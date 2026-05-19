@@ -558,75 +558,88 @@ const MS_TYPE:       u32 = 1;
 const MS_IDENTIFIER: u32 = 3;
 const MS_CONTEXT:    u32 = 4;
 
-fn parse_marked_source_fqn(buf: &[u8]) -> Option<String> {
-    /// Returns (rendered_string, this_node_kind).
+pub fn parse_marked_source_fqn(buf: &[u8]) -> Option<String> {
+    // Field numbers per kythe.proto.common.MarkedSource (v0.0.75):
+    //   1 kind, 2 pre_text, 3 child, 4 post_child_text, 5 post_text,
+    //   10 add_final_list_token (bool — when true, `post_child_text`
+    //      is also appended AFTER the last child). The latter is the
+    //      load-bearing detail: cxx_indexer encodes a CONTEXT
+    //      `android::Parcel` with joiner `::` and add_final_list=1,
+    //      so the rendered text is `android::Parcel::`, with the
+    //      trailing `::` becoming the separator before the sibling
+    //      IDENTIFIER `writeAligned`. Ignoring field 10 collapsed the
+    //      FQN to `android::Parcelwriteaisn` or, depending on
+    //      surrounding context, `android::Parcel::writeAlignedval`
+    //      (where `val` is a parameter name).
     fn render(buf: &[u8]) -> Option<(String, u32)> {
         let mut kind: u32 = MS_BOX;
         let mut pre = String::new();
         let mut joiner = String::new();
         let mut post = String::new();
-        let mut child_renders: Vec<(String, u32)> = Vec::new();
+        let mut add_final_list_token = false;
+        let mut child_renders: Vec<String> = Vec::new();
         let mut pos = 0;
         while pos < buf.len() {
             let (field, wire, val_end, val_start) = read_proto_field(buf, pos)?;
             pos = val_end;
             match (field, wire) {
                 (1, 0) => {
-                    // kind enum (varint). Re-read the value.
                     if let Some((v, _)) = read_varint_at(&buf[val_start..val_end], 0) {
                         kind = v as u32;
                     }
                 }
                 (2, 2) => pre = String::from_utf8_lossy(&buf[val_start..val_end]).into_owned(),
                 (3, 2) => {
-                    if let Some(c) = render(&buf[val_start..val_end]) {
-                        child_renders.push(c);
+                    if let Some((s, _)) = render(&buf[val_start..val_end]) {
+                        child_renders.push(s);
                     }
                 }
                 (4, 2) => joiner = String::from_utf8_lossy(&buf[val_start..val_end]).into_owned(),
                 (5, 2) => post = String::from_utf8_lossy(&buf[val_start..val_end]).into_owned(),
+                (10, 0) => {
+                    if let Some((v, _)) = read_varint_at(&buf[val_start..val_end], 0) {
+                        add_final_list_token = v != 0;
+                    }
+                }
                 _      => {}
             }
         }
-        // cxx_indexer emits a fact for every PARAMETER whose
-        // MarkedSource is `[TYPE, " ", BOX(CONTEXT+IDENT_function), IDENT_param_name]`.
-        // The trailing bare IDENTIFIER after a BOX is the parameter
-        // name and concatenating it into the function FQN gives bogus
-        // aliases like "android::Parcel::writeAlignedval". Detect
-        // that pattern at THIS level and drop the trailing IDENT.
-        if child_renders.len() >= 2 {
-            let last_kind = child_renders.last().map(|(_, k)| *k).unwrap_or(MS_BOX);
-            let earlier_has_box = child_renders[..child_renders.len() - 1]
-                .iter().any(|(_, k)| *k == MS_BOX);
-            if last_kind == MS_IDENTIFIER && earlier_has_box {
-                child_renders.pop();
-            }
-        }
-        let parts: Vec<&str> = child_renders.iter().map(|(s, _)| s.as_str()).collect();
         let mut out = String::with_capacity(pre.len() + post.len());
         out.push_str(&pre);
-        out.push_str(&parts.join(&joiner));
+        if !child_renders.is_empty() {
+            out.push_str(&child_renders.join(&joiner));
+            if add_final_list_token { out.push_str(&joiner); }
+        }
         out.push_str(&post);
         if out.is_empty() { None } else { Some((out, kind)) }
     }
     let (full, _) = render(buf)?;
-    // Truncate at the first `(` — cxx_indexer's parameter list lives
-    // inside a BOX child whose pre_text starts with `(`.
+    // Truncate at the first `(` — the parameter list lives inside a
+    // BOX child whose pre_text starts with `(`.
     let cut = full.find('(').unwrap_or(full.len());
     let trimmed = full[..cut].trim_end();
-    // cxx_indexer prefixes method MarkedSources with return type and
-    // export modifiers ("LIBBINDER_EXPORTED status_t android::Parcel::foo").
-    // The FQN itself never contains whitespace (C++ uses `::`), so the
-    // last whitespace-separated token is the FQN.
-    let fqn = trimmed.rsplit_once(char::is_whitespace)
+    // Method MarkedSources are prefixed with return-type + visibility
+    // modifiers ("LIBBINDER_EXPORTED status_t android::Parcel::foo");
+    // the FQN never contains whitespace, so the last whitespace-
+    // separated token is the FQN.
+    let last_token = trimmed.rsplit_once(char::is_whitespace)
         .map(|(_, fqn)| fqn).unwrap_or(trimmed);
+    // Trim a trailing "::" left over from add_final_list_token when
+    // the FQN was the very last text in the rendering.
+    let fqn = last_token.trim_end_matches(':');
     if fqn.is_empty() { None } else { Some(fqn.to_string()) }
 }
 
-// Silence the "unused" warnings on the constants — they document the
-// kind enum even when only MS_BOX and MS_IDENTIFIER are referenced
-// in the current render heuristic.
-#[allow(dead_code)] const _MS_KINDS_USED: (u32, u32) = (MS_TYPE, MS_CONTEXT);
+// Const docs — MS_TYPE / MS_IDENTIFIER / MS_CONTEXT are documentary
+// references to the kind enum even though render() no longer reads
+// them directly (the trailing-list-token fix removed the need for
+// kind-based child filtering).
+#[allow(dead_code)]
+const _MS_KINDS_DOC: (u32, u32, u32) = (MS_TYPE, MS_IDENTIFIER, MS_CONTEXT);
+
+// MS_TYPE is referenced by the inner kind-decode branch; the others
+// are used directly by the rendering heuristic.
+#[allow(dead_code)] const _MS_TYPE_USED_FOR_DOC: u32 = MS_TYPE;
 
 /// Read one proto field header (varint tag + wire-size payload) at
 /// `pos` from `buf`. Returns `(field, wire, val_end, val_start)` where
@@ -918,64 +931,67 @@ mod tests {
     }
 
     #[test]
-    fn parse_marked_source_drops_trailing_param_name() {
-        // cxx_indexer also emits /kythe/code facts for parameter
-        // symbols with structure [TYPE, " ", BOX(CONTEXT+IDENT_func),
-        // IDENT_param_name]. Without the trailing-IDENT drop the
-        // rendered FQN becomes e.g. "android::Parcel::writeAlignedval".
-        // We want the LAST IDENT dropped so the alias matches the
-        // enclosing function FQN (the param's own sym still gets the
-        // canonical Kythe VName for identification).
-        fn varint(mut v: u64, out: &mut Vec<u8>) {
-            while v >= 0x80 { out.push(((v & 0x7F) | 0x80) as u8); v >>= 7; }
-            out.push(v as u8);
-        }
-        fn lendelim(field: u64, body: &[u8], out: &mut Vec<u8>) {
-            out.push(((field << 3) | 2) as u8);
-            varint(body.len() as u64, out);
-            out.extend_from_slice(body);
-        }
-        fn strf(field: u64, s: &str, out: &mut Vec<u8>) {
-            out.push(((field << 3) | 2) as u8);
-            varint(s.len() as u64, out);
-            out.extend_from_slice(s.as_bytes());
-        }
-        fn id(name: &str) -> Vec<u8> {
-            let mut b = Vec::new();
-            b.push(0x08); b.push(3);            // kind=IDENTIFIER
-            strf(2, name, &mut b);
-            b
-        }
-
-        // BOX containing CONTEXT(android, Parcel) post=:: + IDENT(writeAligned).
-        // Default kind=BOX (0) — omit field 1 entirely.
-        let mut ctx = Vec::new();
-        ctx.push(0x08); ctx.push(4);            // kind=CONTEXT
-        lendelim(3, &id("android"), &mut ctx);
-        lendelim(3, &id("Parcel"),  &mut ctx);
-        strf(4, "::", &mut ctx);
-        strf(5, "::", &mut ctx);
-        let mut name_box = Vec::new();          // kind defaults to BOX
-        lendelim(3, &ctx, &mut name_box);
-        lendelim(3, &id("writeAligned"), &mut name_box);
-
-        // TYPE("T")
-        let mut t = Vec::new(); t.push(0x08); t.push(1); strf(2, "T", &mut t);
-        // BOX(" ") separator
-        let mut sep = Vec::new(); strf(2, " ", &mut sep);
-        // IDENT("val") trailing param name
-        let val = id("val");
-
-        // Outer MarkedSource (kind=BOX default) with these 4 children.
-        let mut root = Vec::new();
-        lendelim(3, &t,        &mut root);
-        lendelim(3, &sep,      &mut root);
-        lendelim(3, &name_box, &mut root);
-        lendelim(3, &val,      &mut root);
-
-        let fqn = parse_marked_source_fqn(&root).expect("renders");
+    fn parse_marked_source_aosp_method_real_bytes() {
+        // Exact /kythe/code fact_value bytes captured from cxx_indexer
+        // running on the AOSP Parcel.cpp CU. This is `LIBBINDER_EXPORTED
+        // status_t android::Parcel::writeAligned(...)`. Structure:
+        //   outer (BOX, pre="LIBBINDER_EXPORTED " was absent here, padding
+        //   spaces instead): [TYPE("status_t"), BOX("            "),
+        //   BOX(CONTEXT("android::Parcel", add_final_list_token=1) +
+        //       IDENT("writeAligned")),
+        //   BOX(kind=6, pre="(", post_child=", ", post=")")]
+        let bytes: &[u8] = &[
+            0x1a, 0x0c, 0x08, 0x01, 0x12, 0x08, b's', b't', b'a', b't', b'u',
+            b's', b'_', b't',                                             // TYPE "status_t"
+            0x1a, 0x0e, 0x12, 0x0c, b' ', b' ', b' ', b' ', b' ', b' ',
+            b' ', b' ', b' ', b' ', b' ', b' ',                           // BOX(spaces)
+            0x1a, 0x35,                                                    // BOX(53) — the FQN
+              0x1a, 0x21, 0x08, 0x04,                                       // CONTEXT
+                0x1a, 0x0b, 0x08, 0x03, 0x12, 0x07, b'a', b'n', b'd', b'r',
+                b'o', b'i', b'd',
+                0x1a, 0x0a, 0x08, 0x03, 0x12, 0x06, b'P', b'a', b'r', b'c',
+                b'e', b'l',
+                0x22, 0x02, b':', b':',                                     // post_child_text "::"
+                0x50, 0x01,                                                 // add_final_list_token = 1
+              0x1a, 0x10, 0x08, 0x03, 0x12, 0x0c, b'w', b'r', b'i', b't',
+              b'e', b'A', b'l', b'i', b'g', b'n', b'e', b'd',
+            0x1a, 0x0c, 0x08, 0x06, 0x12, 0x01, b'(', 0x22, 0x02, b',',
+            b' ', 0x2a, 0x01, b')',                                        // PARAM BOX
+        ];
+        let fqn = parse_marked_source_fqn(bytes).expect("renders");
         assert_eq!(fqn, "android::Parcel::writeAligned",
-            "trailing IDENT(param-name) must be dropped");
+            "method FQN: return-type + padding stripped, params truncated");
+    }
+
+    #[test]
+    fn parse_marked_source_aosp_parameter_real_bytes() {
+        // Exact bytes for the parameter `val` MarkedSource emitted by
+        // cxx_indexer alongside the writeAligned method. Structure:
+        //   outer: [TYPE("T"), BOX(" "),
+        //          BOX(CONTEXT("android::Parcel::writeAligned",
+        //               add_final_list_token=1) + IDENT("val"))]
+        // Note that the CONTEXT here includes the FUNCTION simple name
+        // as a third IDENTIFIER, and the trailing `::` is what
+        // separates it from "val". The FQN for this parameter sym is
+        // "android::Parcel::writeAligned::val".
+        let bytes: &[u8] = &[
+            0x1a, 0x05, 0x08, 0x01, 0x12, 0x01, b'T',                      // TYPE "T"
+            0x1a, 0x03, 0x12, 0x01, b' ',                                  // BOX(" ")
+            0x1a, 0x3e,                                                    // BOX(62)
+              0x1a, 0x33, 0x08, 0x04,                                       // CONTEXT
+                0x1a, 0x0b, 0x08, 0x03, 0x12, 0x07, b'a', b'n', b'd', b'r',
+                b'o', b'i', b'd',
+                0x1a, 0x0a, 0x08, 0x03, 0x12, 0x06, b'P', b'a', b'r', b'c',
+                b'e', b'l',
+                0x1a, 0x10, 0x08, 0x03, 0x12, 0x0c, b'w', b'r', b'i', b't',
+                b'e', b'A', b'l', b'i', b'g', b'n', b'e', b'd',
+                0x22, 0x02, b':', b':',                                     // post_child_text "::"
+                0x50, 0x01,                                                 // add_final_list_token = 1
+              0x1a, 0x07, 0x08, 0x03, 0x12, 0x03, b'v', b'a', b'l',         // IDENT "val"
+        ];
+        let fqn = parse_marked_source_fqn(bytes).expect("renders");
+        assert_eq!(fqn, "android::Parcel::writeAligned::val",
+            "parameter FQN: <enclosing-function>::<param-name>");
     }
 
     #[test]

@@ -152,6 +152,14 @@ enum Cmd {
         #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
+    /// Diagnostic (hidden): read MarkedSource bytes from FILE and print
+    /// the FQN our parser produces. Used to verify the cxx_indexer
+    /// `/kythe/code` decode path against real-world inputs.
+    #[command(hide = true)]
+    DebugMarkedSource {
+        #[arg(value_parser = path_arg)] file: PathBuf,
+    },
+
     /// `names PREFIX` — diagnostic: list alphabetically-sorted name
     /// index entries starting with PREFIX. Useful for confirming what
     /// aliases the indexer actually emitted (debug "why doesn't
@@ -243,6 +251,15 @@ fn main() -> Result<()> {
             return server::serve(&cli.index, &sock);
         }
         Cmd::Repl => return server::repl(&cli.index),
+        Cmd::DebugMarkedSource { file } => {
+            let bytes = std::fs::read(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            match scry2::kythe::parse_marked_source_fqn(&bytes) {
+                Some(fqn) => println!("{fqn}"),
+                None      => println!("(no FQN extracted)"),
+            }
+            return Ok(());
+        }
         Cmd::Names { prefix, limit } => {
             let ix = Index::open(&cli.index)?;
             for (name, sym) in ix.names_with_prefix(&prefix, limit) {

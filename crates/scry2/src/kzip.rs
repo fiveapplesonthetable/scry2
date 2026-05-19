@@ -114,6 +114,34 @@ impl Unit {
         if let Some(raw) = &self.raw_proto { return raw.clone(); }
         encode_indexed_compilation(&self.cu)
     }
+
+    /// Best guess at the CU's primary source path. Used by from-kzip
+    /// for `--in` / `--not-in` filtering before we incur sub-kzip
+    /// build + indexer spawn cost.
+    ///
+    /// Preference order:
+    /// 1. `source_file[0]` — explicit primary file (set by Bazel-style
+    ///    extractors and AOSP's Soong/xref_cxx).
+    /// 2. `required_input[0].v_name.path` — the first input's VName
+    ///    path (corpus-relative). Present on every Kythe CU.
+    /// 3. `v_name.path` — the unit's own VName (rare but valid for
+    ///    JVM bytecode units that have no source files).
+    pub fn primary_path(&self) -> Option<&str> {
+        if let Some(f) = self.cu.unit.source_file.first() { return Some(f.as_str()); }
+        if let Some(ri) = self.cu.unit.required_input.first() {
+            if !ri.v_name.path.is_empty() { return Some(&ri.v_name.path); }
+            if !ri.info.path.is_empty()   { return Some(&ri.info.path);   }
+        }
+        let vp = self.cu.unit.v_name.path.as_str();
+        if !vp.is_empty() { Some(vp) } else { None }
+    }
+
+    /// Language hint from `v_name.language`. Lower-cased so callers
+    /// can match without worrying about case (Kythe is consistent
+    /// but some custom extractors aren't).
+    pub fn language(&self) -> String {
+        self.cu.unit.v_name.language.to_ascii_lowercase()
+    }
 }
 
 // ----------------------------------------------------------------- reader
@@ -258,6 +286,58 @@ pub fn write_normalized_progress<P: Progress>(
     }
     zout.finish()?.flush()?;
     Ok(())
+}
+
+/// Open the source kzip once and hand out per-CU sub-kzip extractions.
+/// Avoids the ~50 ms central-directory rescan cost per call that you
+/// pay if you `ZipArchive::new` for every unit — important for AOSP-
+/// scale runs where we extract 100k+ sub-kzips.
+pub struct SubKzipWriter {
+    zin: zip::ZipArchive<File>,
+}
+
+impl SubKzipWriter {
+    pub fn open(src: &Path) -> Result<Self> {
+        let f = File::open(src).with_context(|| format!("reopen kzip {}", src.display()))?;
+        Ok(Self { zin: zip::ZipArchive::new(f)? })
+    }
+
+    /// Write `dst` as a single-CU kzip: one proto-encoded pbunit +
+    /// every `root/files/<digest>` blob the unit's required_input
+    /// names. Equivalent in structure to what `build_kzip.bash`
+    /// produces when run against just one compile target — every
+    /// stock Kythe indexer accepts it as input.
+    ///
+    /// Returns the number of file blobs copied (some required_inputs
+    /// reference compiler-builtin paths that aren't in the kzip; those
+    /// are skipped silently, matching `write_normalized`).
+    pub fn extract(&mut self, unit: &Unit, dst: &Path) -> Result<usize> {
+        let out_f = File::create(dst).with_context(|| format!("create {}", dst.display()))?;
+        let mut zout = zip::ZipWriter::new(BufWriter::with_capacity(1 << 20, out_f));
+        let opts = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zout.add_directory("root/", opts)?;
+        zout.add_directory("root/pbunits/", opts)?;
+        zout.add_directory("root/files/", opts)?;
+        zout.start_file(format!("root/pbunits/{}", unit.sha), opts)?;
+        zout.write_all(&unit.to_proto_bytes())?;
+        let mut copied = 0;
+        let mut seen: HashSet<&str> = HashSet::new();
+        for fi in &unit.cu.unit.required_input {
+            if fi.info.digest.is_empty() { continue; }
+            if !seen.insert(fi.info.digest.as_str()) { continue; }
+            let entry = format!("root/files/{}", fi.info.digest);
+            let mut src_e = match self.zin.by_name(&entry) {
+                Ok(e) => e,
+                Err(_) => continue, // not in kzip (compiler builtin / external)
+            };
+            zout.start_file(&entry, opts)?;
+            std::io::copy(&mut src_e, &mut zout)?;
+            copied += 1;
+        }
+        zout.finish()?.flush()?;
+        Ok(copied)
+    }
 }
 
 /// One-shot: read every unit from `src`, write a proto-only kzip at
@@ -579,6 +659,108 @@ mod tests {
     /// callback fires for every phase. Locks the contract that
     /// long-running ops emit observable progress instead of going
     /// silent for minutes at a time.
+    #[test]
+    fn sub_kzip_writer_extracts_one_cu_with_files() {
+        // Build a kzip with two units (each with its own file blob);
+        // extract one with SubKzipWriter and assert the output kzip
+        // has exactly that unit + its blob, not the other one.
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("scry2-subkzip-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("in.kzip");
+        let dst = dir.join("out.kzip");
+
+        let f = std::fs::File::create(&src).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.add_directory("root/", opts).unwrap();
+        z.add_directory("root/pbunits/", opts).unwrap();
+        z.add_directory("root/files/", opts).unwrap();
+        for (sha, digest) in [("aaa", "111"), ("bbb", "222")] {
+            let cu = IndexedCompilation {
+                unit: CompilationUnit {
+                    v_name: VName { language: "c++".into(), ..Default::default() },
+                    required_input: vec![FileInput {
+                        v_name: VName::default(),
+                        info: FileInfo { path: format!("f-{sha}.h"), digest: digest.into() },
+                    }],
+                    ..Default::default()
+                },
+            };
+            z.start_file(format!("root/pbunits/{sha}"), opts).unwrap();
+            z.write_all(&encode_indexed_compilation(&cu)).unwrap();
+            z.start_file(format!("root/files/{digest}"), opts).unwrap();
+            z.write_all(format!("contents-of-{digest}").as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+
+        // Re-read the source kzip via our own walker so we get a
+        // round-tripped Unit (matching production flow).
+        let units = read_units(&src).unwrap();
+        assert_eq!(units.len(), 2);
+        let unit_aaa = units.iter().find(|u| u.sha == "aaa").unwrap();
+
+        let mut w = SubKzipWriter::open(&src).unwrap();
+        let copied = w.extract(unit_aaa, &dst).unwrap();
+        assert_eq!(copied, 1, "one file blob for unit aaa");
+
+        // Open the extracted kzip and verify content.
+        let extracted = std::fs::File::open(&dst).unwrap();
+        let mut z2 = zip::ZipArchive::new(extracted).unwrap();
+        let names: std::collections::HashSet<String> =
+            (0..z2.len()).map(|i| z2.by_index(i).unwrap().name().to_string()).collect();
+        assert!(names.contains("root/pbunits/aaa"));
+        assert!(names.contains("root/files/111"));
+        assert!(!names.contains("root/pbunits/bbb"), "unit bbb must not leak");
+        assert!(!names.contains("root/files/222"), "blob for bbb must not leak");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_path_prefers_source_file() {
+        let cu = IndexedCompilation {
+            unit: CompilationUnit {
+                source_file: vec!["foo.cpp".into()],
+                required_input: vec![FileInput {
+                    v_name: VName { path: "bar.h".into(), ..Default::default() },
+                    info: FileInfo { path: "bar.h".into(), digest: "abc".into() },
+                }],
+                ..Default::default()
+            },
+        };
+        let u = Unit { sha: "x".into(), cu, raw_proto: None };
+        assert_eq!(u.primary_path(), Some("foo.cpp"));
+    }
+
+    #[test]
+    fn primary_path_falls_back_to_first_required_input() {
+        let cu = IndexedCompilation {
+            unit: CompilationUnit {
+                source_file: vec![],
+                required_input: vec![FileInput {
+                    v_name: VName { path: "bar.h".into(), ..Default::default() },
+                    info: FileInfo { path: "bar.h".into(), digest: "abc".into() },
+                }],
+                ..Default::default()
+            },
+        };
+        let u = Unit { sha: "x".into(), cu, raw_proto: None };
+        assert_eq!(u.primary_path(), Some("bar.h"));
+    }
+
+    #[test]
+    fn language_normalizes_to_lowercase() {
+        let cu = IndexedCompilation {
+            unit: CompilationUnit {
+                v_name: VName { language: "JAVA".into(), ..Default::default() },
+                ..Default::default()
+            },
+        };
+        let u = Unit { sha: "x".into(), cu, raw_proto: None };
+        assert_eq!(u.language(), "java");
+    }
+
     #[test]
     fn normalize_progress_invokes_callback_for_every_phase() {
         use std::io::Write;

@@ -9,7 +9,8 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use scry2::{Index, IndexBuilder, kythe, kzip, reply::{Reply, emit}, server::{self, Request}};
+use scry2::{Index, IndexBuilder, kythe, kzip, kzip::Progress as _,
+            reply::{Reply, emit}, server::{self, Request}};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -176,15 +177,40 @@ enum Cmd {
         #[arg(long = "out", value_name = "PATH", value_parser = path_arg)] out: PathBuf,
     },
 
-    /// `from-kzip` — build an .s2db by running each Kythe indexer
-    /// against KZIP and ingesting all entries.
+    /// `from-kzip` — build an .s2db by extracting each CU into a
+    /// per-CU sub-kzip, running the appropriate Kythe indexer on it,
+    /// and ingesting the emitted Entry proto stream. Per-CU dispatch
+    /// is what makes the run robust against one bad CU killing the
+    /// whole batch (cxx_indexer segfaults on malformed argv).
     FromKzip {
         #[arg(long, value_parser = path_arg)] kzip: PathBuf,
         #[arg(long = "kythe-root", value_parser = path_arg)] kythe_root: PathBuf,
         #[arg(short, long, default_value = "scry2.s2db", value_parser = path_arg)] out: PathBuf,
+        /// Comma-separated languages to index. Routing is by the CU's
+        /// `v_name.language`: c++ → cxx_indexer, java → java_indexer,
+        /// jvm → jvm_indexer, go → go_indexer, protobuf → proto_indexer,
+        /// textproto → textproto_indexer.
         #[arg(long, default_value = "cxx,java,jvm,go,proto,textproto")]
         langs: String,
         #[arg(long, default_value = "8g")] jvm_heap: String,
+        /// Restrict to CUs whose primary source path (from
+        /// `source_file[0]` or `required_input[0]`) contains ANY of
+        /// these comma-separated substrings. Repeatable.
+        #[arg(long = "in", value_name = "SUBSTR", num_args = 1.., value_delimiter = ',')]
+        in_: Vec<String>,
+        /// Drop CUs whose primary path contains ANY of these. Repeatable.
+        #[arg(long = "not-in", value_name = "SUBSTR", num_args = 1.., value_delimiter = ',')]
+        not_in: Vec<String>,
+        /// Per-CU staging directory. Each sub-kzip is built here, fed
+        /// to the indexer, then removed. Defaults to a process-local
+        /// dir under `$SCRY_TMP_DIR` (or /mnt/agent/tmp if set, else
+        /// the system tmp).
+        #[arg(long = "staging", value_parser = path_arg)]
+        staging: Option<PathBuf>,
+        /// Number of CUs to index concurrently. Defaults to num_cpus/2
+        /// (JVM-based indexers carry a 200-300 MB working set, so we
+        /// cap to avoid OOM on big runs).
+        #[arg(long, default_value = "0")] workers: usize,
     },
 }
 
@@ -194,8 +220,14 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Index { entries, out }  => return cmd_index(&entries, &out),
         Cmd::NormalizeKzip { in_, out } => return cmd_normalize_kzip(&in_, &out),
-        Cmd::FromKzip { kzip, kythe_root, out, langs, jvm_heap } =>
-            return cmd_from_kzip(&kzip, &kythe_root, &out, &langs, &jvm_heap),
+        Cmd::FromKzip { kzip, kythe_root, out, langs, jvm_heap,
+                        in_, not_in, staging, workers } =>
+            return cmd_from_kzip(FromKzipArgs {
+                kzip: &kzip, kythe_root: &kythe_root, out: &out,
+                langs: &langs, jvm_heap: &jvm_heap,
+                in_: &in_, not_in: &not_in,
+                staging: staging.as_deref(), workers,
+            }),
         Cmd::Serve { socket } => {
             let sock = socket.unwrap_or_else(|| server::default_socket_for(&cli.index));
             return server::serve(&cli.index, &sock);
@@ -320,80 +352,327 @@ fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_from_kzip(
-    kzip: &std::path::Path,
+/// Routing from a CU's `v_name.language` to an indexer binary +
+/// invocation shape. `None` means "no indexer in this Kythe release
+/// for this language" (kotlin and rust source — Google-internal only
+/// in v0.0.75); those CUs are counted as skipped, not failed.
+#[derive(Clone, Copy, Debug)]
+enum IndexerKind {
+    Cxx,
+    JavaSource,
+    JvmBytecode,
+    Go,
+    Proto,
+    TextProto,
+}
+
+/// Classify by `v_name.language`. Stays in sync with the CLI
+/// `--langs` filter; an unknown language returns None and the CU
+/// is counted in the `skipped` bucket of the run summary.
+fn route_language(lang: &str) -> Option<IndexerKind> {
+    match lang {
+        "c++"       => Some(IndexerKind::Cxx),
+        "java"      => Some(IndexerKind::JavaSource),
+        "jvm"       => Some(IndexerKind::JvmBytecode),
+        "go"        => Some(IndexerKind::Go),
+        "protobuf" | "proto" => Some(IndexerKind::Proto),
+        "textproto" => Some(IndexerKind::TextProto),
+        _           => None,
+    }
+}
+
+fn lang_label(k: IndexerKind) -> &'static str {
+    match k {
+        IndexerKind::Cxx         => "cxx",
+        IndexerKind::JavaSource  => "java",
+        IndexerKind::JvmBytecode => "jvm",
+        IndexerKind::Go          => "go",
+        IndexerKind::Proto       => "proto",
+        IndexerKind::TextProto   => "textproto",
+    }
+}
+
+/// Bundled args — keeps `cmd_from_kzip` under the clippy threshold
+/// for arg count without losing call-site clarity.
+struct FromKzipArgs<'a> {
+    kzip:       &'a std::path::Path,
+    kythe_root: &'a std::path::Path,
+    out:        &'a std::path::Path,
+    langs:      &'a str,
+    jvm_heap:   &'a str,
+    in_:        &'a [String],
+    not_in:     &'a [String],
+    staging:    Option<&'a std::path::Path>,
+    workers:    usize,
+}
+
+fn build_indexer_command(
+    kind: IndexerKind,
     kythe_root: &std::path::Path,
-    out: &std::path::Path,
-    langs: &str,
+    cu_kzip: &std::path::Path,
     jvm_heap: &str,
-) -> Result<()> {
-    use std::process::{Command, Stdio};
-    let want: std::collections::HashSet<&str> = langs.split(',').map(|s| s.trim()).collect();
+    jvm_temp_dir: &std::path::Path,
+) -> Result<std::process::Command> {
+    use std::process::Command;
+    match kind {
+        IndexerKind::Cxx => {
+            let bin = kythe_root.join("indexers/cxx_indexer");
+            if !bin.exists() { anyhow::bail!("cxx_indexer missing: {}", bin.display()); }
+            let mut c = Command::new(bin); c.arg(cu_kzip);
+            Ok(c)
+        }
+        IndexerKind::Go => {
+            let bin = kythe_root.join("indexers/go_indexer");
+            if !bin.exists() { anyhow::bail!("go_indexer missing: {}", bin.display()); }
+            let mut c = Command::new(bin); c.arg(cu_kzip);
+            Ok(c)
+        }
+        IndexerKind::JavaSource | IndexerKind::JvmBytecode => {
+            let jar = kythe_root.join(if matches!(kind, IndexerKind::JavaSource) {
+                "indexers/java_indexer.jar"
+            } else {
+                "indexers/jvm_indexer.jar"
+            });
+            if !jar.exists() { anyhow::bail!("{} missing", jar.display()); }
+            let mut c = Command::new("java");
+            c.arg(format!("-Xmx{jvm_heap}"))
+                .arg("-jar").arg(jar)
+                .arg("--ignore_empty_kzip")
+                .arg("--temp_directory").arg(jvm_temp_dir)
+                .arg(cu_kzip);
+            Ok(c)
+        }
+        IndexerKind::Proto => {
+            let bin = kythe_root.join("indexers/proto_indexer");
+            if !bin.exists() { anyhow::bail!("proto_indexer missing: {}", bin.display()); }
+            let mut c = Command::new(bin);
+            c.arg(format!("-index_file={}", cu_kzip.display()));
+            Ok(c)
+        }
+        IndexerKind::TextProto => {
+            let bin = kythe_root.join("indexers/textproto_indexer");
+            if !bin.exists() { anyhow::bail!("textproto_indexer missing: {}", bin.display()); }
+            let mut c = Command::new(bin);
+            c.arg(format!("--index_file={}", cu_kzip.display()));
+            Ok(c)
+        }
+    }
+}
+
+/// One CU's run summary — accumulated across workers and into the
+/// final per-language report.
+#[derive(Default, Debug, Clone)]
+struct LangStats {
+    cus:       usize,
+    entries:   u64,
+    anchors:   u64,
+    xrefs:     u64,
+    inherits:  u64,
+    aliases:   u64,
+    calls:     u64,
+    succeeded: usize,
+    empty:     usize,
+    failed:    usize,
+    fail_tails: Vec<String>,  // first N failure stderr tails for diagnosis
+}
+
+const MAX_FAIL_TAILS: usize = 8;
+const STDERR_TAIL_BYTES: usize = 4096;
+
+fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
+    use std::process::Stdio;
+    use std::collections::HashSet;
+
+    let t0 = Instant::now();
+    let want: HashSet<&str> = args.langs.split(',').map(|s| s.trim()).collect();
+
+    eprintln!("[from-kzip] reading {} …", args.kzip.display());
+    let units = kzip::read_units_progress(args.kzip, CliProgress::new("from-kzip"))?;
+    eprintln!("[from-kzip] {} units total", units.len());
+
+    // CU-level filter: (a) want this language, (b) path matches --in/--not-in.
+    let in_filters:  &[String] = args.in_;
+    let not_in_filters: &[String] = args.not_in;
+    let primary_ok = |u: &kzip::Unit| -> bool {
+        if in_filters.is_empty() && not_in_filters.is_empty() { return true; }
+        let p = u.primary_path().unwrap_or("");
+        if !in_filters.is_empty()
+            && !in_filters.iter().any(|s| !s.is_empty() && p.contains(s.as_str()))
+        { return false; }
+        if not_in_filters.iter().any(|s| !s.is_empty() && p.contains(s.as_str())) {
+            return false;
+        }
+        true
+    };
+    let mut plan: Vec<(IndexerKind, &kzip::Unit)> = Vec::with_capacity(units.len());
+    let mut skipped_lang = 0usize;
+    let mut skipped_path = 0usize;
+    for u in &units {
+        let Some(kind) = route_language(&u.language()) else { skipped_lang += 1; continue };
+        if !want.contains(lang_label(kind)) { skipped_lang += 1; continue; }
+        if !primary_ok(u) { skipped_path += 1; continue; }
+        plan.push((kind, u));
+    }
+    eprintln!("[from-kzip] plan: {} CUs to index ({} skipped: lang={}, path={})",
+        plan.len(), skipped_lang + skipped_path, skipped_lang, skipped_path);
+    if plan.is_empty() { anyhow::bail!("from-kzip: nothing to index after filters"); }
+
+    // Staging dir — one process-local subdir under SCRY_TMP_DIR or
+    // /mnt/agent/tmp. Cleaned up at the end.
+    let staging = args.staging.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        let base = std::env::var_os("SCRY_TMP_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/mnt/agent/tmp"));
+        base.join(format!("scry2-from-kzip-{}", std::process::id()))
+    });
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("mkdir staging {}", staging.display()))?;
+    eprintln!("[from-kzip] staging dir: {}", staging.display());
+
+    let workers = if args.workers == 0 {
+        std::cmp::max(1, num_cpus_get() / 2)
+    } else { args.workers };
+    eprintln!("[from-kzip] workers: {workers}");
+
     let mut builder = IndexBuilder::new();
     let mut file_ids = kythe::FileIdAllocator::default();
-    let t0 = Instant::now();
+    let mut by_lang: std::collections::HashMap<&'static str, LangStats> =
+        std::collections::HashMap::new();
 
-    let cxx        = kythe_root.join("indexers/cxx_indexer");
-    let java_jar   = kythe_root.join("indexers/java_indexer.jar");
-    let jvm_jar    = kythe_root.join("indexers/jvm_indexer.jar");
-    let go         = kythe_root.join("indexers/go_indexer");
-    let proto      = kythe_root.join("indexers/proto_indexer");
-    let textproto  = kythe_root.join("indexers/textproto_indexer");
+    // Sequential per-CU dispatch with one reusable SubKzipWriter
+    // (opens the source kzip once and reads each CU's blobs on demand).
+    // Parallelism is deferred — sequential at ~1-3s/CU is already
+    // bounded by the indexer subprocess; the gain from N workers
+    // shows up after we add a thread pool that shares one
+    // SubKzipWriter and one IndexBuilder behind a Mutex (v0.2).
+    let _ = workers; // reserved for v0.2 parallelism
+    let mut extractor = kzip::SubKzipWriter::open(args.kzip)?;
+    let mut progress = CliProgress::new("from-kzip");
+    for (i, (kind, unit)) in plan.iter().enumerate() {
+        let label = lang_label(*kind);
+        let stats = by_lang.entry(label).or_default();
+        let sub_path = staging.join(format!("{}.kzip", unit.sha));
+        // Reusable JVM temp dir per CU — java_indexer needs writable
+        // dir to unpack JDK system modules from --system <jdk_image>.
+        let jvm_tmp = staging.join(format!("{}.jvmtmp", unit.sha));
+        if matches!(kind, IndexerKind::JavaSource | IndexerKind::JvmBytecode) {
+            std::fs::create_dir_all(&jvm_tmp)?;
+        }
+        // Build sub-kzip.
+        if let Err(e) = extractor.extract(unit, &sub_path) {
+            stats.failed += 1;
+            stats.fail_tails.push(format!("sha={} extract: {e:#}", unit.sha));
+            continue;
+        }
+        // Spawn indexer.
+        let mut cmd = build_indexer_command(*kind, args.kythe_root, &sub_path,
+                                            args.jvm_heap, &jvm_tmp)?;
+        let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                stats.failed += 1;
+                stats.fail_tails.push(format!("sha={} spawn: {e:#}", unit.sha));
+                let _ = std::fs::remove_file(&sub_path);
+                let _ = std::fs::remove_dir_all(&jvm_tmp);
+                continue;
+            }
+        };
+        // Drain stderr in a thread to avoid blocking the indexer on
+        // its stderr pipe when we're sinking stdout into ingest.
+        let stderr_h = child.stderr.take().unwrap();
+        let stderr_thread = std::thread::spawn(move || drain_tail(stderr_h, STDERR_TAIL_BYTES));
+        let stdout_h = child.stdout.take().unwrap();
 
-    let make_jvm = |jar: &std::path::Path| -> Command {
-        let mut c = Command::new("java");
-        c.arg(format!("-Xmx{jvm_heap}"))
-            .arg("-jar").arg(jar)
-            .arg("--ignore_empty_kzip")
-            .arg(kzip);
-        c
-    };
-    let make_proto = |bin: &std::path::Path, dash: &str| -> Command {
-        let mut c = Command::new(bin);
-        c.arg(format!("{dash}index_file={}", kzip.display()));
-        c
-    };
+        let cu_t0 = Instant::now();
+        let cu_stats = scry2::kythe::ingest_tolerant(stdout_h, &mut builder, &mut file_ids, true)?;
+        let status = child.wait()?;
+        let stderr_tail = stderr_thread.join().unwrap_or_default();
+        let _ = std::fs::remove_file(&sub_path);
+        let _ = std::fs::remove_dir_all(&jvm_tmp);
 
-    let mut to_run: Vec<(&'static str, Command)> = Vec::new();
-    if want.contains("cxx") && cxx.exists()       { let mut c = Command::new(&cxx); c.arg(kzip); to_run.push(("cxx", c)); }
-    if want.contains("java") && java_jar.exists() { to_run.push(("java", make_jvm(&java_jar))); }
-    if want.contains("jvm")  && jvm_jar.exists()  { to_run.push(("jvm",  make_jvm(&jvm_jar))); }
-    if want.contains("go")   && go.exists()       { let mut c = Command::new(&go); c.arg(kzip); to_run.push(("go",   c)); }
-    if want.contains("proto") && proto.exists()   { to_run.push(("proto", make_proto(&proto, "-"))); }
-    if want.contains("textproto") && textproto.exists() {
-        to_run.push(("textproto", make_proto(&textproto, "--")));
+        stats.cus += 1;
+        stats.entries  += cu_stats.entries;
+        stats.anchors  += cu_stats.anchors_flushed;
+        stats.xrefs    += cu_stats.xrefs_emitted;
+        stats.inherits += cu_stats.inherits_emitted;
+        stats.aliases  += cu_stats.aliases_emitted;
+        stats.calls    += cu_stats.calls_emitted;
+        let ok = status.success();
+        let any = cu_stats.entries > 0;
+        match (ok, any) {
+            (true,  true)  => stats.succeeded += 1,
+            (true,  false) => stats.empty     += 1,
+            (false, _)     => {
+                stats.failed += 1;
+                if stats.fail_tails.len() < MAX_FAIL_TAILS {
+                    let tail = String::from_utf8_lossy(&stderr_tail).into_owned();
+                    stats.fail_tails.push(format!(
+                        "sha={} exit={:?} wall={:.1}s\n{}",
+                        unit.sha, status.code(),
+                        cu_t0.elapsed().as_secs_f64(),
+                        tail.trim(),
+                    ));
+                }
+            }
+        }
+        progress.report("index", i + 1, plan.len());
     }
-    if to_run.is_empty() {
-        anyhow::bail!("from-kzip: no indexer binaries found under {} for langs={langs}",
-            kythe_root.display());
-    }
-    for (label, mut cmd) in to_run {
-        let phase_t = Instant::now();
-        eprintln!("[from-kzip] running {label}");
-        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
-            .with_context(|| format!("spawn {label} indexer"))?;
-        let stdout = child.stdout.take().unwrap();
-        let stats = scry2::kythe::ingest_tolerant(stdout, &mut builder, &mut file_ids, true)?;
-        let exit = child.wait()?;
+
+    // Report per-language summary + first failure tails.
+    for (label, s) in &by_lang {
         eprintln!(
-            "[from-kzip]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} (wall={:.1}s, exit={:?})",
-            stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
-            stats.inherits_emitted, stats.aliases_emitted, stats.calls_emitted,
-            phase_t.elapsed().as_secs_f64(), exit.code(),
+            "[from-kzip] {label}: CUs={} (ok={} empty={} failed={}) entries={} anchors={} xrefs={} inh={} alias={} calls={}",
+            s.cus, s.succeeded, s.empty, s.failed,
+            s.entries, s.anchors, s.xrefs, s.inherits, s.aliases, s.calls,
         );
+        for (i, tail) in s.fail_tails.iter().enumerate() {
+            eprintln!("[from-kzip] {label} failure {}/{}:", i + 1, s.fail_tails.len());
+            for line in tail.lines() { eprintln!("    {line}"); }
+        }
     }
+
     file_ids.drain_into(&mut builder);
-    eprintln!(
-        "[from-kzip] writing — xrefs={} syms={} files={} inhs={} calls={}",
+    eprintln!("[from-kzip] writing — xrefs={} syms={} files={} inhs={} calls={}",
         builder.n_xrefs(), builder.n_syms(), builder.n_files(),
-        builder.n_inh(), builder.n_calls(),
-    );
-    let bytes = builder.finish(out)?;
-    eprintln!(
-        "[from-kzip] done in {:.2}s → {} ({:.2} GB)",
-        t0.elapsed().as_secs_f64(), out.display(), bytes as f64 / 1e9,
-    );
+        builder.n_inh(), builder.n_calls());
+    let bytes = builder.finish(args.out)?;
+    let _ = std::fs::remove_dir_all(&staging);
+    eprintln!("[from-kzip] done in {:.2}s → {} ({:.2} GB)",
+        t0.elapsed().as_secs_f64(), args.out.display(), bytes as f64 / 1e9);
     Ok(())
+}
+
+/// Drain `r` and return the LAST `n` bytes — used to capture indexer
+/// stderr tails for failure diagnosis without buffering 10+ MB of
+/// INFO output from a noisy CU.
+fn drain_tail<R: std::io::Read>(mut r: R, n: usize) -> Vec<u8> {
+    let mut ring = Vec::<u8>::with_capacity(n.min(64 << 10));
+    let mut buf = [0u8; 8192];
+    while let Ok(k) = r.read(&mut buf) {
+        if k == 0 { break; }
+        if ring.len() + k <= n {
+            ring.extend_from_slice(&buf[..k]);
+        } else {
+            // Discard the oldest bytes; keep last n.
+            let combined_len = ring.len() + k;
+            let drop = combined_len - n;
+            if drop >= ring.len() {
+                let offset = drop - ring.len();
+                ring.clear();
+                ring.extend_from_slice(&buf[offset..k]);
+            } else {
+                ring.drain(..drop);
+                ring.extend_from_slice(&buf[..k]);
+            }
+        }
+    }
+    ring
+}
+
+/// Lightweight CPU-count helper. `num_cpus` crate would do the same
+/// thing but we want zero extra deps for this single call site.
+fn num_cpus_get() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 #[cfg(test)]

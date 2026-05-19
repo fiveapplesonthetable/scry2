@@ -247,15 +247,20 @@ fn parse_compilation_unit(buf: &[u8]) -> Result<CompilationUnit> {
     while pos < buf.len() {
         let (field, wire, len) = read_field_header(buf, &mut pos)?;
         let slice = take(buf, &mut pos, len)?;
+        // kythe.proto.CompilationUnit field numbers (analysis.proto):
+        //   v_name=1, required_input=3, has_compile_errors=4 (bool, skip),
+        //   argument=5, source_file=6, output_key=7,
+        //   working_directory=8, entry_context=9,
+        //   environment=10, details=11 (skip).
         match (field, wire) {
-            (1,  2) => out.v_name = parse_vname(slice)?,
-            (3,  2) => out.required_input.push(parse_file_input(slice)?),
-            (5,  2) => out.entry_context = String::from_utf8_lossy(slice).into_owned(),
-            (8,  2) => out.argument.push(String::from_utf8_lossy(slice).into_owned()),
-            (9,  2) => out.source_file.push(String::from_utf8_lossy(slice).into_owned()),
-            (10, 2) => out.output_key = String::from_utf8_lossy(slice).into_owned(),
-            (11, 2) => out.working_directory = String::from_utf8_lossy(slice).into_owned(),
-            _       => { /* fields we don't need (details, etc.) */ }
+            (1, 2) => out.v_name = parse_vname(slice)?,
+            (3, 2) => out.required_input.push(parse_file_input(slice)?),
+            (5, 2) => out.argument.push(String::from_utf8_lossy(slice).into_owned()),
+            (6, 2) => out.source_file.push(String::from_utf8_lossy(slice).into_owned()),
+            (7, 2) => out.output_key = String::from_utf8_lossy(slice).into_owned(),
+            (8, 2) => out.working_directory = String::from_utf8_lossy(slice).into_owned(),
+            (9, 2) => out.entry_context = String::from_utf8_lossy(slice).into_owned(),
+            _      => { /* has_compile_errors, environment, details — skipped */ }
         }
     }
     Ok(out)
@@ -353,6 +358,7 @@ fn encode_indexed_compilation(c: &IndexedCompilation) -> Vec<u8> {
 }
 
 fn encode_compilation_unit(c: &CompilationUnit, out: &mut Vec<u8>) {
+    // See decoder for the canonical field numbers.
     let mut v = Vec::new();
     encode_vname(&c.v_name, &mut v);
     if !v.is_empty() { write_tag_len(1, &v, out); }
@@ -361,12 +367,14 @@ fn encode_compilation_unit(c: &CompilationUnit, out: &mut Vec<u8>) {
         encode_file_input(fi, &mut b);
         write_tag_len(3, &b, out);
     }
-    if !c.entry_context.is_empty() { write_tag_len(5, c.entry_context.as_bytes(), out); }
-    for a in &c.argument        { write_tag_len(8,  a.as_bytes(), out); }
-    for s in &c.source_file     { write_tag_len(9,  s.as_bytes(), out); }
-    if !c.output_key.is_empty() { write_tag_len(10, c.output_key.as_bytes(), out); }
+    for a in &c.argument        { write_tag_len(5, a.as_bytes(), out); }
+    for s in &c.source_file     { write_tag_len(6, s.as_bytes(), out); }
+    if !c.output_key.is_empty() { write_tag_len(7, c.output_key.as_bytes(), out); }
     if !c.working_directory.is_empty() {
-        write_tag_len(11, c.working_directory.as_bytes(), out);
+        write_tag_len(8, c.working_directory.as_bytes(), out);
+    }
+    if !c.entry_context.is_empty() {
+        write_tag_len(9, c.entry_context.as_bytes(), out);
     }
 }
 
@@ -451,6 +459,47 @@ mod tests {
         assert_eq!(parsed.unit.output_key, "foo.o");
         assert_eq!(parsed.unit.working_directory, "/build");
         assert_eq!(parsed.unit.entry_context, "ctx");
+    }
+
+    #[test]
+    fn compilation_unit_decodes_real_kythe_wire_bytes() {
+        // Hand-built wire bytes matching kythe.proto.CompilationUnit
+        // field numbers exactly (per analysis.proto v0.0.75). If our
+        // encoder/decoder ever drift from the spec, this fails.
+        // Layout:
+        //   field 1 (v_name)         — submessage, tag=0x0a
+        //     field 5 (language)     — "c++"      tag=0x2a
+        //   field 5 (argument)       — "clang++"  tag=0x2a
+        //   field 6 (source_file)    — "foo.cpp"  tag=0x32
+        //   field 7 (output_key)     — "foo.o"    tag=0x3a
+        //   field 8 (working_dir)    — "/b"       tag=0x42
+        //   field 9 (entry_context)  — "ctx"      tag=0x4a
+        let mut wire = Vec::new();
+        // v_name { language: "c++" }
+        wire.extend_from_slice(&[0x0a, 5,  0x2a, 3, b'c', b'+', b'+']);
+        // argument: "clang++"
+        wire.extend_from_slice(&[0x2a, 7,  b'c', b'l', b'a', b'n', b'g', b'+', b'+']);
+        // source_file: "foo.cpp"
+        wire.extend_from_slice(&[0x32, 7,  b'f', b'o', b'o', b'.', b'c', b'p', b'p']);
+        // output_key: "foo.o"
+        wire.extend_from_slice(&[0x3a, 5,  b'f', b'o', b'o', b'.', b'o']);
+        // working_directory: "/b"
+        wire.extend_from_slice(&[0x42, 2,  b'/', b'b']);
+        // entry_context: "ctx"
+        wire.extend_from_slice(&[0x4a, 3,  b'c', b't', b'x']);
+
+        let cu = parse_compilation_unit(&wire).unwrap();
+        assert_eq!(cu.v_name.language, "c++");
+        assert_eq!(cu.argument, vec!["clang++"]);
+        assert_eq!(cu.source_file, vec!["foo.cpp"]);
+        assert_eq!(cu.output_key, "foo.o");
+        assert_eq!(cu.working_directory, "/b");
+        assert_eq!(cu.entry_context, "ctx");
+
+        // And our encoder emits the same canonical bytes.
+        let mut re = Vec::new();
+        encode_compilation_unit(&cu, &mut re);
+        assert_eq!(re, wire, "encoder output drifted from canonical wire bytes");
     }
 
     #[test]

@@ -220,6 +220,251 @@ mod tests {
     }
 
     #[test]
+    fn streaming_merge_matches_reference_finish() {
+        // The streaming-merge path takes a prior on-disk index plus an
+        // in-memory delta and produces a new index byte-for-byte
+        // equivalent (in query semantics) to one produced by feeding
+        // the union of all rows through finish() in one shot. We
+        // exercise every table — xrefs, syms, files, inherits, calls,
+        // aliases — with both disjoint and overlapping content,
+        // including a sym in both halves to check first-wins.
+        let reference_path = tmp("merge-reference");
+        let merged_path    = tmp("merge-streaming");
+        let prior_path     = tmp("merge-prior");
+
+        let s_a    = sym_of("kythe:c++:test###fnA");
+        let s_b    = sym_of("kythe:c++:test###fnB");
+        let s_c    = sym_of("kythe:c++:test###fnC");
+        let s_iface = sym_of("kythe:c++:test###Iface");
+        let s_impl  = sym_of("kythe:c++:test###Impl");
+        let s_var   = sym_of("kythe:c++:test###gVar");
+
+        let mut reference = IndexBuilder::new();
+        reference.upsert_sym(s_a, kind::FUNCTION, lang::CXX, "kythe:c++:test###fnA");
+        reference.upsert_sym(s_b, kind::FUNCTION, lang::CXX, "kythe:c++:test###fnB");
+        reference.upsert_sym(s_c, kind::FUNCTION, lang::CXX, "kythe:c++:test###fnC");
+        reference.upsert_sym(s_iface, kind::TYPE, lang::CXX, "kythe:c++:test###Iface");
+        reference.upsert_sym(s_impl,  kind::TYPE, lang::CXX, "kythe:c++:test###Impl");
+        reference.upsert_sym(s_var, kind::VARIABLE, lang::CXX, "kythe:c++:test###gVar");
+        reference.add_alias(s_a, "ns::fnA");
+        reference.add_alias(s_b, "ns::fnB");
+        reference.add_alias(s_c, "ns::fnC");
+        reference.add_alias(s_iface, "ns::Iface");
+        reference.add_alias(s_var, "ns::gVar");           // suppressed (VARIABLE)
+        reference.upsert_file(1, "/aosp/A.cpp");
+        reference.upsert_file(2, "/aosp/B.cpp");
+        reference.upsert_file(3, "/aosp/C.cpp");
+        reference.add_xref(s_a, role::DECL, 1, 100);
+        reference.add_xref(s_a, role::CALL, 2, 200);
+        reference.add_xref(s_b, role::DEF,  2, 50);
+        reference.add_xref(s_c, role::REF,  3, 300);
+        reference.add_inherit(s_impl, s_iface);
+        reference.add_call(s_a, s_b, role::CALL);
+        reference.add_call(s_b, s_c, role::CALL);
+        reference.add_call(s_a, s_c, role::REF);
+        reference.finish(&reference_path).unwrap();
+
+        // Streaming: split the same rows across prior + delta with
+        // overlap on s_a (same kind), s_b (delta sees UNK — prior wins),
+        // and duplicate alias + xref + call entries to exercise dedup.
+        let mut prior_builder = IndexBuilder::new();
+        prior_builder.upsert_sym(s_a, kind::FUNCTION, lang::CXX, "kythe:c++:test###fnA");
+        prior_builder.upsert_sym(s_b, kind::FUNCTION, lang::CXX, "kythe:c++:test###fnB");
+        prior_builder.upsert_sym(s_iface, kind::TYPE, lang::CXX, "kythe:c++:test###Iface");
+        prior_builder.upsert_sym(s_var, kind::VARIABLE, lang::CXX, "kythe:c++:test###gVar");
+        prior_builder.add_alias(s_a, "ns::fnA");
+        prior_builder.add_alias(s_iface, "ns::Iface");
+        prior_builder.add_alias(s_var, "ns::gVar");
+        prior_builder.upsert_file(1, "/aosp/A.cpp");
+        prior_builder.upsert_file(2, "/aosp/B.cpp");
+        prior_builder.add_xref(s_a, role::DECL, 1, 100);
+        prior_builder.add_xref(s_b, role::DEF,  2, 50);
+        prior_builder.add_inherit(s_impl, s_iface);
+        prior_builder.add_call(s_a, s_b, role::CALL);
+        prior_builder.finish(&prior_path).unwrap();
+
+        let prior = Index::open(&prior_path).unwrap();
+        let mut delta = IndexBuilder::new();
+        delta.upsert_sym(s_a, kind::FUNCTION, lang::CXX, "kythe:c++:test###fnA");
+        delta.upsert_sym(s_b, kind::UNK, lang::CXX, "kythe:c++:test###fnB");
+        delta.upsert_sym(s_c, kind::FUNCTION, lang::CXX, "kythe:c++:test###fnC");
+        delta.upsert_sym(s_impl, kind::TYPE, lang::CXX, "kythe:c++:test###Impl");
+        delta.add_alias(s_a, "ns::fnA");                  // dup of prior
+        delta.add_alias(s_b, "ns::fnB");
+        delta.add_alias(s_c, "ns::fnC");
+        delta.upsert_file(3, "/aosp/C.cpp");
+        delta.add_xref(s_a, role::CALL, 2, 200);
+        delta.add_xref(s_b, role::DEF,  2, 50);           // dup of prior
+        delta.add_xref(s_c, role::REF,  3, 300);
+        delta.add_call(s_a, s_b, role::CALL);             // dup of prior
+        delta.add_call(s_b, s_c, role::CALL);
+        delta.add_call(s_a, s_c, role::REF);
+        delta.write_merged_snapshot(Some(&prior), &merged_path).unwrap();
+        drop(prior);
+
+        let r1 = Index::open(&reference_path).unwrap();
+        let r2 = Index::open(&merged_path).unwrap();
+        assert_eq!(r1.n_xrefs(), r2.n_xrefs(), "xref count diverges");
+        assert_eq!(r1.n_syms(),  r2.n_syms(),  "sym count diverges");
+        assert_eq!(r1.n_files(), r2.n_files(), "file count diverges");
+        assert_eq!(r1.n_inh(),   r2.n_inh(),   "inherits count diverges");
+        assert_eq!(r1.n_calls(), r2.n_calls(), "calls count diverges");
+        assert_eq!(r1.n_names(), r2.n_names(), "names count diverges");
+        for name in ["kythe:c++:test###fnA", "kythe:c++:test###fnB",
+                     "kythe:c++:test###fnC", "kythe:c++:test###Iface",
+                     "kythe:c++:test###Impl", "kythe:c++:test###gVar",
+                     "ns::fnA", "ns::fnB", "ns::fnC", "ns::Iface"] {
+            assert_eq!(r1.sym_for_name(name), r2.sym_for_name(name),
+                "name '{name}' resolves differently between reference and streaming");
+        }
+        assert_eq!(r2.sym_for_name("ns::gVar"), None,
+            "VARIABLE-kind alias should be suppressed in streaming merge");
+        for sym in [s_a, s_b, s_c, s_iface, s_impl, s_var] {
+            assert_eq!(r1.sym_meta(sym), r2.sym_meta(sym),
+                "sym meta diverges for {sym:x}");
+        }
+        for sym in [s_a, s_b, s_c] {
+            let x1: Vec<_> = r1.xrefs(sym, 0, u8::MAX).collect();
+            let x2: Vec<_> = r2.xrefs(sym, 0, u8::MAX).collect();
+            assert_eq!(x1, x2, "xrefs diverge for {sym:x}");
+        }
+        assert_eq!(r1.inherits_of(s_impl), r2.inherits_of(s_impl));
+        assert_eq!(r1.inherited_by(s_iface), r2.inherited_by(s_iface));
+        for caller in [s_a, s_b] {
+            let c1: Vec<_> = r1.calls_from(caller).into_iter().collect();
+            let c2: Vec<_> = r2.calls_from(caller).into_iter().collect();
+            assert_eq!(c1, c2, "calls_from diverge for caller {caller:x}");
+        }
+        for f in 1u32..=3 {
+            assert_eq!(r1.file_path(f), r2.file_path(f),
+                "file_path({f}) diverges");
+        }
+
+        let _ = std::fs::remove_file(&reference_path);
+        let _ = std::fs::remove_file(&merged_path);
+        let _ = std::fs::remove_file(&prior_path);
+    }
+
+    #[test]
+    fn streaming_merge_handles_empty_prior() {
+        // No prior partial yet (first snapshot of a run). The merge
+        // reduces to a single-source write, exercising the
+        // `prior = None` arms of every helper.
+        let direct_path  = tmp("merge-empty-prior-direct");
+        let merged_path  = tmp("merge-empty-prior-streamed");
+
+        let mk_data = || {
+            let mut b = IndexBuilder::new();
+            let s = sym_of("kythe:c++:t###fn");
+            b.upsert_sym(s, kind::FUNCTION, lang::CXX, "kythe:c++:t###fn");
+            b.add_alias(s, "ns::fn");
+            b.upsert_file(1, "/x.cpp");
+            b.add_xref(s, role::DECL, 1, 10);
+            b.add_call(s, s, role::CALL);
+            b
+        };
+
+        mk_data().finish(&direct_path).unwrap();
+        mk_data().write_merged_snapshot(None, &merged_path).unwrap();
+
+        let r1 = Index::open(&direct_path).unwrap();
+        let r2 = Index::open(&merged_path).unwrap();
+        assert_eq!(r1.n_xrefs(), r2.n_xrefs());
+        assert_eq!(r1.n_syms(),  r2.n_syms());
+        assert_eq!(r1.n_names(), r2.n_names());
+        assert_eq!(r2.sym_for_name("ns::fn"),
+                   Some(sym_of("kythe:c++:t###fn")));
+
+        let _ = std::fs::remove_file(&direct_path);
+        let _ = std::fs::remove_file(&merged_path);
+    }
+
+    #[test]
+    fn streaming_merge_chains_three_snapshots() {
+        // Realistic snap cycle: snap1 = delta1 → partial1
+        //                       snap2 = delta2 + partial1 → partial2
+        //                       snap3 = delta3 + partial2 → partial3
+        // Compare partial3 to a single-shot finish() of (delta1 ∪ delta2 ∪ delta3).
+        let snap1 = tmp("chain-snap1");
+        let snap2 = tmp("chain-snap2");
+        let snap3 = tmp("chain-snap3");
+        let reference = tmp("chain-reference");
+
+        let s_a = sym_of("kythe:test###a");
+        let s_b = sym_of("kythe:test###b");
+        let s_c = sym_of("kythe:test###c");
+
+        let mut d1 = IndexBuilder::new();
+        d1.upsert_sym(s_a, kind::FUNCTION, lang::CXX, "kythe:test###a");
+        d1.add_alias(s_a, "a_fqn");
+        d1.upsert_file(1, "/a");
+        d1.add_xref(s_a, role::DECL, 1, 1);
+        d1.write_merged_snapshot(None, &snap1).unwrap();
+
+        let prior1 = Index::open(&snap1).unwrap();
+        let mut d2 = IndexBuilder::new();
+        d2.upsert_sym(s_b, kind::FUNCTION, lang::CXX, "kythe:test###b");
+        d2.add_alias(s_b, "b_fqn");
+        d2.add_alias(s_a, "a_alt");
+        d2.upsert_file(2, "/b");
+        d2.add_xref(s_b, role::DEF, 2, 2);
+        d2.add_call(s_a, s_b, role::CALL);
+        d2.write_merged_snapshot(Some(&prior1), &snap2).unwrap();
+        drop(prior1);
+
+        let prior2 = Index::open(&snap2).unwrap();
+        let mut d3 = IndexBuilder::new();
+        d3.upsert_sym(s_c, kind::FUNCTION, lang::CXX, "kythe:test###c");
+        d3.upsert_file(3, "/c");
+        d3.add_xref(s_a, role::CALL, 3, 100);
+        d3.add_xref(s_c, role::DECL, 3, 1);
+        d3.add_inherit(s_b, s_a);
+        d3.add_call(s_b, s_c, role::CALL);
+        d3.write_merged_snapshot(Some(&prior2), &snap3).unwrap();
+        drop(prior2);
+
+        let mut r = IndexBuilder::new();
+        r.upsert_sym(s_a, kind::FUNCTION, lang::CXX, "kythe:test###a");
+        r.upsert_sym(s_b, kind::FUNCTION, lang::CXX, "kythe:test###b");
+        r.upsert_sym(s_c, kind::FUNCTION, lang::CXX, "kythe:test###c");
+        r.add_alias(s_a, "a_fqn");
+        r.add_alias(s_a, "a_alt");
+        r.add_alias(s_b, "b_fqn");
+        r.upsert_file(1, "/a");
+        r.upsert_file(2, "/b");
+        r.upsert_file(3, "/c");
+        r.add_xref(s_a, role::DECL, 1, 1);
+        r.add_xref(s_a, role::CALL, 3, 100);
+        r.add_xref(s_b, role::DEF, 2, 2);
+        r.add_xref(s_c, role::DECL, 3, 1);
+        r.add_inherit(s_b, s_a);
+        r.add_call(s_a, s_b, role::CALL);
+        r.add_call(s_b, s_c, role::CALL);
+        r.finish(&reference).unwrap();
+
+        let chained = Index::open(&snap3).unwrap();
+        let refidx  = Index::open(&reference).unwrap();
+        assert_eq!(chained.n_xrefs(), refidx.n_xrefs());
+        assert_eq!(chained.n_syms(),  refidx.n_syms());
+        assert_eq!(chained.n_files(), refidx.n_files());
+        assert_eq!(chained.n_names(), refidx.n_names());
+        for name in ["kythe:test###a", "kythe:test###b", "kythe:test###c",
+                     "a_fqn", "a_alt", "b_fqn"] {
+            assert_eq!(chained.sym_for_name(name), refidx.sym_for_name(name),
+                "name '{name}' diverges across 3-snap chain");
+        }
+        for sym in [s_a, s_b, s_c] {
+            let x1: Vec<_> = chained.xrefs(sym, 0, u8::MAX).collect();
+            let x2: Vec<_> = refidx.xrefs(sym, 0, u8::MAX).collect();
+            assert_eq!(x1, x2, "xrefs diverge for {sym:x}");
+        }
+        let _ = std::fs::remove_file(&snap1);
+        let _ = std::fs::remove_file(&snap2);
+        let _ = std::fs::remove_file(&snap3);
+        let _ = std::fs::remove_file(&reference);
+    }
+
+    #[test]
     fn alias_suppressed_for_variable_kind_syms() {
         // cxx_indexer emits /kythe/code on parameters too; the parsed
         // FQN `Method::param` would otherwise leak into the names table

@@ -155,6 +155,259 @@ impl IndexBuilder {
         Ok(())
     }
 
+    /// Streaming 2-way merge of `self` (an in-memory delta) with an
+    /// optional `prior` on-disk index (mmap'd, never fully loaded into
+    /// RAM), written atomically to `output`. The output is byte-for-byte
+    /// equivalent to what [`finish`] would produce on a builder
+    /// containing `prior + self` — sort/dedup/first-wins semantics
+    /// preserved — but peak RAM is bounded to `self`'s size plus the
+    /// new file's string blob, regardless of how large `prior` has grown.
+    ///
+    /// This is the engine behind `from-kzip`'s rolling snapshot: every
+    /// snap drains workers into a small delta and merges it against
+    /// the previous partial.s2db. Without streaming, each snap would
+    /// have to clone or fully reload the accumulator, doubling RAM at
+    /// snap time and growing with the run total.
+    ///
+    /// Consumes `self`: the delta's tables are sorted in place and
+    /// drained, so the caller should drop it after this returns.
+    /// Returns total bytes written to `output`.
+    pub fn write_merged_snapshot(
+        mut self,
+        prior: Option<&crate::reader::Index>,
+        output: &Path,
+    ) -> Result<u64> {
+        // ---- 1. Sort delta tables in place ----
+        self.xrefs.sort_unstable();
+        self.xrefs.dedup();
+        self.inherits.sort_unstable();
+        self.inherits.dedup();
+        self.calls.sort_unstable();
+        self.calls.dedup();
+        self.aliases.sort_unstable();
+        self.aliases.dedup();
+        let mut delta_syms: Vec<(u64, u8, u8, String)> = self.syms.drain()
+            .map(|(s, (k, l, n))| (s, k, l, n)).collect();
+        delta_syms.sort_unstable_by_key(|r| r.0);
+        let mut delta_files: Vec<(u32, String)> = self.files.drain().collect();
+        delta_files.sort_unstable_by_key(|r| r.0);
+
+        // ---- 2. var_syms (for alias suppression) from merged syms ----
+        // First-wins: prior's kind wins if both have the same sym.
+        // We need this set before processing aliases.
+        let var_syms = merge_var_syms(prior, &delta_syms);
+
+        // ---- 3. Count merged table sizes (dry-run merge) ----
+        // We need the counts to compute section offsets before writing.
+        // Iterating prior's mmap'd sections is cheap (one walk per table).
+        let n_xrefs = count_merged_xrefs(prior, &self.xrefs);
+        let n_syms  = count_merged_syms(prior, &delta_syms);
+        let n_files = count_merged_files(prior, &delta_files);
+        let n_inh   = count_merged_inh(prior, &self.inherits);
+        let n_calls = count_merged_calls(prior, &self.calls);
+        let n_crev  = n_calls;
+        let n_aliases_kept =
+            count_merged_aliases(prior, &self.aliases, &var_syms);
+        let n_names = n_syms + n_aliases_kept;
+
+        // ---- 4. Compute section offsets ----
+        let xrefs_off = pad_up(size_of_header() as u64);
+        let syms_off  = pad_up(xrefs_off + n_xrefs * XREF_LEN as u64);
+        let names_off = pad_up(syms_off  + n_syms  * SYM_LEN  as u64);
+        let files_off = pad_up(names_off + n_names * NAME_LEN as u64);
+        let inh_off   = pad_up(files_off + n_files * FILE_LEN as u64);
+        let calls_off = pad_up(inh_off   + n_inh   * INH_LEN  as u64);
+        let crev_off  = pad_up(calls_off + n_calls * CALL_LEN as u64);
+        let blob_off  = pad_up(crev_off  + n_crev  * CALL_LEN as u64);
+
+        // ---- 5. Write to tempfile + atomic rename ----
+        let tmp_path: PathBuf = output.with_extension("s2db.tmp");
+        let f = File::create(&tmp_path)
+            .with_context(|| format!("create {}", tmp_path.display()))?;
+        let mut w = BufWriter::with_capacity(8 << 20, f);
+
+        // Placeholder header (overwritten at end with final counts).
+        let hdr_placeholder = Header { magic: MAGIC, version: VERSION, ..Default::default() };
+        write_header(&mut w, &hdr_placeholder)?;
+
+        // Build the new blob alongside the tables that reference it.
+        // The blob is a few hundred MB max — names + paths + aliases —
+        // bounded by total distinct strings in (prior ∪ delta), not by
+        // the row counts of xrefs/calls.
+        let mut blob: Vec<u8> = Vec::new();
+        let mut by_name: Vec<(u32, u16, u64)> = Vec::new();
+
+        // xrefs: pure merge, no blob interaction.
+        seek_to(&mut w, xrefs_off)?;
+        {
+            let pri: Box<dyn Iterator<Item = (u64, u8, u32, u32)>> = match prior {
+                Some(p) => Box::new(p.iter_xrefs()),
+                None    => Box::new(std::iter::empty()),
+            };
+            let del = self.xrefs.iter().copied();
+            for (sym, role, file, offset) in merge_sorted_dedup(pri, del) {
+                w.write_all(&sym.to_be_bytes())?;
+                w.write_all(&[role])?;
+                w.write_all(&file.to_be_bytes())?;
+                w.write_all(&offset.to_be_bytes())?;
+            }
+        }
+
+        // syms: merge-write, append canonical name to blob, record
+        // (off, len, sym) for the alphabetical name index.
+        seek_to(&mut w, syms_off)?;
+        {
+            let pri: Box<dyn Iterator<Item = (u64, u8, u8, &str)>> = match prior {
+                Some(p) => Box::new(p.iter_syms()),
+                None    => Box::new(std::iter::empty()),
+            };
+            let del = delta_syms.iter().map(|(s, k, l, n)| (*s, *k, *l, n.as_str()));
+            for (sym, kind, lang, name) in merge_syms_first_wins(pri, del) {
+                let off = blob.len() as u32;
+                let len = name.len() as u16;
+                blob.extend_from_slice(name.as_bytes());
+                w.write_all(&sym.to_be_bytes())?;
+                w.write_all(&[kind, lang])?;
+                w.write_all(&off.to_be_bytes())?;
+                w.write_all(&len.to_be_bytes())?;
+                by_name.push((off, len, sym));
+            }
+        }
+
+        // aliases (no dedicated section in the file format — they
+        // become extra entries in the alphabetical name index). We
+        // also append each alias's bytes to the blob now so the
+        // name-index entry can point at it.
+        //
+        // `prior.iter_aliases()` returns rows in *alpha* order (it
+        // walks the alphabetical name index), but our merge wants
+        // `(sym, alias)` order. Collect once into a Vec borrowing
+        // into the mmap'd blob (no string copies) and sort.
+        {
+            let mut prior_aliases: Vec<(u64, &str)> = match prior {
+                Some(p) => p.iter_aliases().collect(),
+                None    => Vec::new(),
+            };
+            prior_aliases.sort_unstable();
+            prior_aliases.dedup();
+            let pri = prior_aliases.iter().copied();
+            let del = self.aliases.iter().map(|(s, a)| (*s, a.as_str()));
+            for (sym, alias) in merge_aliases_dedup(pri, del) {
+                if var_syms.contains(&sym) { continue; }
+                let off = blob.len() as u32;
+                let len = alias.len() as u16;
+                blob.extend_from_slice(alias.as_bytes());
+                by_name.push((off, len, sym));
+            }
+        }
+
+        // names: alpha-sort + write.
+        by_name.sort_by(|a, b| {
+            let an = &blob[a.0 as usize..a.0 as usize + a.1 as usize];
+            let bn = &blob[b.0 as usize..b.0 as usize + b.1 as usize];
+            an.cmp(bn)
+        });
+        debug_assert_eq!(by_name.len() as u64, n_names);
+        seek_to(&mut w, names_off)?;
+        for (off, len, sym) in &by_name {
+            w.write_all(&off.to_be_bytes())?;
+            w.write_all(&len.to_be_bytes())?;
+            w.write_all(&[0u8, 0u8])?;     // _pad
+            w.write_all(&sym.to_be_bytes())?;
+        }
+
+        // files: merge-write (first-wins on file_id), append path to blob.
+        seek_to(&mut w, files_off)?;
+        {
+            let pri: Box<dyn Iterator<Item = (u32, &str)>> = match prior {
+                Some(p) => Box::new(p.iter_files()),
+                None    => Box::new(std::iter::empty()),
+            };
+            let del = delta_files.iter().map(|(f, p)| (*f, p.as_str()));
+            for (file, path) in merge_files_first_wins(pri, del) {
+                let off = blob.len() as u32;
+                let len = path.len() as u16;
+                blob.extend_from_slice(path.as_bytes());
+                w.write_all(&file.to_be_bytes())?;
+                w.write_all(&off.to_be_bytes())?;
+                w.write_all(&len.to_be_bytes())?;
+            }
+        }
+
+        // inherits: pure merge.
+        seek_to(&mut w, inh_off)?;
+        {
+            let pri: Box<dyn Iterator<Item = (u64, u64)>> = match prior {
+                Some(p) => Box::new(p.iter_inherits()),
+                None    => Box::new(std::iter::empty()),
+            };
+            let del = self.inherits.iter().copied();
+            for (c, p) in merge_sorted_dedup(pri, del) {
+                w.write_all(&c.to_be_bytes())?;
+                w.write_all(&p.to_be_bytes())?;
+            }
+        }
+
+        // calls + calls_rev: pure merge for the forward table, then
+        // reverse for the by-callee index. We materialise the merged
+        // forward into a Vec to feed the reverse sort — n_calls × 17 B,
+        // bounded by total call edges in (prior ∪ delta).
+        seek_to(&mut w, calls_off)?;
+        let merged_calls: Vec<(u64, u64, u8)> = {
+            let pri: Box<dyn Iterator<Item = (u64, u64, u8)>> = match prior {
+                Some(p) => Box::new(p.iter_calls()),
+                None    => Box::new(std::iter::empty()),
+            };
+            let del = self.calls.iter().copied();
+            merge_sorted_dedup(pri, del).collect()
+        };
+        for (caller, callee, role) in &merged_calls {
+            w.write_all(&caller.to_be_bytes())?;
+            w.write_all(&callee.to_be_bytes())?;
+            w.write_all(&[*role])?;
+        }
+
+        seek_to(&mut w, crev_off)?;
+        let mut calls_rev: Vec<(u64, u64, u8)> = merged_calls.iter()
+            .map(|(caller, callee, role)| (*callee, *caller, *role))
+            .collect();
+        calls_rev.sort_unstable();
+        for (callee, caller, role) in &calls_rev {
+            w.write_all(&callee.to_be_bytes())?;
+            w.write_all(&caller.to_be_bytes())?;
+            w.write_all(&[*role])?;
+        }
+        drop(calls_rev);
+
+        // Blob last.
+        seek_to(&mut w, blob_off)?;
+        w.write_all(&blob)?;
+
+        // Rewrite header with final counts + offsets.
+        let hdr = Header {
+            magic: MAGIC, version: VERSION,
+            xrefs_off, xrefs_n: n_xrefs,
+            syms_off,  syms_n:  n_syms,
+            names_off, names_n: n_names,
+            files_off, files_n: n_files,
+            inh_off,   inh_n:   n_inh,
+            calls_off, calls_n: n_calls,
+            crev_off,  crev_n:  n_crev,
+            blob_off,  blob_len: blob.len() as u64,
+            ..Default::default()
+        };
+        seek_to(&mut w, 0)?;
+        write_header(&mut w, &hdr)?;
+
+        let total = blob_off + blob.len() as u64;
+        w.flush()?;
+        w.get_mut().sync_all().context("fsync")?;
+        drop(w);
+        std::fs::rename(&tmp_path, output)
+            .with_context(|| format!("rename to {}", output.display()))?;
+        Ok(total)
+    }
+
     /// Sort all tables and serialize to `path` atomically. Returns total
     /// bytes written.
     pub fn finish(mut self, path: &Path) -> Result<u64> {
@@ -356,6 +609,296 @@ impl IndexBuilder {
         std::fs::rename(&tmp_path, path).with_context(|| format!("rename to {}", path.display()))?;
         Ok(total)
     }
+}
+
+// ============================================================
+// Streaming-merge helpers (used by `write_merged_snapshot`)
+// ============================================================
+//
+// Two-way merge between an mmap'd prior `.s2db` and an in-memory
+// `delta` (already sorted). Each function comes in two flavours:
+// a `merge_*` iterator that produces the merged stream, and a
+// `count_merged_*` companion that just counts (used to size the
+// output file's sections before writing).
+
+fn merge_sorted_dedup<T, A, B>(a: A, b: B) -> impl Iterator<Item = T>
+where
+    T: Ord + Copy,
+    A: Iterator<Item = T>,
+    B: Iterator<Item = T>,
+{
+    use std::iter::Peekable;
+    struct Iter<T, A, B>
+    where A: Iterator<Item = T>, B: Iterator<Item = T>
+    {
+        a: Peekable<A>,
+        b: Peekable<B>,
+        last: Option<T>,
+    }
+    impl<T, A, B> Iterator for Iter<T, A, B>
+    where
+        T: Ord + Copy,
+        A: Iterator<Item = T>,
+        B: Iterator<Item = T>,
+    {
+        type Item = T;
+        fn next(&mut self) -> Option<T> {
+            loop {
+                let v = match (self.a.peek(), self.b.peek()) {
+                    (Some(x), Some(y)) => {
+                        match x.cmp(y) {
+                            std::cmp::Ordering::Less    => self.a.next(),
+                            std::cmp::Ordering::Greater => self.b.next(),
+                            std::cmp::Ordering::Equal   => {
+                                self.b.next();
+                                self.a.next()
+                            }
+                        }
+                    }
+                    (Some(_), None) => self.a.next(),
+                    (None, Some(_)) => self.b.next(),
+                    (None, None)    => return None,
+                };
+                let v = v?;
+                if self.last == Some(v) { continue; }
+                self.last = Some(v);
+                return Some(v);
+            }
+        }
+    }
+    Iter { a: a.peekable(), b: b.peekable(), last: None }
+}
+
+fn count_merged_xrefs(
+    prior: Option<&crate::reader::Index>,
+    delta: &[(u64, u8, u32, u32)],
+) -> u64 {
+    let pri: Box<dyn Iterator<Item = (u64, u8, u32, u32)>> = match prior {
+        Some(p) => Box::new(p.iter_xrefs()),
+        None    => Box::new(std::iter::empty()),
+    };
+    let del = delta.iter().copied();
+    merge_sorted_dedup(pri, del).count() as u64
+}
+
+fn count_merged_inh(
+    prior: Option<&crate::reader::Index>,
+    delta: &[(u64, u64)],
+) -> u64 {
+    let pri: Box<dyn Iterator<Item = (u64, u64)>> = match prior {
+        Some(p) => Box::new(p.iter_inherits()),
+        None    => Box::new(std::iter::empty()),
+    };
+    let del = delta.iter().copied();
+    merge_sorted_dedup(pri, del).count() as u64
+}
+
+fn count_merged_calls(
+    prior: Option<&crate::reader::Index>,
+    delta: &[(u64, u64, u8)],
+) -> u64 {
+    let pri: Box<dyn Iterator<Item = (u64, u64, u8)>> = match prior {
+        Some(p) => Box::new(p.iter_calls()),
+        None    => Box::new(std::iter::empty()),
+    };
+    let del = delta.iter().copied();
+    merge_sorted_dedup(pri, del).count() as u64
+}
+
+/// First-wins on tied sym ids. Yields `(sym, kind, lang, name)`.
+fn merge_syms_first_wins<'a, A, B>(a: A, b: B) -> impl Iterator<Item = (u64, u8, u8, &'a str)>
+where
+    A: Iterator<Item = (u64, u8, u8, &'a str)>,
+    B: Iterator<Item = (u64, u8, u8, &'a str)>,
+{
+    use std::iter::Peekable;
+    struct Iter<'a, A, B>
+    where
+        A: Iterator<Item = (u64, u8, u8, &'a str)>,
+        B: Iterator<Item = (u64, u8, u8, &'a str)>,
+    {
+        a: Peekable<A>,
+        b: Peekable<B>,
+    }
+    impl<'a, A, B> Iterator for Iter<'a, A, B>
+    where
+        A: Iterator<Item = (u64, u8, u8, &'a str)>,
+        B: Iterator<Item = (u64, u8, u8, &'a str)>,
+    {
+        type Item = (u64, u8, u8, &'a str);
+        fn next(&mut self) -> Option<Self::Item> {
+            match (self.a.peek(), self.b.peek()) {
+                (Some(&(ka, _, _, _)), Some(&(kb, _, _, _))) => {
+                    match ka.cmp(&kb) {
+                        std::cmp::Ordering::Less    => self.a.next(),
+                        std::cmp::Ordering::Greater => self.b.next(),
+                        std::cmp::Ordering::Equal   => {
+                            self.b.next();
+                            self.a.next()
+                        }
+                    }
+                }
+                (Some(_), None) => self.a.next(),
+                (None, Some(_)) => self.b.next(),
+                (None, None)    => None,
+            }
+        }
+    }
+    Iter { a: a.peekable(), b: b.peekable() }
+}
+
+fn count_merged_syms(
+    prior: Option<&crate::reader::Index>,
+    delta: &[(u64, u8, u8, String)],
+) -> u64 {
+    let pri: Box<dyn Iterator<Item = (u64, u8, u8, &str)>> = match prior {
+        Some(p) => Box::new(p.iter_syms()),
+        None    => Box::new(std::iter::empty()),
+    };
+    let del = delta.iter().map(|(s, k, l, n)| (*s, *k, *l, n.as_str()));
+    merge_syms_first_wins(pri, del).count() as u64
+}
+
+/// First-wins on tied file ids. Yields `(file_id, path)`.
+fn merge_files_first_wins<'a, A, B>(a: A, b: B) -> impl Iterator<Item = (u32, &'a str)>
+where
+    A: Iterator<Item = (u32, &'a str)>,
+    B: Iterator<Item = (u32, &'a str)>,
+{
+    use std::iter::Peekable;
+    struct Iter<'a, A, B>
+    where
+        A: Iterator<Item = (u32, &'a str)>,
+        B: Iterator<Item = (u32, &'a str)>,
+    {
+        a: Peekable<A>,
+        b: Peekable<B>,
+    }
+    impl<'a, A, B> Iterator for Iter<'a, A, B>
+    where
+        A: Iterator<Item = (u32, &'a str)>,
+        B: Iterator<Item = (u32, &'a str)>,
+    {
+        type Item = (u32, &'a str);
+        fn next(&mut self) -> Option<Self::Item> {
+            match (self.a.peek(), self.b.peek()) {
+                (Some(&(ka, _)), Some(&(kb, _))) => {
+                    match ka.cmp(&kb) {
+                        std::cmp::Ordering::Less    => self.a.next(),
+                        std::cmp::Ordering::Greater => self.b.next(),
+                        std::cmp::Ordering::Equal   => {
+                            self.b.next();
+                            self.a.next()
+                        }
+                    }
+                }
+                (Some(_), None) => self.a.next(),
+                (None, Some(_)) => self.b.next(),
+                (None, None)    => None,
+            }
+        }
+    }
+    Iter { a: a.peekable(), b: b.peekable() }
+}
+
+fn count_merged_files(
+    prior: Option<&crate::reader::Index>,
+    delta: &[(u32, String)],
+) -> u64 {
+    let pri: Box<dyn Iterator<Item = (u32, &str)>> = match prior {
+        Some(p) => Box::new(p.iter_files()),
+        None    => Box::new(std::iter::empty()),
+    };
+    let del = delta.iter().map(|(f, p)| (*f, p.as_str()));
+    merge_files_first_wins(pri, del).count() as u64
+}
+
+/// Aliases sorted by `(sym, alias)` then deduped. Both sources are
+/// expected to be sorted+deduped already.
+fn merge_aliases_dedup<'a, A, B>(a: A, b: B) -> impl Iterator<Item = (u64, &'a str)>
+where
+    A: Iterator<Item = (u64, &'a str)>,
+    B: Iterator<Item = (u64, &'a str)>,
+{
+    use std::iter::Peekable;
+    struct Iter<'a, A, B>
+    where
+        A: Iterator<Item = (u64, &'a str)>,
+        B: Iterator<Item = (u64, &'a str)>,
+    {
+        a: Peekable<A>,
+        b: Peekable<B>,
+        last: Option<(u64, &'a str)>,
+    }
+    impl<'a, A, B> Iterator for Iter<'a, A, B>
+    where
+        A: Iterator<Item = (u64, &'a str)>,
+        B: Iterator<Item = (u64, &'a str)>,
+    {
+        type Item = (u64, &'a str);
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                let v = match (self.a.peek(), self.b.peek()) {
+                    (Some(&xa), Some(&xb)) => {
+                        match xa.cmp(&xb) {
+                            std::cmp::Ordering::Less    => self.a.next(),
+                            std::cmp::Ordering::Greater => self.b.next(),
+                            std::cmp::Ordering::Equal   => {
+                                self.b.next();
+                                self.a.next()
+                            }
+                        }
+                    }
+                    (Some(_), None) => self.a.next(),
+                    (None, Some(_)) => self.b.next(),
+                    (None, None)    => return None,
+                };
+                let v = v?;
+                if self.last == Some(v) { continue; }
+                self.last = Some(v);
+                return Some(v);
+            }
+        }
+    }
+    Iter { a: a.peekable(), b: b.peekable(), last: None }
+}
+
+fn count_merged_aliases(
+    prior: Option<&crate::reader::Index>,
+    delta: &[(u64, String)],
+    var_syms: &std::collections::HashSet<u64>,
+) -> u64 {
+    // `prior.iter_aliases()` yields in *alpha* order; merge_aliases_dedup
+    // needs `(sym, alias)` order. Collect once into a sorted vec.
+    let mut prior_aliases: Vec<(u64, &str)> = match prior {
+        Some(p) => p.iter_aliases().collect(),
+        None    => Vec::new(),
+    };
+    prior_aliases.sort_unstable();
+    prior_aliases.dedup();
+    let pri = prior_aliases.iter().copied();
+    let del = delta.iter().map(|(s, a)| (*s, a.as_str()));
+    merge_aliases_dedup(pri, del)
+        .filter(|(s, _)| !var_syms.contains(s))
+        .count() as u64
+}
+
+/// Build the `var_syms` set from the merged sym stream — the final
+/// kind for a sym is whichever source wins (prior on ties), and the
+/// set is used to suppress alias entries for VARIABLE-kind syms.
+fn merge_var_syms(
+    prior: Option<&crate::reader::Index>,
+    delta_syms: &[(u64, u8, u8, String)],
+) -> std::collections::HashSet<u64> {
+    let pri: Box<dyn Iterator<Item = (u64, u8, u8, &str)>> = match prior {
+        Some(p) => Box::new(p.iter_syms()),
+        None    => Box::new(std::iter::empty()),
+    };
+    let del = delta_syms.iter().map(|(s, k, l, n)| (*s, *k, *l, n.as_str()));
+    merge_syms_first_wins(pri, del)
+        .filter(|(_, k, _, _)| *k == kind::VARIABLE)
+        .map(|(s, _, _, _)| s)
+        .collect()
 }
 
 fn size_of_header() -> usize { std::mem::size_of::<Header>() }

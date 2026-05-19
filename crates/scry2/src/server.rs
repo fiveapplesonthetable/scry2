@@ -86,9 +86,14 @@ fn default_direction() -> String { "up".into() }
 fn default_depth() -> usize { 3 }
 fn default_max_syms() -> usize { 200 }
 
-/// Path-substring filter shared by `def`, `ref`, and `callers`.
-/// All three matches are on Kythe's stored `path` field with no
-/// normalization (see docs/USAGE.md for path semantics).
+/// Path-substring filter shared by every query verb. Matches on
+/// Kythe's stored `path` field with no normalization (see
+/// docs/USAGE.md for path semantics).
+///
+/// Empty-string filters are no-ops: `Some("")` for `in_` matches
+/// everything, `Some("")` for `not_in` rejects nothing. Matches what
+/// callers expect when an upstream pipes Option<String> through from
+/// the CLI without trimming.
 #[derive(Debug, Default, Clone, Copy)]
 struct PathFilter<'a> {
     /// File path of the ref/call site must contain this.
@@ -98,6 +103,29 @@ struct PathFilter<'a> {
     /// Target symbol's decl/def path must contain this — used to
     /// drop matches whose definitions live outside a subtree of interest.
     pub def_in: Option<&'a str>,
+}
+
+impl PathFilter<'_> {
+    /// One canonical `--in` / `--not-in` check. Used by every query
+    /// verb that path-filters its result rows or BFS frontier — never
+    /// inline this logic at a call site.
+    pub fn passes(&self, path: &str) -> bool {
+        if let Some(s) = self.in_ {
+            if !s.is_empty() && !path.contains(s) { return false; }
+        }
+        if let Some(s) = self.not_in {
+            if !s.is_empty() && path.contains(s) { return false; }
+        }
+        true
+    }
+
+    /// True iff at least one of `--in` / `--not-in` would actually
+    /// reject a path. Lets hot paths skip the path lookup entirely
+    /// when neither filter is set (or both are empty strings).
+    pub fn has_in_out(&self) -> bool {
+        self.in_.is_some_and(|s| !s.is_empty())
+            || self.not_in.is_some_and(|s| !s.is_empty())
+    }
 }
 
 /// Run a single request against a borrowed Index and return its Reply.
@@ -156,21 +184,17 @@ fn do_xrefs(
     let mut total = 0usize;
     let mut truncated = false;
     'outer: for sym in &syms {
-        if let Some(p) = filt.def_in {
-            let mut def_ok = false;
-            for (_, _, file, _) in ix.xrefs(*sym, role::DECL, role::DEF) {
-                if let Some(path) = ix.file_path(file) {
-                    if path.contains(p) { def_ok = true; break; }
-                }
+        if let Some(needle) = filt.def_in {
+            if !needle.is_empty() {
+                let def_ok = ix.sym_def_path(*sym).is_some_and(|p| p.contains(needle));
+                if !def_ok { continue; }
             }
-            if !def_ok { continue; }
         }
         let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", 0, 0));
         let mut rows: Vec<XrefHit> = Vec::new();
         for (_, r, file, off) in ix.xrefs(*sym, role_lo, role_hi) {
             let path = ix.file_path(file).unwrap_or("?");
-            if let Some(p) = filt.not_in { if path.contains(p) { continue; } }
-            if let Some(p) = filt.in_    { if !path.contains(p) { continue; } }
+            if !filt.passes(path) { continue; }
             rows.push(XrefHit { role: role_str(r).to_string(), file: path.to_string(), off });
             total += 1;
             if total >= max_hits {
@@ -211,10 +235,9 @@ fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
         let related = if sub { ix.inherited_by(sym) } else { ix.inherits_of(sym) };
         for r in related {
             if !seen.insert(r) { continue; }
-            if filt.in_.is_some() || filt.not_in.is_some() {
+            if filt.has_in_out() {
                 let p = ix.sym_def_path(r).unwrap_or("");
-                if let Some(s) = filt.in_     { if !p.contains(s) { continue; } }
-                if let Some(s) = filt.not_in  { if  p.contains(s) { continue; } }
+                if !filt.passes(p) { continue; }
             }
             hits.push(InhHit { name: name_of(r) });
         }
@@ -244,18 +267,17 @@ fn do_callgraph(
     // --def-in narrows the seed roots only (scry semantics): the
     // walker doesn't carry per-frame def context, so deeper levels
     // can't be filtered the same way.
-    let roots: Vec<u64> = if let Some(s) = filt.def_in {
-        roots.into_iter()
+    let roots: Vec<u64> = match filt.def_in {
+        Some(s) if !s.is_empty() => roots.into_iter()
             .filter(|r| ix.sym_def_path(*r).is_some_and(|p| p.contains(s)))
-            .collect()
-    } else { roots };
+            .collect(),
+        _ => roots,
+    };
     // --in / --not-in apply at every level (including roots).
+    let has_in_out = filt.has_in_out();
     let pass = |s: u64| -> bool {
-        if filt.in_.is_none() && filt.not_in.is_none() { return true; }
-        let p = ix.sym_def_path(s).unwrap_or("");
-        if let Some(needle) = filt.in_    { if !p.contains(needle) { return false; } }
-        if let Some(needle) = filt.not_in { if  p.contains(needle) { return false; } }
-        true
+        if !has_in_out { return true; }
+        filt.passes(ix.sym_def_path(s).unwrap_or(""))
     };
     let roots: Vec<u64> = roots.into_iter().filter(|r| pass(*r)).collect();
     if roots.is_empty() {
@@ -402,4 +424,58 @@ pub fn default_socket_for(index: &Path) -> PathBuf {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(format!("{runtime}/scry2-{:016x}.sock", h.finish()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PathFilter;
+
+    fn f<'a>(in_: Option<&'a str>, not_in: Option<&'a str>) -> PathFilter<'a> {
+        PathFilter { in_, not_in, def_in: None }
+    }
+
+    #[test]
+    fn passes_no_filters_matches_everything() {
+        let pf = f(None, None);
+        assert!(pf.passes(""));
+        assert!(pf.passes("frameworks/base/core/java/X.java"));
+        assert!(!pf.has_in_out());
+    }
+
+    #[test]
+    fn passes_in_substring_match() {
+        let pf = f(Some("frameworks/"), None);
+        assert!(pf.passes("/aosp/frameworks/base/x.java"));
+        assert!(!pf.passes("/aosp/system/core/x.cpp"));
+        assert!(pf.has_in_out());
+    }
+
+    #[test]
+    fn passes_not_in_substring_match() {
+        let pf = f(None, Some("/tests/"));
+        assert!(pf.passes("/aosp/frameworks/base/x.java"));
+        assert!(!pf.passes("/aosp/frameworks/base/tests/x.java"));
+        assert!(pf.has_in_out());
+    }
+
+    #[test]
+    fn passes_both_in_and_not_in() {
+        // `--in frameworks/ --not-in /tests/` is the canonical
+        // "real code only, no test files" query.
+        let pf = f(Some("frameworks/"), Some("/tests/"));
+        assert!(pf.passes("/aosp/frameworks/base/x.java"));
+        assert!(!pf.passes("/aosp/system/core/x.cpp"));        // wrong subtree
+        assert!(!pf.passes("/aosp/frameworks/base/tests/x.java")); // excluded
+    }
+
+    #[test]
+    fn empty_string_filters_are_no_ops() {
+        // Conservative semantics matching scry: an upstream that
+        // forwards Option<String> without trimming may produce
+        // Some(""). These should NOT reject everything.
+        let pf = f(Some(""), Some(""));
+        assert!(pf.passes("anything"));
+        assert!(pf.passes(""));
+        assert!(!pf.has_in_out(), "empty filters are not in/out filters");
+    }
 }

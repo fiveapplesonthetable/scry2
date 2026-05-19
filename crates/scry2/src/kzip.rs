@@ -118,16 +118,53 @@ impl Unit {
 
 // ----------------------------------------------------------------- reader
 
+/// Progress sink: invoked periodically by long-running kzip ops.
+/// `total = 0` is allowed if the caller doesn't know it yet (printer
+/// can fall back to a spinner). Use [`NoProgress`] for silent runs;
+/// `&mut P` works wherever `P: Progress` so a single sink can flow
+/// through nested calls without re-wrapping.
+pub trait Progress {
+    fn report(&mut self, phase: &str, done: usize, total: usize);
+}
+
+/// Zero-cost no-op progress sink. Use when you don't care about
+/// progress (tests, library callers, batch scripts).
+pub struct NoProgress;
+impl Progress for NoProgress {
+    fn report(&mut self, _: &str, _: usize, _: usize) {}
+}
+
+impl<P: Progress + ?Sized> Progress for &mut P {
+    fn report(&mut self, phase: &str, done: usize, total: usize) {
+        (**self).report(phase, done, total)
+    }
+}
+
 /// Iterate every CU in `path`, regardless of pbunits/units encoding.
 /// Decoded results stream — peak memory is one buffered unit.
 ///
 /// On encoding overlap (the same sha appearing under both pbunits/
 /// and units/), the proto wins and the JSON twin is silently dropped.
 pub fn read_units(path: &Path) -> Result<Vec<Unit>> {
+    read_units_progress(path, NoProgress)
+}
+
+/// Same as [`read_units`] but invokes `progress.report("read", ...)`
+/// on each unit decoded.
+pub fn read_units_progress<P: Progress>(path: &Path, mut progress: P) -> Result<Vec<Unit>> {
     let f = File::open(path).with_context(|| format!("open kzip {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(f).with_context(|| "open zip")?;
+    // Count pbunits/units up front so the callback can show a real
+    // percentage instead of a spinner from the first call.
+    let mut total_units = 0usize;
+    for i in 0..zip.len() {
+        let name = zip.by_index(i)?.name().to_string();
+        if strip_prefix(&name, "root/pbunits/").is_some()
+            || strip_prefix(&name, "root/units/").is_some()
+        { total_units += 1; }
+    }
     let mut proto_shas: HashSet<String> = HashSet::new();
-    let mut out: Vec<Unit> = Vec::new();
+    let mut out: Vec<Unit> = Vec::with_capacity(total_units);
     // First pass: proto-encoded units (they win on collision).
     for i in 0..zip.len() {
         let mut f = zip.by_index(i)?;
@@ -139,6 +176,7 @@ pub fn read_units(path: &Path) -> Result<Vec<Unit>> {
                 .with_context(|| format!("decode proto unit {sha}"))?;
             proto_shas.insert(sha.to_string());
             out.push(Unit { sha: sha.to_string(), cu, raw_proto: Some(buf) });
+            progress.report("read", out.len(), total_units);
         }
     }
     // Second pass: JSON-encoded units, skipping any with a proto twin.
@@ -152,6 +190,7 @@ pub fn read_units(path: &Path) -> Result<Vec<Unit>> {
             let cu: IndexedCompilation = serde_json::from_str(&buf)
                 .with_context(|| format!("decode JSON unit {sha}"))?;
             out.push(Unit { sha: sha.to_string(), cu, raw_proto: None });
+            progress.report("read", out.len(), total_units);
         }
     }
     Ok(out)
@@ -173,6 +212,15 @@ fn strip_prefix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
 /// produces with `KYTHE_KZIP_ENCODING=proto` — readable by every
 /// stock Kythe v0.0.75 indexer.
 pub fn write_normalized(src: &Path, units: &[Unit], out: &Path) -> Result<()> {
+    write_normalized_progress(src, units, out, NoProgress)
+}
+
+/// Same as [`write_normalized`] but invokes `progress.report` with
+/// phases `"write-units"` (proto re-encode + emit) and
+/// `"write-files"` (file-blob carry-over).
+pub fn write_normalized_progress<P: Progress>(
+    src: &Path, units: &[Unit], out: &Path, mut progress: P,
+) -> Result<()> {
     let in_f = File::open(src).with_context(|| format!("reopen kzip {}", src.display()))?;
     let mut zin = zip::ZipArchive::new(in_f)?;
     let out_f = File::create(out).with_context(|| format!("create {}", out.display()))?;
@@ -187,15 +235,17 @@ pub fn write_normalized(src: &Path, units: &[Unit], out: &Path) -> Result<()> {
 
     // Units → proto.
     let mut needed_files: HashSet<String> = HashSet::new();
-    for u in units {
+    for (i, u) in units.iter().enumerate() {
         zout.start_file(format!("root/pbunits/{}", u.sha), opts)?;
         zout.write_all(&u.to_proto_bytes())?;
         for fi in &u.cu.unit.required_input {
             if !fi.info.digest.is_empty() { needed_files.insert(fi.info.digest.clone()); }
         }
+        progress.report("write-units", i + 1, units.len());
     }
     // File blobs — copy verbatim from the source kzip.
-    for digest in &needed_files {
+    let total_files = needed_files.len();
+    for (i, digest) in needed_files.iter().enumerate() {
         let entry_name = format!("root/files/{digest}");
         let mut src_f = match zin.by_name(&entry_name) {
             Ok(f) => f,
@@ -204,6 +254,7 @@ pub fn write_normalized(src: &Path, units: &[Unit], out: &Path) -> Result<()> {
         };
         zout.start_file(&entry_name, opts)?;
         std::io::copy(&mut src_f, &mut zout)?;
+        progress.report("write-files", i + 1, total_files);
     }
     zout.finish()?.flush()?;
     Ok(())
@@ -212,14 +263,23 @@ pub fn write_normalized(src: &Path, units: &[Unit], out: &Path) -> Result<()> {
 /// One-shot: read every unit from `src`, write a proto-only kzip at
 /// `dst`. Returns `(n_units, n_files)`.
 pub fn normalize(src: &Path, dst: &Path) -> Result<(usize, usize)> {
-    let units = read_units(src)?;
+    normalize_progress(src, dst, NoProgress)
+}
+
+/// Same as [`normalize`] but invokes `progress.report` periodically
+/// during read and write phases. Phase strings: `"read"`,
+/// `"write-units"`, `"write-files"`.
+pub fn normalize_progress<P: Progress>(
+    src: &Path, dst: &Path, mut progress: P,
+) -> Result<(usize, usize)> {
+    let units = read_units_progress(src, &mut progress)?;
     let mut files: HashSet<String> = HashSet::new();
     for u in &units {
         for fi in &u.cu.unit.required_input {
             if !fi.info.digest.is_empty() { files.insert(fi.info.digest.clone()); }
         }
     }
-    write_normalized(src, &units, dst)?;
+    write_normalized_progress(src, &units, dst, &mut progress)?;
     Ok((units.len(), files.len()))
 }
 
@@ -512,6 +572,79 @@ mod tests {
         assert_eq!(strip_prefix("root/units/abc123", "root/units/"), Some("abc123"));
         // Nested paths still rejected.
         assert_eq!(strip_prefix("root/units/sub/abc", "root/units/"), None);
+    }
+
+    /// End-to-end: build a tiny mixed-encoding kzip in memory, run
+    /// `normalize_progress` against it, and verify the progress
+    /// callback fires for every phase. Locks the contract that
+    /// long-running ops emit observable progress instead of going
+    /// silent for minutes at a time.
+    #[test]
+    fn normalize_progress_invokes_callback_for_every_phase() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("scry2-kzip-prog-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("in.kzip");
+        let dst = dir.join("out.kzip");
+
+        // Build a kzip with one proto unit, one JSON unit, and one
+        // file blob. Exercises both reader passes + writer.
+        let f = std::fs::File::create(&src).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.add_directory("root/", opts).unwrap();
+        z.add_directory("root/pbunits/", opts).unwrap();
+        z.add_directory("root/units/", opts).unwrap();
+        z.add_directory("root/files/", opts).unwrap();
+        // One proto unit pointing at digest "abc".
+        let cu = IndexedCompilation {
+            unit: CompilationUnit {
+                v_name: VName { language: "c++".into(), ..Default::default() },
+                required_input: vec![FileInput {
+                    v_name: VName::default(),
+                    info: FileInfo { path: "foo.h".into(), digest: "abc".into() },
+                }],
+                ..Default::default()
+            },
+        };
+        z.start_file("root/pbunits/aaa", opts).unwrap();
+        z.write_all(&encode_indexed_compilation(&cu)).unwrap();
+        // One JSON unit pointing at a different digest.
+        z.start_file("root/units/bbb", opts).unwrap();
+        z.write_all(br#"{"unit":{"vName":{"language":"java"},"requiredInput":[{"info":{"path":"X.java","digest":"def"}}]}}"#).unwrap();
+        // File blobs.
+        z.start_file("root/files/abc", opts).unwrap();
+        z.write_all(b"void foo();").unwrap();
+        z.start_file("root/files/def", opts).unwrap();
+        z.write_all(b"class X {}").unwrap();
+        z.finish().unwrap();
+
+        #[derive(Default)]
+        struct Recorder {
+            calls: std::collections::HashMap<String, (usize, usize)>,
+        }
+        impl Progress for Recorder {
+            fn report(&mut self, phase: &str, done: usize, total: usize) {
+                let e = self.calls.entry(phase.to_string()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = e.1.max(done);
+                assert!(done <= total.max(done), "done={done} total={total}");
+            }
+        }
+        let mut rec = Recorder::default();
+        let (n_units, n_files) = normalize_progress(&src, &dst, &mut rec).unwrap();
+        assert_eq!(n_units, 2, "1 proto + 1 JSON");
+        assert_eq!(n_files, 2, "2 file blobs");
+        // Each phase must have been reported at least once, and the
+        // last `done` for each must equal the total work.
+        for phase in &["read", "write-units", "write-files"] {
+            let (calls, max_done) = rec.calls.get(*phase)
+                .unwrap_or_else(|| panic!("phase {phase} never reported"));
+            assert!(*calls >= 1, "phase {phase}: at least one progress call");
+            assert_eq!(*max_done, 2, "phase {phase}: last done == total work");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

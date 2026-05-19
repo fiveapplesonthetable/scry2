@@ -346,6 +346,31 @@ mod tests {
     }
 
     #[test]
+    fn ref_def_in_empty_string_is_noop() {
+        // Conservative semantics: --def-in="" should match every sym,
+        // not reject all of them. Mirrors scry's path_matches behavior.
+        use server::{Request, dispatch};
+        use reply::Reply;
+        let path = tmp("def_in_empty");
+        let mut b = IndexBuilder::new();
+        let s_foo = sym_of("foo");
+        b.upsert_sym(s_foo, kind::FUNCTION, lang::CXX, "foo");
+        b.upsert_file(1, "/aosp/x.cpp");
+        b.add_xref(s_foo, role::DECL, 1, 100);
+        b.add_xref(s_foo, role::REF,  1, 200);
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+        let r = dispatch(&ix, &Request::Ref {
+            name: "foo".into(), substr: false, limit: 16, max_hits: 200,
+            in_: Some("".into()), not_in: Some("".into()), def_in: Some("".into()),
+        });
+        if let Reply::Xrefs { total, .. } = r {
+            assert!(total >= 1, "empty filters must not reject anything");
+        } else { panic!("expected Reply::Xrefs") }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn name_substring_match() {
         let path = tmp("substr");
         let mut b = IndexBuilder::new();

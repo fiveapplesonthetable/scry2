@@ -13,18 +13,42 @@ use scry2::{Index, IndexBuilder, kythe, kzip, reply::{Reply, emit}, server::{sel
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Expand a leading `~/` (and bare `~`) in `s` against `home`. Pure
+/// — no env access — so tests can drive every branch without mutating
+/// process-global state. With `home = None` the tilde is preserved
+/// verbatim (matches what most shells do when `$HOME` is unset).
+fn expand_tilde(s: &str, home: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(h) = home {
+            let mut p = PathBuf::from(h);
+            p.push(rest);
+            return p;
+        }
+    } else if s == "~" {
+        if let Some(h) = home { return PathBuf::from(h); }
+    }
+    PathBuf::from(s)
+}
+
+/// Clap value parser for every path-valued argument. Thin shim over
+/// [`expand_tilde`] that reads `$HOME` from the environment so the
+/// CLI accepts shell-style home references like `~/scry2-setup/...`.
+fn path_arg(s: &str) -> Result<PathBuf, String> {
+    Ok(expand_tilde(s, std::env::var_os("HOME").as_deref()))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "scry2", version, about = "lean Kythe wrapper for AOSP")]
 struct Cli {
     /// Path to the .s2db index file. Defaults to ./scry2.s2db. Ignored
     /// when --socket is set — the daemon owns the index.
-    #[arg(long, global = true, default_value = "scry2.s2db")]
+    #[arg(long, global = true, default_value = "scry2.s2db", value_parser = path_arg)]
     index: PathBuf,
 
     /// If set, send the query to the `scry2 serve` daemon listening
     /// on this Unix socket instead of opening the index in-process.
     /// Eliminates the ~10 ms process-startup + mmap cost per query.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = path_arg)]
     socket: Option<PathBuf>,
 
     /// Emit machine-readable JSON. Same wire shape the daemon returns.
@@ -43,8 +67,10 @@ enum Cmd {
     /// Build an .s2db from one or more delimited Kythe Entry proto
     /// streams. Use `-` to read from stdin.
     Index {
-        #[arg(long = "entries", required = true)] entries: Vec<PathBuf>,
-        #[arg(short, long, default_value = "scry2.s2db")] out: PathBuf,
+        #[arg(long = "entries", required = true, value_parser = path_arg)]
+        entries: Vec<PathBuf>,
+        #[arg(short, long, default_value = "scry2.s2db", value_parser = path_arg)]
+        out: PathBuf,
     },
 
     /// `def NAME` — print the definition site(s) of a symbol.
@@ -131,7 +157,7 @@ enum Cmd {
     Serve {
         /// Socket path. Defaults to a stable per-index path under
         /// $XDG_RUNTIME_DIR (or /tmp).
-        #[arg(long)] socket: Option<PathBuf>,
+        #[arg(long, value_parser = path_arg)] socket: Option<PathBuf>,
     },
 
     /// `repl` — stdin/stdout JSON loop. One request per line in, one
@@ -146,16 +172,16 @@ enum Cmd {
     /// "Malformed kzip: multiple unit encodings but different entries".
     /// Run this once before `from-kzip`.
     NormalizeKzip {
-        #[arg(long = "in",  value_name = "PATH")] in_:  PathBuf,
-        #[arg(long = "out", value_name = "PATH")] out: PathBuf,
+        #[arg(long = "in",  value_name = "PATH", value_parser = path_arg)] in_:  PathBuf,
+        #[arg(long = "out", value_name = "PATH", value_parser = path_arg)] out: PathBuf,
     },
 
     /// `from-kzip` — build an .s2db by running each Kythe indexer
     /// against KZIP and ingesting all entries.
     FromKzip {
-        #[arg(long)] kzip: PathBuf,
-        #[arg(long = "kythe-root")] kythe_root: PathBuf,
-        #[arg(short, long, default_value = "scry2.s2db")] out: PathBuf,
+        #[arg(long, value_parser = path_arg)] kzip: PathBuf,
+        #[arg(long = "kythe-root", value_parser = path_arg)] kythe_root: PathBuf,
+        #[arg(short, long, default_value = "scry2.s2db", value_parser = path_arg)] out: PathBuf,
         #[arg(long, default_value = "cxx,java,jvm,go,proto,textproto")]
         langs: String,
         #[arg(long, default_value = "8g")] jvm_heap: String,
@@ -206,10 +232,47 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// One-line-per-second progress printer, used by every long-running
+/// CLI subcommand that takes a `Progress`. Throttles to once-per-
+/// second within a phase, but always emits the first line of a new
+/// phase so the user sees the transition (read → write-units →
+/// write-files).
+struct CliProgress {
+    label: &'static str,
+    phase: String,
+    phase_t0: Instant,
+    last_tick: Instant,
+}
+
+impl CliProgress {
+    fn new(label: &'static str) -> Self {
+        let now = Instant::now();
+        Self { label, phase: String::new(), phase_t0: now, last_tick: now }
+    }
+}
+
+impl kzip::Progress for CliProgress {
+    fn report(&mut self, phase: &str, done: usize, total: usize) {
+        let new_phase = self.phase != phase;
+        if new_phase {
+            self.phase.clear();
+            self.phase.push_str(phase);
+            self.phase_t0 = Instant::now();
+        }
+        if !new_phase && self.last_tick.elapsed().as_secs() < 1 { return; }
+        self.last_tick = Instant::now();
+        let pct = if total == 0 { 0.0 } else { 100.0 * done as f64 / total as f64 };
+        eprintln!("[{}] {:>11} {:>7}/{:<7} ({:>5.1}%)  +{:.1}s",
+            self.label, phase, done, total, pct,
+            self.phase_t0.elapsed().as_secs_f64());
+    }
+}
+
 fn cmd_normalize_kzip(in_: &std::path::Path, out: &std::path::Path) -> Result<()> {
     let t0 = Instant::now();
     eprintln!("[normalize] reading {}", in_.display());
-    let (n_units, n_files) = kzip::normalize(in_, out)?;
+    let (n_units, n_files) =
+        kzip::normalize_progress(in_, out, CliProgress::new("normalize"))?;
     eprintln!(
         "[normalize] done in {:.1}s — {} units, {} unique file blobs → {}",
         t0.elapsed().as_secs_f64(), n_units, n_files, out.display(),
@@ -331,4 +394,50 @@ fn cmd_from_kzip(
         t0.elapsed().as_secs_f64(), out.display(), bytes as f64 / 1e9,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_tilde;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    fn h(s: &str) -> Option<&OsStr> { Some(OsStr::new(s)) }
+
+    #[test]
+    fn no_tilde_is_passthrough() {
+        assert_eq!(expand_tilde("/abs/path", h("/home/u")), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("rel/path",  h("/home/u")), PathBuf::from("rel/path"));
+        assert_eq!(expand_tilde("",          h("/home/u")), PathBuf::from(""));
+    }
+
+    #[test]
+    fn tilde_slash_expands() {
+        assert_eq!(expand_tilde("~/scry2-setup/aosp.s2db", h("/home/test-user")),
+                   PathBuf::from("/home/test-user/scry2-setup/aosp.s2db"));
+    }
+
+    #[test]
+    fn bare_tilde_is_home() {
+        assert_eq!(expand_tilde("~", h("/home/test-user")),
+                   PathBuf::from("/home/test-user"));
+    }
+
+    #[test]
+    fn tilde_only_at_start() {
+        // `foo/~/bar` is a literal path; only leading `~/` expands.
+        assert_eq!(expand_tilde("foo/~/bar", h("/home/u")),
+                   PathBuf::from("foo/~/bar"));
+        // Embedded tilde without slash is also literal.
+        assert_eq!(expand_tilde("~user/foo", h("/home/u")),
+                   PathBuf::from("~user/foo"));
+    }
+
+    #[test]
+    fn no_home_falls_back_to_verbatim() {
+        // No `$HOME` → tilde stays in the path verbatim. Don't crash,
+        // don't guess.
+        assert_eq!(expand_tilde("~/foo", None), PathBuf::from("~/foo"));
+        assert_eq!(expand_tilde("~",     None), PathBuf::from("~"));
+    }
 }

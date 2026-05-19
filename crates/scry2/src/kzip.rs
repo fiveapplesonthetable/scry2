@@ -127,13 +127,7 @@ impl Unit {
     /// 3. `v_name.path` — the unit's own VName (rare but valid for
     ///    JVM bytecode units that have no source files).
     pub fn primary_path(&self) -> Option<&str> {
-        if let Some(f) = self.cu.unit.source_file.first() { return Some(f.as_str()); }
-        if let Some(ri) = self.cu.unit.required_input.first() {
-            if !ri.v_name.path.is_empty() { return Some(&ri.v_name.path); }
-            if !ri.info.path.is_empty()   { return Some(&ri.info.path);   }
-        }
-        let vp = self.cu.unit.v_name.path.as_str();
-        if !vp.is_empty() { Some(vp) } else { None }
+        cu_primary_path(&self.cu.unit)
     }
 
     /// Language hint from `v_name.language`. Lower-cased so callers
@@ -142,6 +136,19 @@ impl Unit {
     pub fn language(&self) -> String {
         self.cu.unit.v_name.language.to_ascii_lowercase()
     }
+}
+
+/// Same lookup as [`Unit::primary_path`] but free-standing so callers
+/// that hold only a `CompilationUnit` (no Unit wrapper, no raw_proto)
+/// can re-check the path post-decode without rebuilding a Unit.
+pub fn cu_primary_path(cu: &CompilationUnit) -> Option<&str> {
+    if let Some(f) = cu.source_file.first() { return Some(f.as_str()); }
+    if let Some(ri) = cu.required_input.first() {
+        if !ri.v_name.path.is_empty() { return Some(&ri.v_name.path); }
+        if !ri.info.path.is_empty()   { return Some(&ri.info.path);   }
+    }
+    let vp = cu.v_name.path.as_str();
+    if !vp.is_empty() { Some(vp) } else { None }
 }
 
 // ----------------------------------------------------------------- reader
@@ -175,6 +182,257 @@ impl<P: Progress + ?Sized> Progress for &mut P {
 /// and units/), the proto wins and the JSON twin is silently dropped.
 pub fn read_units(path: &Path) -> Result<Vec<Unit>> {
     read_units_progress(path, NoProgress)
+}
+
+/// Cheap peek over raw unit bytes for the CU's primary source path,
+/// used by [`read_units_filtered`] to skip the full decode when a
+/// path filter would drop the unit anyway. Walks the proto/JSON
+/// without allocating per-CU work. Returns:
+///   `Some(path)` — confidently located the primary source path;
+///   `Some("")`  — successfully parsed structure with no source path
+///                 (e.g., file-only CUs);
+///   `None`      — the peek could not find a recognizable structure;
+///                 the caller should fall back to a full decode rather
+///                 than silently drop the CU under an `--in` filter.
+pub fn peek_primary_path(bytes: &[u8], is_proto: bool) -> Option<String> {
+    if is_proto { peek_proto_primary_path(bytes) }
+    else        { peek_json_primary_path(bytes)  }
+}
+
+fn peek_proto_primary_path(bytes: &[u8]) -> Option<String> {
+    // IndexedCompilation.unit (field 1) is a sub-message.
+    let cu = find_field_ld_truncating(bytes, 1)?;
+    // CompilationUnit.source_file (field 6) is a repeated string —
+    // take the first one if present.
+    if let Some(s) = find_first_field_string(cu, 6) { return Some(s); }
+    // Fall back to CompilationUnit.required_input[0] (field 3,
+    // repeated FileInput). FileInput.v_name (field 1) is a VName,
+    // its .path (field 4) is the source path.
+    let first_input = find_field_ld_truncating(cu, 3)?;
+    let vname       = find_field_ld_truncating(first_input, 1)?;
+    if let Some(p) = find_first_field_string(vname, 4) { return Some(p); }
+    // Last resort: FileInput.info (field 2) is FileInfo, its .path
+    // (field 1) is the source path. If even that's absent we return
+    // Some("") — the structure was parseable, the CU just has no
+    // primary path. (Distinct from `None`, which means "couldn't
+    // walk the proto at all".)
+    let info = find_field_ld_truncating(first_input, 2)?;
+    Some(find_first_field_string(info, 1).unwrap_or_default())
+}
+
+fn peek_json_primary_path(bytes: &[u8]) -> Option<String> {
+    // Prefer the proto3-JSON name `source_file` (snake) or its
+    // camelCase twin. CompilationUnit.source_file is a repeated
+    // string so the value is `["path", ...]`; we peek the first
+    // element. If the encoder happens to emit a bare string, take
+    // that too.
+    for key in [&b"\"source_file\""[..], &b"\"sourceFile\""[..]] {
+        if let Some(s) = json_first_value_string_or_list(bytes, key) {
+            return Some(s);
+        }
+    }
+    // Walk every `"path":"<...>"` and return the first whose suffix
+    // looks like a source file. Covers CUs whose source_file isn't a
+    // direct top-level key but whose first source-extension required
+    // input is the primary source.
+    let mut cursor = 0;
+    while let Some(rel) = memmem(&bytes[cursor..], b"\"path\"") {
+        let after = cursor + rel + b"\"path\"".len();
+        if let Some((val, end)) = json_take_string_value(bytes, after) {
+            if is_source_extension(&val) { return Some(val); }
+            cursor = end;
+        } else {
+            cursor = after;
+        }
+    }
+    // Couldn't peek a recognizable source path — let the caller fall
+    // back to a full decode rather than silently dropping the CU.
+    None
+}
+
+/// Walk a length-delimited proto sub-message for one field, returning
+/// its raw payload bytes. Truncating: when the declared length runs
+/// past `bytes`, return the clipped tail anyway (peek buffers are
+/// allowed to end mid-field).
+fn find_field_ld_truncating(bytes: &[u8], target: u32) -> Option<&[u8]> {
+    let mut cur = 0;
+    while cur < bytes.len() {
+        let (tag, n) = peek_varint(&bytes[cur..])?;
+        cur += n;
+        let field = (tag >> 3) as u32;
+        let wire = (tag & 0x7) as u8;
+        if field == target && wire == 2 {
+            let (len, ln) = peek_varint(&bytes[cur..])?;
+            cur += ln;
+            let end = cur.checked_add(len as usize)?;
+            return Some(&bytes[cur..end.min(bytes.len())]);
+        }
+        cur = skip_proto_field(bytes, cur, wire)?;
+    }
+    None
+}
+
+/// First length-delimited string field at `target`, decoded UTF-8.
+fn find_first_field_string(bytes: &[u8], target: u32) -> Option<String> {
+    let raw = find_field_ld_truncating(bytes, target)?;
+    std::str::from_utf8(raw).ok().map(|s| s.to_string())
+}
+
+fn skip_proto_field(bytes: &[u8], cur: usize, wire: u8) -> Option<usize> {
+    match wire {
+        0 => { let (_, n) = peek_varint(&bytes[cur..])?; Some(cur + n) }
+        1 => if cur + 8 <= bytes.len() { Some(cur + 8) } else { None },
+        2 => {
+            let (len, n) = peek_varint(&bytes[cur..])?;
+            let end = cur.checked_add(n)?.checked_add(len as usize)?;
+            if end > bytes.len() { return None; }
+            Some(end)
+        }
+        5 => if cur + 4 <= bytes.len() { Some(cur + 4) } else { None },
+        _ => None,
+    }
+}
+
+/// Standalone varint reader used by the slice-walking peek helpers
+/// above. Returns the decoded value plus the byte count it consumed,
+/// or `None` if `bytes` is truncated. (Distinct from the cursor-style
+/// [`read_varint_bytes`] used by the strict decoder further down.)
+fn peek_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut val: u64 = 0;
+    let mut shift = 0u32;
+    for i in 0..10 {
+        let b = *bytes.get(i)?;
+        val |= ((b & 0x7F) as u64) << shift;
+        if b & 0x80 == 0 { return Some((val, i + 1)); }
+        shift += 7;
+    }
+    None
+}
+
+fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() { return None; }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Locate `key` in `bytes` and return the first string value after
+/// the `:` — accepting either a bare `"..."` or the first element of
+/// a `[ "...", ... ]` array. Used to peek proto3-JSON repeated-string
+/// fields like `source_file`.
+fn json_first_value_string_or_list(bytes: &[u8], key: &[u8]) -> Option<String> {
+    let rel = memmem(bytes, key)?;
+    let after = rel + key.len();
+    let mut p = after;
+    while p < bytes.len() && bytes[p].is_ascii_whitespace() { p += 1; }
+    if bytes.get(p) != Some(&b':') { return None; }
+    p += 1;
+    while p < bytes.len() && bytes[p].is_ascii_whitespace() { p += 1; }
+    if bytes.get(p) == Some(&b'[') {
+        p += 1;
+        while p < bytes.len() && bytes[p].is_ascii_whitespace() { p += 1; }
+    }
+    if bytes.get(p) != Some(&b'"') { return None; }
+    // Reuse json_take_string_value's quote-walking by reconstructing
+    // a position just after the key — feed it the `:` we already
+    // confirmed, but anchored at the same offset. The simpler path
+    // is to inline the quote walk here.
+    p += 1;
+    let start = p;
+    while p < bytes.len() && bytes[p] != b'"' {
+        if bytes[p] == b'\\' && p + 1 < bytes.len() { p += 2; }
+        else { p += 1; }
+    }
+    if p >= bytes.len() { return None; }
+    let raw = &bytes[start..p];
+    Some(std::str::from_utf8(raw).ok()?.to_string())
+}
+
+fn json_take_string_value(bytes: &[u8], from: usize) -> Option<(String, usize)> {
+    let mut p = from;
+    while p < bytes.len() && bytes[p].is_ascii_whitespace() { p += 1; }
+    if bytes.get(p) != Some(&b':') { return None; }
+    p += 1;
+    while p < bytes.len() && bytes[p].is_ascii_whitespace() { p += 1; }
+    if bytes.get(p) != Some(&b'"') { return None; }
+    p += 1;
+    let start = p;
+    while p < bytes.len() && bytes[p] != b'"' {
+        if bytes[p] == b'\\' && p + 1 < bytes.len() { p += 2; }
+        else { p += 1; }
+    }
+    if p >= bytes.len() { return None; }
+    let raw = &bytes[start..p];
+    Some((std::str::from_utf8(raw).ok()?.to_string(), p + 1))
+}
+
+fn is_source_extension(path: &str) -> bool {
+    const EXTS: &[&str] = &[
+        ".cc", ".cpp", ".cxx", ".c++", ".c", ".m", ".mm",
+        ".java", ".kt", ".go", ".rs",
+        ".proto", ".textpb", ".textproto",
+    ];
+    EXTS.iter().any(|e| path.ends_with(e))
+}
+
+/// Read every CU in `path` whose primary source path satisfies
+/// `accept`. When the cheap peek confidently locates a path, the CU
+/// is dropped without a full decode — this avoids the ~3 min / 5 GB
+/// cost of decoding 118 k AOSP units when only ~1 k of them match an
+/// `--in` filter. When the peek returns `None` (unrecognized layout)
+/// we fall back to a full decode and re-check `accept` against the
+/// decoded primary path, so a malformed-but-otherwise-parseable CU is
+/// never silently dropped.
+pub fn read_units_filtered<P: Progress, F: Fn(&str) -> bool>(
+    path: &Path, mut progress: P, accept: F,
+) -> Result<Vec<Unit>> {
+    let f = File::open(path).with_context(|| format!("open kzip {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(f).with_context(|| "open zip")?;
+    let mut pbunit_idx: Vec<(usize, String)> = Vec::new();
+    let mut json_idx:   Vec<(usize, String)> = Vec::new();
+    for i in 0..zip.len() {
+        let name = zip.by_index(i)?.name().to_string();
+        if let Some(sha) = strip_prefix(&name, "root/pbunits/") {
+            pbunit_idx.push((i, sha.to_string()));
+        } else if let Some(sha) = strip_prefix(&name, "root/units/") {
+            json_idx.push((i, sha.to_string()));
+        }
+    }
+    let total_units = pbunit_idx.len() + json_idx.len();
+    let mut proto_shas: HashSet<String> = HashSet::new();
+    let mut out: Vec<Unit> = Vec::new();
+    let mut scanned = 0usize;
+    for (i, sha) in &pbunit_idx {
+        let mut f = zip.by_index(*i)?;
+        let mut buf = Vec::with_capacity(f.size() as usize);
+        f.read_to_end(&mut buf)?;
+        scanned += 1;
+        progress.report("scan", scanned, total_units);
+        match peek_primary_path(&buf, true) {
+            Some(p) if !accept(&p) => continue,
+            _ => {}
+        }
+        let cu = parse_indexed_compilation(&buf)
+            .with_context(|| format!("decode proto unit {sha}"))?;
+        if !accept(cu_primary_path(&cu.unit).unwrap_or("")) { continue; }
+        proto_shas.insert(sha.clone());
+        out.push(Unit { sha: sha.clone(), cu, raw_proto: Some(buf) });
+    }
+    for (i, sha) in &json_idx {
+        if proto_shas.contains(sha) { scanned += 1; continue; }
+        let mut f = zip.by_index(*i)?;
+        let mut buf = String::with_capacity(f.size() as usize);
+        f.read_to_string(&mut buf)?;
+        scanned += 1;
+        progress.report("scan", scanned, total_units);
+        match peek_primary_path(buf.as_bytes(), false) {
+            Some(p) if !accept(&p) => continue,
+            _ => {}
+        }
+        let cu: IndexedCompilation = serde_json::from_str(&buf)
+            .with_context(|| format!("decode JSON unit {sha}"))?;
+        if !accept(cu_primary_path(&cu.unit).unwrap_or("")) { continue; }
+        out.push(Unit { sha: sha.clone(), cu, raw_proto: None });
+    }
+    Ok(out)
 }
 
 /// Same as [`read_units`] but invokes `progress.report("read", ...)`

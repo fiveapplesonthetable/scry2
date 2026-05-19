@@ -4,14 +4,14 @@
 //! Writes go to a tempfile in the same directory, then atomically
 //! rename. A crashed build leaves a `.tmp` behind, never a torn index.
 
-use crate::format::*;
+use crate::format::{*, kind};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct IndexBuilder {
     xrefs:    Vec<(u64, u8, u32, u32)>,
     syms:     HashMap<u64, (u8, u8, String)>,   // sym → (kind, lang, name)
@@ -83,6 +83,48 @@ impl IndexBuilder {
     pub fn n_aliases(&self) -> usize { self.aliases.len() }
     pub fn n_calls(&self) -> usize { self.calls.len() }
 
+    /// Snapshot the current accumulated state to `path` without
+    /// consuming `self`. Used by `from-kzip` to write a partial
+    /// `.s2db` every N CUs so a killed run can resume via
+    /// [`populate_from_index`].
+    ///
+    /// Implementation: clone the in-memory tables, then call
+    /// [`finish`]. Clone cost on a fully-loaded AOSP builder is
+    /// dominated by memcpy of the xref/calls vectors (~8 GB at
+    /// ~10 GB/s ≈ 1 s) — short enough to take under the builder
+    /// mutex without stalling workers visibly. The cloned copy is
+    /// dropped when `finish` returns; the original `self` continues
+    /// accumulating new CUs.
+    pub fn snapshot(&self, path: &Path) -> Result<u64> {
+        self.clone().finish(path)
+    }
+
+    /// Replay every row from a saved `.s2db` into `self`. After this
+    /// call, calling [`finish`] reproduces a superset of the same
+    /// `.s2db` — superset because callers usually keep ingesting
+    /// more CUs after a resume.
+    pub fn populate_from_index(&mut self, ix: &crate::reader::Index) -> Result<()> {
+        for (sym, role, file, offset) in ix.iter_xrefs() {
+            self.add_xref(sym, role, file, offset);
+        }
+        for (sym, kind, lang, name) in ix.iter_syms() {
+            self.upsert_sym(sym, kind, lang, name);
+        }
+        for (file, path) in ix.iter_files() {
+            self.upsert_file(file, path);
+        }
+        for (child, parent) in ix.iter_inherits() {
+            self.add_inherit(child, parent);
+        }
+        for (caller, callee, role) in ix.iter_calls() {
+            self.add_call(caller, callee, role);
+        }
+        for (sym, alias) in ix.iter_aliases() {
+            self.add_alias(sym, alias);
+        }
+        Ok(())
+    }
+
     /// Sort all tables and serialize to `path` atomically. Returns total
     /// bytes written.
     pub fn finish(mut self, path: &Path) -> Result<u64> {
@@ -108,6 +150,32 @@ impl IndexBuilder {
         }
         // Also lay out aliases in the blob. We collect `(sym, off, len)`
         // tuples now and fold them into the alpha index later.
+        //
+        // Two stream-quality fixes happen here, deferred to finish so the
+        // ingest path can stay branch-free and order-independent:
+        //
+        // (a) Dedup. A single CU often emits the same `/kythe/edge/named`
+        //     alias on dozens of nodes (every reference to a function
+        //     inherits its MarkedSource), so the raw Vec routinely has
+        //     30× redundancy per CU. Sort+dedup keys on `(sym, alias)`
+        //     because the same alias on a different sym is a separate
+        //     fact.
+        //
+        // (b) Variable-kind suppression. cxx_indexer emits `/kythe/code`
+        //     MarkedSource for parameters and locals too — the parsed
+        //     FQN of `Method::param` is `Method::param`, indistinguishable
+        //     from a top-level entity. Without this filter,
+        //     `def writeAligned --substr` returns both the method and its
+        //     parameter sym, which surprises users. Kind facts can arrive
+        //     before or after the code fact in the stream, so we resolve
+        //     here when every sym's kind is known.
+        let var_syms: std::collections::HashSet<u64> = syms_vec.iter()
+            .filter(|(_, k, _, _)| *k == kind::VARIABLE)
+            .map(|(s, _, _, _)| *s)
+            .collect();
+        self.aliases.retain(|(s, _)| !var_syms.contains(s));
+        self.aliases.sort_unstable();
+        self.aliases.dedup();
         let mut alias_pos: Vec<(u64, u32, u16)> = Vec::with_capacity(self.aliases.len());
         for (sym, alias) in &self.aliases {
             assert!(alias.len() <= u16::MAX as usize, "alias longer than 64KB");

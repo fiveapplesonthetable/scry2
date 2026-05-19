@@ -590,6 +590,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "memchr",
  "memmap2",
  "rand",
  "serde",

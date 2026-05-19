@@ -40,6 +40,7 @@ impl Index {
     pub fn n_files(&self) -> u64 { self.hdr.files_n }
     pub fn n_inh(&self)   -> u64 { self.hdr.inh_n }
     pub fn n_calls(&self) -> u64 { self.hdr.calls_n }
+    pub fn n_names(&self) -> u64 { self.hdr.names_n }
 
     // -- raw section slices --------------------------------------------------
 
@@ -153,19 +154,27 @@ impl Index {
 
     /// Return all syms whose qualified name contains `needle` (case-
     /// sensitive substring). Linear scan over the name index; for 5M
-    /// syms × 64 B/name = 320 MB this is 1 SSD pass, ~few hundred ms cold,
-    /// instant warm.
+    /// syms × 64 B/name = 320 MB this is 1 SSD pass.
+    ///
+    /// Uses `memchr::memmem::Finder` for the inner string search: it
+    /// precomputes a SIMD-friendly state machine once per call and
+    /// is ~10× faster than the naive `windows(needle.len()).position`
+    /// pattern on long names, which dominates wall time on AOSP
+    /// (~5M names averaging 60 bytes).
     pub fn syms_matching_substring(&self, needle: &str, limit: usize) -> Vec<u64> {
         let names = self.names_slice();
         let n = self.hdr.names_n as usize;
         let mut out = Vec::with_capacity(limit.min(64));
         let nb = needle.as_bytes();
+        if nb.is_empty() { return out; }
+        let finder = memchr::memmem::Finder::new(nb);
+        let blob = self.blob();
         for i in 0..n {
             let row_off = i * NAME_LEN;
             let name_off = u32::from_be_bytes(names[row_off..row_off + 4].try_into().unwrap());
             let name_len = u16::from_be_bytes(names[row_off + 4..row_off + 6].try_into().unwrap());
-            let row_name = &self.blob()[name_off as usize..name_off as usize + name_len as usize];
-            if memmem(row_name, nb).is_some() {
+            let row_name = &blob[name_off as usize..name_off as usize + name_len as usize];
+            if finder.find(row_name).is_some() {
                 let sym = u64::from_be_bytes(names[row_off + 8..row_off + 16].try_into().unwrap());
                 out.push(sym);
                 if out.len() >= limit { break; }
@@ -350,6 +359,111 @@ impl Index {
         }
         None
     }
+
+    // -- whole-table iterators ----------------------------------------------
+    //
+    // Used by `IndexBuilder::load_from_index` to replay a partial
+    // snapshot into a fresh builder when --resume picks up a killed
+    // from-kzip run. No mutation contracts — iteration is read-only
+    // over the mapped pages.
+
+    pub fn iter_xrefs(&self) -> impl Iterator<Item = (u64, u8, u32, u32)> + '_ {
+        let n = self.hdr.xrefs_n as usize;
+        let xrefs = self.xrefs_slice();
+        (0..n).map(move |i| {
+            let off = i * XREF_LEN;
+            let sym  = u64::from_be_bytes(xrefs[off..off + 8].try_into().unwrap());
+            let role = xrefs[off + 8];
+            let file = u32::from_be_bytes(xrefs[off + 9..off + 13].try_into().unwrap());
+            let xoff = u32::from_be_bytes(xrefs[off + 13..off + 17].try_into().unwrap());
+            (sym, role, file, xoff)
+        })
+    }
+
+    pub fn iter_syms(&self) -> impl Iterator<Item = (u64, u8, u8, &str)> + '_ {
+        let n = self.hdr.syms_n as usize;
+        let syms = self.syms_slice();
+        let blob = self.blob();
+        (0..n).map(move |i| {
+            let off = i * SYM_LEN;
+            let sym  = u64::from_be_bytes(syms[off..off + 8].try_into().unwrap());
+            let kind = syms[off + 8];
+            let lang = syms[off + 9];
+            let no = u32::from_be_bytes(syms[off + 10..off + 14].try_into().unwrap()) as usize;
+            let nl = u16::from_be_bytes(syms[off + 14..off + 16].try_into().unwrap()) as usize;
+            let name = std::str::from_utf8(&blob[no..no + nl]).unwrap_or("");
+            (sym, kind, lang, name)
+        })
+    }
+
+    pub fn iter_files(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
+        let n = self.hdr.files_n as usize;
+        let files = self.files_slice();
+        let blob = self.blob();
+        (0..n).map(move |i| {
+            let off = i * FILE_LEN;
+            let f = u32::from_be_bytes(files[off..off + 4].try_into().unwrap());
+            let po = u32::from_be_bytes(files[off + 4..off + 8].try_into().unwrap()) as usize;
+            let pl = u16::from_be_bytes(files[off + 8..off + 10].try_into().unwrap()) as usize;
+            let p = std::str::from_utf8(&blob[po..po + pl]).unwrap_or("");
+            (f, p)
+        })
+    }
+
+    pub fn iter_inherits(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let n = self.hdr.inh_n as usize;
+        let inh = self.inh_slice();
+        (0..n).map(move |i| {
+            let off = i * INH_LEN;
+            let c = u64::from_be_bytes(inh[off..off + 8].try_into().unwrap());
+            let p = u64::from_be_bytes(inh[off + 8..off + 16].try_into().unwrap());
+            (c, p)
+        })
+    }
+
+    pub fn iter_calls(&self) -> impl Iterator<Item = (u64, u64, u8)> + '_ {
+        let n = self.hdr.calls_n as usize;
+        let calls = self.calls_slice();
+        (0..n).map(move |i| {
+            let off = i * CALL_LEN;
+            let caller = u64::from_be_bytes(calls[off..off + 8].try_into().unwrap());
+            let callee = u64::from_be_bytes(calls[off + 8..off + 16].try_into().unwrap());
+            let role   = calls[off + 16];
+            (caller, callee, role)
+        })
+    }
+
+    /// Names that are NOT a sym's canonical name — i.e., aliases learned
+    /// via `/kythe/edge/named` or MarkedSource. Used by snapshot/resume
+    /// to round-trip alias rows back through `IndexBuilder::add_alias`
+    /// without doubling the canonical names.
+    pub fn iter_aliases(&self) -> impl Iterator<Item = (u64, &str)> + '_ {
+        // Build a per-sym canonical (off,len) lookup once.
+        let syms = self.syms_slice();
+        let n_syms = self.hdr.syms_n as usize;
+        let mut canon: std::collections::HashMap<u64, (u32, u16)> =
+            std::collections::HashMap::with_capacity(n_syms);
+        for i in 0..n_syms {
+            let off = i * SYM_LEN;
+            let s  = u64::from_be_bytes(syms[off..off + 8].try_into().unwrap());
+            let no = u32::from_be_bytes(syms[off + 10..off + 14].try_into().unwrap());
+            let nl = u16::from_be_bytes(syms[off + 14..off + 16].try_into().unwrap());
+            canon.insert(s, (no, nl));
+        }
+        let names = self.names_slice();
+        let n_names = self.hdr.names_n as usize;
+        let blob = self.blob();
+        (0..n_names).filter_map(move |i| {
+            let off = i * NAME_LEN;
+            let no = u32::from_be_bytes(names[off..off + 4].try_into().unwrap());
+            let nl = u16::from_be_bytes(names[off + 4..off + 6].try_into().unwrap());
+            let sym = u64::from_be_bytes(names[off + 8..off + 16].try_into().unwrap());
+            if canon.get(&sym) == Some(&(no, nl)) { return None; }
+            let s = std::str::from_utf8(&blob[no as usize..no as usize + nl as usize]).ok()?;
+            Some((sym, s))
+        })
+    }
+
 }
 
 pub struct XrefIter<'a> {
@@ -388,13 +502,3 @@ fn lower_bound(table: &[u8], n: usize, stride: usize, needle: &[u8]) -> usize {
     lo
 }
 
-/// Trivial substring search. We don't link memchr to keep the dep list
-/// flat; for our query budget this is fine.
-fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() { return Some(0); }
-    if hay.len() < needle.len() { return None; }
-    for i in 0..=(hay.len() - needle.len()) {
-        if &hay[i..i + needle.len()] == needle { return Some(i); }
-    }
-    None
-}

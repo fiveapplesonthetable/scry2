@@ -100,6 +100,113 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_then_resume_round_trips_all_rows() {
+        // Populate a builder, snapshot to disk, open the snapshot as
+        // an Index, replay it into a FRESH builder, then finish and
+        // verify the resumed `.s2db` is point-for-point equivalent
+        // to the original. This is the contract that `from-kzip
+        // --resume` relies on.
+        let snap_path = tmp("snap");
+        let resumed_path = tmp("resumed");
+
+        let mut b = IndexBuilder::new();
+        let s_foo = sym_of("kythe:c++:test###foo");
+        let s_bar = sym_of("kythe:c++:test###bar");
+        b.upsert_sym(s_foo, kind::FUNCTION, lang::CXX, "kythe:c++:test###foo");
+        b.upsert_sym(s_bar, kind::FUNCTION, lang::CXX, "kythe:c++:test###bar");
+        b.add_alias(s_foo, "ns::foo");
+        b.upsert_file(1, "/aosp/foo.cpp");
+        b.add_xref(s_foo, role::DECL, 1, 100);
+        b.add_xref(s_bar, role::REF,  1, 200);
+        b.add_inherit(s_bar, s_foo);
+        b.add_call(s_foo, s_bar, role::CALL);
+
+        // Snapshot (non-consuming) — produces a usable .s2db.
+        b.snapshot(&snap_path).unwrap();
+
+        // Now resume: fresh builder + populate_from_index, then
+        // finish to a new path.
+        let ix = Index::open(&snap_path).unwrap();
+        let mut resumed = IndexBuilder::new();
+        resumed.populate_from_index(&ix).unwrap();
+        resumed.finish(&resumed_path).unwrap();
+
+        // Verify query parity on resumed index.
+        let r = Index::open(&resumed_path).unwrap();
+        assert_eq!(r.sym_for_name("kythe:c++:test###foo"), Some(s_foo));
+        assert_eq!(r.sym_for_name("ns::foo"), Some(s_foo),
+            "alias survives the snapshot/resume round-trip");
+        let refs: Vec<_> = r.xrefs(s_foo, 0, 255).collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(r.inherits_of(s_bar), vec![s_foo]);
+        let calls: Vec<_> = r.calls_from(s_foo).into_iter().map(|(s,_)|s).collect();
+        assert_eq!(calls, vec![s_bar]);
+
+        let _ = std::fs::remove_file(&snap_path);
+        let _ = std::fs::remove_file(&resumed_path);
+    }
+
+    #[test]
+    fn alias_suppressed_for_variable_kind_syms() {
+        // cxx_indexer emits /kythe/code on parameters too; the parsed
+        // FQN `Method::param` would otherwise leak into the names table
+        // and make `def Method --substr` return the parameter sym as
+        // well. The writer must drop alias rows whose sym is kind=VARIABLE.
+        //
+        // Canonical names in real Kythe ingest are VName-style strings,
+        // never the FQN — only the FQN comes through `add_alias`, which
+        // is what this kind-suppression filter targets.
+        let path = tmp("alias-var-supp");
+        let mut b = IndexBuilder::new();
+        let method_canon = "kythe:c++:android##Parcel.cpp#writeAligned";
+        let param_canon  = "kythe:c++:android##Parcel.cpp#writeAligned#val";
+        let method = sym_of(method_canon);
+        let param  = sym_of(param_canon);
+        b.upsert_sym(method, kind::FUNCTION, lang::CXX, method_canon);
+        b.upsert_sym(param,  kind::VARIABLE, lang::CXX, param_canon);
+        b.add_alias(method, "android::Parcel::writeAligned");
+        b.add_alias(param,  "android::Parcel::writeAligned::val");
+        b.upsert_file(1, "/aosp/Parcel.cpp");
+        b.add_xref(method, role::DECL, 1, 100);
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // Method's FQN alias survives.
+        assert_eq!(ix.sym_for_name("android::Parcel::writeAligned"), Some(method));
+        // Parameter's FQN alias is suppressed; only canonical name resolves.
+        assert_eq!(ix.sym_for_name("android::Parcel::writeAligned::val"), None,
+            "variable-kind sym should have no FQN alias entry");
+        assert_eq!(ix.sym_for_name(param_canon), Some(param),
+            "canonical name still resolves the variable sym");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn alias_dedup_collapses_redundant_pairs() {
+        // Real Kythe streams emit the same `/kythe/edge/named` alias on
+        // every node that shares a MarkedSource — for AOSP methods that
+        // means ~30 redundant adds per CU. The writer must collapse them
+        // so the names table only carries one entry per (sym, alias),
+        // not 30.
+        let path = tmp("alias-dedup");
+        let mut b = IndexBuilder::new();
+        let canon = "kythe:c++:android##frameworks/native/.../Parcel.cpp#writeStrongBinder";
+        let alias = "android::Parcel::writeStrongBinder";
+        let s = sym_of(canon);
+        b.upsert_sym(s, kind::FUNCTION, lang::CXX, canon);
+        for _ in 0..30 { b.add_alias(s, alias); }
+        b.upsert_file(1, "/aosp/Parcel.cpp");
+        b.add_xref(s, role::DECL, 1, 100);
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // 1 canonical name + 1 deduped alias = 2 entries, not 31.
+        assert_eq!(ix.n_names(), 2, "alias dedup: redundant pairs collapsed");
+        assert_eq!(ix.sym_for_name(alias), Some(s));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn alias_resolves_to_same_sym() {
         let path = tmp("alias");
         let mut b = IndexBuilder::new();

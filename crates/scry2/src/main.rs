@@ -1014,22 +1014,25 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     // of MB/s), not the indexer subprocess. Other
                     // workers' subprocesses keep running while we hold
                     // the lock.
-                    // Ingest into THIS worker's local sink — no
-                    // cross-worker contention on the builder side.
-                    // The same lock guards `pending_shas`, so a
-                    // successful CU's sha is committed to the sink
-                    // atomically with its data; the snapshotter then
-                    // takes both via one `mem::take` and never sees
-                    // a "data without sha" gap (which would re-run
-                    // already-applied CUs on resume).
+                    // Ingest into a per-CU LOCAL builder, not the
+                    // sink. The indexer subprocess writes incrementally
+                    // over the CU's full wall time (~30 s for a typical
+                    // Java CU, minutes for the slowest C++ TUs); if we
+                    // held the sink lock for the whole stream the
+                    // snapshotter's `try_lock` would lose the race
+                    // ~95 % of the time and worker sinks would
+                    // accumulate data indefinitely. Streaming into a
+                    // local builder keeps the sink lock free; we
+                    // briefly acquire it only to merge the finished CU
+                    // (milliseconds for parse-and-append, then the
+                    // sink is unlocked again).
                     //
                     // `file_ids` is shared by-reference: its interior
                     // mutex is taken only per intern (O(hash)), not
                     // for the whole CU, so workers don't serialize.
-                    let ingest_res = {
-                        let mut sink = my_sink.lock().unwrap();
-                        scry2::kythe::ingest_tolerant(stdout_h, &mut sink.builder, file_ids, true)
-                    };
+                    let mut cu_builder = scry2::writer::IndexBuilder::new();
+                    let ingest_res = scry2::kythe::ingest_tolerant(
+                        stdout_h, &mut cu_builder, file_ids, true);
                     // On ingest failure the subprocess may still be
                     // writing; killing it now unblocks the pipe and
                     // lets `wait()` return so we can reap the child
@@ -1093,15 +1096,20 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                         stats.empty += 1;
                     }
                     drop(by_lang);
-                    // Register the sha *inside* my_sink (same lock as
-                    // the builder) — guarantees the on-disk
+                    // Atomically fold the local CU into the sink:
+                    // merge the local builder + register the sha
+                    // under one lock acquisition. This is the
+                    // load-bearing invariant — the on-disk
                     // `.partial.shas` never names a CU whose data
-                    // isn't in `.partial.s2db`. Only successful CUs
+                    // isn't in `.partial.s2db`, even if the
+                    // snapshotter races our lock. Only successful CUs
                     // (had entries, ingested cleanly, exited 0) earn
                     // a sha; failures and empties are safe to re-run.
                     let cu_succeeded = !failed && any_entries;
                     if cu_succeeded {
-                        my_sink.lock().unwrap().pending_shas.push(unit.sha.clone());
+                        let mut sink = my_sink.lock().unwrap();
+                        sink.builder.merge_from(cu_builder);
+                        sink.pending_shas.push(unit.sha.clone());
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     progress_mu.lock().unwrap().report("index", n, plan_len);

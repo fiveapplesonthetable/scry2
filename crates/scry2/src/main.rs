@@ -997,7 +997,20 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                 // The lock blocks `pending` pushes for
                                 // ~1s on AOSP — acceptable per ~5min
                                 // of indexer wall time.
-                                let cloned = builder_mu.lock().unwrap().clone();
+                                //
+                                // Sync the FileIdAllocator into the
+                                // builder before the clone — otherwise
+                                // the snapshot has zero `files` rows
+                                // (intern() stages mappings in the
+                                // allocator until the final
+                                // `drain_into`) and resumed xrefs lose
+                                // their file paths.
+                                let cloned = {
+                                    let mut b = builder_mu.lock().unwrap();
+                                    let fids  = file_ids_mu.lock().unwrap();
+                                    fids.push_to(&mut b);
+                                    b.clone()
+                                };
                                 let mut shas: Vec<String> = snap.committed
                                     .iter().cloned().collect();
                                 shas.sort();

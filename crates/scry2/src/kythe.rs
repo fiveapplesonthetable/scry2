@@ -244,6 +244,17 @@ impl FileIdAllocator {
             builder.upsert_file(id, &path);
         }
     }
+    /// Non-consuming variant for mid-run snapshots: copy the current
+    /// (path, id) map into `builder` so a clone-and-finish captures
+    /// every file_id that any xref might reference. `IndexBuilder::
+    /// upsert_file` is first-write-wins, so this is safe to call
+    /// repeatedly and safe to interleave with the final
+    /// `drain_into`.
+    pub fn push_to(&self, builder: &mut IndexBuilder) {
+        for (path, &id) in &self.map {
+            builder.upsert_file(id, path);
+        }
+    }
 }
 
 /// In-flight ingestion state. Lives for one `ingest_tolerant` call.

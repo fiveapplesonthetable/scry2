@@ -606,19 +606,9 @@ struct WorkerSink {
 /// land in `committed_shas`. On `--resume` both are seeded from the
 /// partial `.s2db` + `.shas`. Lock contention is rare — only the
 /// snapshotter writes; workers never touch it.
-///
-/// `needs_reload` is the load-bearing memory-bound: after every
-/// successful snapshot we drop `builder` to free RAM (the data is
-/// now durable on `.partial.s2db`) and set this flag. The next
-/// snapshot repopulates `builder` from the partial before merging
-/// new worker data. Steady-state RAM is therefore bounded to one
-/// inter-snapshot delta + the peak-of-snapshot reload-and-clone
-/// transient, rather than growing monotonically across the whole
-/// run.
 struct Accumulator {
     builder:        IndexBuilder,
     committed_shas: std::collections::HashSet<String>,
-    needs_reload:   bool,
 }
 
 /// Write a fresh `<partial>.s2db` and `<partial>.shas` pair atomically
@@ -629,13 +619,13 @@ struct Accumulator {
 /// where partial state can mismatch, in which case the user is
 /// instructed to discard the partial and restart.
 fn write_snapshot(
-    builder: &IndexBuilder,
+    builder: IndexBuilder,
     shas:    &[String],
     s2db_path: &std::path::Path,
     shas_path: &std::path::Path,
 ) -> Result<()> {
     let s2db_tmp = s2db_path.with_extension("s2db.tmp");
-    builder.snapshot(&s2db_tmp)
+    builder.finish(&s2db_tmp)
         .with_context(|| format!("write snapshot {}", s2db_tmp.display()))?;
     std::fs::rename(&s2db_tmp, s2db_path)
         .with_context(|| format!("rename {} → {}", s2db_tmp.display(), s2db_path.display()))?;
@@ -822,11 +812,6 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     let accumulator_mu = std::sync::Mutex::new(Accumulator {
         builder:        starting_builder,
         committed_shas: done_shas,
-        // First snapshot doesn't reload — either the builder is empty
-        // (fresh run) or already populated from `--resume`. The first
-        // successful snapshot sets this true so subsequent snapshots
-        // shed-and-reload.
-        needs_reload:   false,
     });
     // `FileIdAllocator` is shared by-reference (interior mutex inside
     // `intern`). Workers hit it once per file path during ingest,
@@ -1167,70 +1152,32 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                     }
                                 }
                                 // Fold drained state into the
-                                // accumulator + write the snapshot.
-                                // The accumulator lock is only
-                                // contended by snapshot writers (and
-                                // we hold snap_writer_mu so there's
-                                // at most one of us at a time), so
-                                // holding it across the write does
-                                // not block workers.
-                                //
-                                // Memory shed: between snapshots the
-                                // accumulator's builder is empty —
-                                // the on-disk `.partial.s2db` is the
-                                // durable record. We repopulate from
-                                // disk here before merging the next
-                                // batch, write the merged snapshot,
-                                // then drop the builder again. This
-                                // bounds RAM to one delta + the
-                                // snapshot-time reload/clone peak,
-                                // instead of growing monotonically.
-                                let mut acc = accumulator_mu.lock().unwrap();
-                                if acc.needs_reload && partial_s2db_path.exists() {
-                                    let ix = scry2::reader::Index::open(partial_s2db_path)
-                                        .with_context(|| format!("reload {} for snapshot",
-                                            partial_s2db_path.display()))?;
-                                    acc.builder.populate_from_index(&ix)
-                                        .with_context(|| "replay prior snapshot")?;
-                                    acc.needs_reload = false;
-                                }
-                                acc.builder.merge_from(drained_data);
-                                file_ids.push_to(&mut acc.builder);
-                                let staged_shas: Vec<String> = drained_shas;
-                                for s in &staged_shas { acc.committed_shas.insert(s.clone()); }
-                                let mut shas: Vec<String> = acc.committed_shas
-                                    .iter().cloned().collect();
-                                shas.sort();
-
-                                match write_snapshot(&acc.builder, &shas,
+                                // accumulator + capture a clone for
+                                // the snapshot write. The accumulator
+                                // lock is only contended by snapshot
+                                // writers (and we hold snap_writer_mu
+                                // so there's at most one of us at a
+                                // time), so it's effectively
+                                // uncontended.
+                                let (cloned, shas) = {
+                                    let mut acc = accumulator_mu.lock().unwrap();
+                                    acc.builder.merge_from(drained_data);
+                                    for s in drained_shas { acc.committed_shas.insert(s); }
+                                    file_ids.push_to(&mut acc.builder);
+                                    let cloned = acc.builder.clone();
+                                    let mut shas: Vec<String> = acc.committed_shas
+                                        .iter().cloned().collect();
+                                    shas.sort();
+                                    (cloned, shas)
+                                };
+                                if let Err(e) = write_snapshot(cloned, &shas,
                                     partial_s2db_path, partial_shas_path)
                                 {
-                                    Ok(()) => {
-                                        eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable (sinks drained={drained_n}/{}, busy={skipped_n})",
-                                            shas.len(), drained_n + skipped_n);
-                                        // Shed: the data is now on
-                                        // disk in `.partial.s2db`.
-                                        // Next snapshot will reload
-                                        // before merging the next
-                                        // batch.
-                                        acc.builder = scry2::writer::IndexBuilder::new();
-                                        acc.needs_reload = true;
-                                    }
-                                    Err(e) => {
-                                        // Roll back the staged shas
-                                        // so they aren't double-
-                                        // credited on the next
-                                        // attempt. The builder still
-                                        // has the data, so the next
-                                        // snapshot will retry the
-                                        // write with the same batch
-                                        // plus anything new.
-                                        for s in &staged_shas {
-                                            acc.committed_shas.remove(s);
-                                        }
-                                        eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed (sinks drained={drained_n}/{}, busy={skipped_n}): {e:#}",
-                                            drained_n + skipped_n);
-                                    }
+                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed (sinks drained={drained_n}/{}, busy={skipped_n}): {e:#}",
+                                        drained_n + skipped_n);
+                                } else {
+                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable (sinks drained={drained_n}/{}, busy={skipped_n})",
+                                        shas.len(), drained_n + skipped_n);
                                 }
                             }
                             // _writer_guard releases here.
@@ -1256,22 +1203,8 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // builder for the final write. After std::thread::scope exits
     // every worker thread is joined, so the per-worker mutexes have
     // no other reference — into_inner() is the right primitive.
-    //
-    // If the last snapshot shed the builder (`needs_reload`), the
-    // durable state lives in `.partial.s2db` only. Reload it before
-    // merging the post-snapshot worker tails so the final s2db is a
-    // superset of the partial.
     let acc = accumulator_mu.into_inner().unwrap();
     let mut builder = acc.builder;
-    if acc.needs_reload && partial_s2db_path.exists() {
-        eprintln!("[from-kzip] final merge: reloading partial from {}",
-            partial_s2db_path.display());
-        let ix = scry2::reader::Index::open(&partial_s2db_path)
-            .with_context(|| format!("reload {} for final merge",
-                partial_s2db_path.display()))?;
-        builder.populate_from_index(&ix)
-            .with_context(|| "replay partial snapshot for final merge")?;
-    }
     for ws in worker_sinks {
         let sink = ws.into_inner().unwrap();
         builder.merge_from(sink.builder);

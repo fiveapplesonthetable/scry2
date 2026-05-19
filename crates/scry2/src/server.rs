@@ -51,9 +51,13 @@ pub enum Request {
               #[serde(default)] not_in: Option<String>,
               #[serde(default)] def_in: Option<String> },
     Super { name: String, #[serde(default)] substr: bool,
-            #[serde(default = "lim16")] limit: usize },
+            #[serde(default = "lim16")] limit: usize,
+            #[serde(default, rename = "in")] in_: Option<String>,
+            #[serde(default)] not_in: Option<String> },
     Sub   { name: String, #[serde(default)] substr: bool,
-            #[serde(default = "lim16")] limit: usize },
+            #[serde(default = "lim16")] limit: usize,
+            #[serde(default, rename = "in")] in_: Option<String>,
+            #[serde(default)] not_in: Option<String> },
     Callgraph { name: String,
                 #[serde(default = "default_direction")] direction: String,
                 #[serde(default = "default_depth")] depth: usize,
@@ -66,7 +70,14 @@ pub enum Request {
                 /// When `substr` is true, cap how many roots seed the
                 /// BFS. Default 16. Cheap roots are fine — the BFS
                 /// dedupes downstream discoveries via the `seen` set.
-                #[serde(default = "default_root_limit")] root_limit: usize },
+                #[serde(default = "default_root_limit")] root_limit: usize,
+                /// Restrict every discovered sym by def-file path.
+                #[serde(default, rename = "in")] in_: Option<String>,
+                /// Drop every discovered sym by def-file path.
+                #[serde(default)] not_in: Option<String>,
+                /// Root-level only: drop seed roots whose def-file
+                /// path doesn't contain SUBSTR. Matches scry semantics.
+                #[serde(default)] def_in: Option<String> },
 }
 fn default_root_limit() -> usize { 16 }
 fn lim16() -> usize { 16 }
@@ -113,10 +124,19 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
             ix, name, *substr, *limit, role::CALL, role::CALL, *max_hits,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
         ),
-        Request::Super { name, substr, limit } => do_inh(ix, name, *substr, *limit, /*sub=*/false),
-        Request::Sub   { name, substr, limit } => do_inh(ix, name, *substr, *limit, /*sub=*/true),
-        Request::Callgraph { name, direction, depth, max_syms, substr, root_limit } =>
-            do_callgraph(ix, name, direction, *depth, *max_syms, *substr, *root_limit),
+        Request::Super { name, substr, limit, in_, not_in } => do_inh(
+            ix, name, *substr, *limit, /*sub=*/false,
+            PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: None },
+        ),
+        Request::Sub   { name, substr, limit, in_, not_in } => do_inh(
+            ix, name, *substr, *limit, /*sub=*/true,
+            PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: None },
+        ),
+        Request::Callgraph { name, direction, depth, max_syms, substr, root_limit,
+                             in_, not_in, def_in } => do_callgraph(
+            ix, name, direction, *depth, *max_syms, *substr, *root_limit,
+            PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
+        ),
     }
 }
 
@@ -176,7 +196,8 @@ fn do_xrefs(
     Reply::Xrefs { groups, total, truncated }
 }
 
-fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool) -> Reply {
+fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
+          filt: PathFilter<'_>) -> Reply {
     let syms: Vec<u64> = if substr {
         ix.syms_matching_substring(name, limit)
     } else {
@@ -189,9 +210,13 @@ fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool) -> Repl
     for sym in syms {
         let related = if sub { ix.inherited_by(sym) } else { ix.inherits_of(sym) };
         for r in related {
-            if seen.insert(r) {
-                hits.push(InhHit { name: name_of(r) });
+            if !seen.insert(r) { continue; }
+            if filt.in_.is_some() || filt.not_in.is_some() {
+                let p = ix.sym_def_path(r).unwrap_or("");
+                if let Some(s) = filt.in_     { if !p.contains(s) { continue; } }
+                if let Some(s) = filt.not_in  { if  p.contains(s) { continue; } }
             }
+            hits.push(InhHit { name: name_of(r) });
         }
     }
     let total = hits.len();
@@ -209,12 +234,30 @@ fn do_callgraph(
     ix: &Index, name: &str, direction: &str,
     depth: usize, max_syms: usize,
     substr: bool, root_limit: usize,
+    filt: PathFilter<'_>,
 ) -> Reply {
     let roots: Vec<u64> = if substr {
         ix.syms_matching_substring(name, root_limit)
     } else {
         ix.sym_for_name(name).into_iter().collect()
     };
+    // --def-in narrows the seed roots only (scry semantics): the
+    // walker doesn't carry per-frame def context, so deeper levels
+    // can't be filtered the same way.
+    let roots: Vec<u64> = if let Some(s) = filt.def_in {
+        roots.into_iter()
+            .filter(|r| ix.sym_def_path(*r).is_some_and(|p| p.contains(s)))
+            .collect()
+    } else { roots };
+    // --in / --not-in apply at every level (including roots).
+    let pass = |s: u64| -> bool {
+        if filt.in_.is_none() && filt.not_in.is_none() { return true; }
+        let p = ix.sym_def_path(s).unwrap_or("");
+        if let Some(needle) = filt.in_    { if !p.contains(needle) { return false; } }
+        if let Some(needle) = filt.not_in { if  p.contains(needle) { return false; } }
+        true
+    };
+    let roots: Vec<u64> = roots.into_iter().filter(|r| pass(*r)).collect();
     if roots.is_empty() {
         return Reply::Callgraph { nodes: Vec::new(), total: 0, truncated: false };
     }
@@ -242,6 +285,7 @@ fn do_callgraph(
         for &(cur_sym, cur_id) in &frontier {
             if go_up {
                 for (caller, _) in ix.called_by(cur_sym) {
+                    if !pass(caller) { continue; }
                     if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(caller) {
                         let id = nodes.len() as u32;
                         v.insert(id);
@@ -254,6 +298,7 @@ fn do_callgraph(
             }
             if go_down {
                 for (callee, _) in ix.calls_from(cur_sym) {
+                    if !pass(callee) { continue; }
                     if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(callee) {
                         let id = nodes.len() as u32;
                         v.insert(id);

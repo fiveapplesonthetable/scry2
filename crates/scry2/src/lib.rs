@@ -261,6 +261,91 @@ mod tests {
     }
 
     #[test]
+    fn super_sub_callgraph_honor_path_filters() {
+        // Two classes in /aosp/.../tests/ and two in /aosp/frameworks/base/.
+        // Filter by --in / --not-in / --def-in and confirm the dispatch
+        // path (server::dispatch → do_inh / do_callgraph) applies them.
+        use server::{Request, dispatch};
+        use reply::Reply;
+
+        let path = tmp("filters");
+        let mut b = IndexBuilder::new();
+        let parent = sym_of("Pkg.Parent");
+        let child_main = sym_of("Pkg.MainChild");
+        let child_test = sym_of("Pkg.TestChild");
+        for (s, n) in [(parent,"Pkg.Parent"),(child_main,"Pkg.MainChild"),
+                       (child_test,"Pkg.TestChild")] {
+            b.upsert_sym(s, kind::TYPE, lang::JAVA, n);
+        }
+        b.upsert_file(1, "/aosp/frameworks/base/core/java/Pkg/Parent.java");
+        b.upsert_file(2, "/aosp/frameworks/base/core/java/Pkg/MainChild.java");
+        b.upsert_file(3, "/aosp/frameworks/base/core/tests/Pkg/TestChild.java");
+        b.add_xref(parent,     role::DECL, 1, 0);
+        b.add_xref(child_main, role::DECL, 2, 0);
+        b.add_xref(child_test, role::DECL, 3, 0);
+        b.add_inherit(child_main, parent);
+        b.add_inherit(child_test, parent);
+
+        // Add a callgraph: MainChild → Parent → TestChild (so all 3
+        // are reachable from MainChild walking down).
+        b.add_call(child_main, parent,     role::CALL);
+        b.add_call(parent,     child_test, role::CALL);
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+
+        // sub Parent --in tests/   →  only TestChild.
+        let r = dispatch(&ix, &Request::Sub {
+            name: "Pkg.Parent".into(), substr: false, limit: 16,
+            in_: Some("tests/".into()), not_in: None,
+        });
+        if let Reply::Inh { hits, .. } = r {
+            let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+            assert_eq!(names, vec!["Pkg.TestChild"], "--in tests/ kept only TestChild");
+        } else { panic!("expected Reply::Inh") }
+
+        // sub Parent --not-in tests/ → only MainChild.
+        let r = dispatch(&ix, &Request::Sub {
+            name: "Pkg.Parent".into(), substr: false, limit: 16,
+            in_: None, not_in: Some("tests/".into()),
+        });
+        if let Reply::Inh { hits, .. } = r {
+            let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+            assert_eq!(names, vec!["Pkg.MainChild"], "--not-in tests/ kept only MainChild");
+        } else { panic!("expected Reply::Inh") }
+
+        // callgraph MainChild --direction down --not-in tests/ →
+        // root MainChild, then Parent (in frameworks/base/), but
+        // NOT TestChild (in tests/).
+        let r = dispatch(&ix, &Request::Callgraph {
+            name: "Pkg.MainChild".into(), direction: "down".into(),
+            depth: 3, max_syms: 200, substr: false, root_limit: 16,
+            in_: None, not_in: Some("tests/".into()), def_in: None,
+        });
+        if let Reply::Callgraph { nodes, .. } = r {
+            let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+            assert_eq!(names, vec!["Pkg.MainChild", "Pkg.Parent"],
+                "BFS stops at Parent — TestChild filtered out");
+        } else { panic!("expected Reply::Callgraph") }
+
+        // callgraph --substr "Child" --def-in tests/ →
+        // only TestChild seeds (root filter), then expand down (no
+        // children of TestChild defined).
+        let r = dispatch(&ix, &Request::Callgraph {
+            name: "Child".into(), direction: "down".into(),
+            depth: 3, max_syms: 200, substr: true, root_limit: 16,
+            in_: None, not_in: None, def_in: Some("tests/".into()),
+        });
+        if let Reply::Callgraph { nodes, .. } = r {
+            let root_names: Vec<&str> = nodes.iter()
+                .filter(|n| n.parent.is_none()).map(|n| n.name.as_str()).collect();
+            assert_eq!(root_names, vec!["Pkg.TestChild"],
+                "--def-in tests/ filtered seed roots to TestChild only");
+        } else { panic!("expected Reply::Callgraph") }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn name_substring_match() {
         let path = tmp("substr");
         let mut b = IndexBuilder::new();

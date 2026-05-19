@@ -191,6 +191,16 @@ impl Index {
         XrefIter { xrefs, idx: lo, end: hi }
     }
 
+    /// File path of the first DECL/DEF xref for `sym`, if any. Used
+    /// by path filters that ask "where is X defined?" without forcing
+    /// the caller to iterate xrefs manually.
+    pub fn sym_def_path(&self, sym: u64) -> Option<&str> {
+        for (_, _, file, _) in self.xrefs(sym, role::DECL, role::DEF) {
+            if let Some(p) = self.file_path(file) { return Some(p); }
+        }
+        None
+    }
+
     // -- inheritance ---------------------------------------------------------
 
     /// `inherits(child)` returns each parent. (super)

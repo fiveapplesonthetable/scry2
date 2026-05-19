@@ -83,6 +83,10 @@ enum Cmd {
         name: String,
         #[arg(long)] substr: bool,
         #[arg(long, default_value = "16")] limit: usize,
+        /// Restrict to supertypes whose def-file path contains SUBSTR.
+        #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        /// Drop supertypes whose def-file path contains SUBSTR.
+        #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
     },
 
     /// `sub NAME` — direct subtypes.
@@ -90,6 +94,10 @@ enum Cmd {
         name: String,
         #[arg(long)] substr: bool,
         #[arg(long, default_value = "16")] limit: usize,
+        /// Restrict to subtypes whose def-file path contains SUBSTR.
+        #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        /// Drop subtypes whose def-file path contains SUBSTR.
+        #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
     },
 
     /// `callgraph NAME` — transitive walk of the call graph.
@@ -105,6 +113,16 @@ enum Cmd {
         #[arg(long)] substr: bool,
         /// Cap roots when --substr is on. Default 16.
         #[arg(long, default_value = "16")] root_limit: usize,
+        /// Restrict expansion: drop any discovered sym whose def-file
+        /// path doesn't contain SUBSTR. Applied at every BFS level.
+        #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        /// Symmetric to `--in`. Drop syms whose def-file path contains
+        /// SUBSTR — useful for pruning whole subtrees (e.g. `/tests/`).
+        #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
+        /// Root-level narrowing only (matches scry semantics):
+        /// drop seed roots whose def-file path doesn't contain SUBSTR.
+        /// Deeper levels are NOT narrowed.
+        #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
     /// `serve --socket PATH` — long-lived daemon over a Unix socket.
@@ -168,10 +186,14 @@ fn main() -> Result<()> {
             => Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in },
         Cmd::Callers { name, substr, limit, max_hits, in_, not_in, def_in }
             => Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in },
-        Cmd::Super { name, substr, limit } => Request::Super { name, substr, limit },
-        Cmd::Sub   { name, substr, limit } => Request::Sub   { name, substr, limit },
-        Cmd::Callgraph { name, direction, depth, max_syms, substr, root_limit }
-            => Request::Callgraph { name, direction, depth, max_syms, substr, root_limit },
+        Cmd::Super { name, substr, limit, in_, not_in }
+            => Request::Super { name, substr, limit, in_, not_in },
+        Cmd::Sub   { name, substr, limit, in_, not_in }
+            => Request::Sub   { name, substr, limit, in_, not_in },
+        Cmd::Callgraph { name, direction, depth, max_syms, substr, root_limit,
+                         in_, not_in, def_in }
+            => Request::Callgraph { name, direction, depth, max_syms, substr,
+                                    root_limit, in_, not_in, def_in },
         _ => unreachable!(),
     };
     let reply: Reply = if let Some(sock) = cli.socket {

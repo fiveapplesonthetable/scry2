@@ -823,6 +823,15 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // and only the would-be snapshotter even tries `snap_writer_mu`.
     let snap_writer_mu = std::sync::Mutex::new(());
     let last_snap_done = std::sync::atomic::AtomicUsize::new(0);
+    // Set true while a snapshot merge is running. Workers check this
+    // before dispatching a new CU and park until it clears. This
+    // bounds peak RAM: during the (minutes-long, prior-sized) merge
+    // no worker spawns a new indexer subprocess, so the ~24 in-flight
+    // subprocesses drain and free their RSS, and no fresh delta
+    // accumulates in the sinks. The snapshotter thus runs in a
+    // near-empty machine regardless of how large the prior has grown.
+    let snap_active = std::sync::atomic::AtomicBool::new(false);
+    let snap_active_ref = &snap_active;
 
     // Split the plan into N work shards by index. Static partition
     // is simpler than a work-stealing queue and load-balances well
@@ -924,6 +933,16 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                 let mut extractor = kzip::SubKzipWriter::open(kzip_path)?;
                 let mut i = w_id;
                 while i < plan_len {
+                    // Park while a snapshot merge is running. Finishing
+                    // the current CU and then idling here (rather than
+                    // spawning the next indexer) lets the in-flight
+                    // subprocesses drain and frees their RSS, so the
+                    // snapshotter merges in a near-empty machine. 100 ms
+                    // granularity is irrelevant against minutes-long
+                    // merges.
+                    while snap_active_ref.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                     let (kind, unit) = plan_ref[i];
                     let label = lang_label(kind);
                     let sub_path = staging.join(format!("{}.kzip", unit.sha));
@@ -1106,6 +1125,20 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                             // doesn't double-snapshot.
                             if n >= last_snap_done.load(Ordering::Relaxed) + snapshot_every {
                                 last_snap_done.store(n, Ordering::Relaxed);
+                                // Signal workers to park before their
+                                // next CU, then settle briefly so the
+                                // common-case fast CUs finish and their
+                                // subprocesses exit. This frees worker
+                                // RSS before the merge and stops fresh
+                                // delta from accumulating during it —
+                                // bounding peak memory regardless of how
+                                // large the prior has grown. A still-
+                                // running mega-CU is not waited on (its
+                                // sink is skipped by `try_lock` below and
+                                // lands in the next snap), so a single
+                                // slow CU never stalls the snapshot.
+                                snap_active_ref.store(true, Ordering::Release);
+                                std::thread::sleep(std::time::Duration::from_secs(3));
                                 // Drain every worker sink we can
                                 // grab via `try_lock`. Sinks mid-CU
                                 // (lock held by the ingesting worker)
@@ -1167,9 +1200,18 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
 
                                 let delta = std::mem::take(&mut acc.builder);
                                 let prior = if partial_s2db_path.exists() {
-                                    Some(scry2::reader::Index::open(partial_s2db_path)
-                                        .with_context(|| format!("open prior {}",
-                                            partial_s2db_path.display()))?)
+                                    match scry2::reader::Index::open(partial_s2db_path) {
+                                        Ok(ix) => Some(ix),
+                                        Err(e) => {
+                                            // Unpark workers before bubbling
+                                            // the fatal error, else they spin
+                                            // in the park loop forever and the
+                                            // scope can't collapse.
+                                            snap_active_ref.store(false, Ordering::Release);
+                                            return Err(e).with_context(|| format!(
+                                                "open prior {}", partial_s2db_path.display()));
+                                        }
+                                    }
                                 } else { None };
 
                                 let merge_res = delta.write_merged_snapshot(
@@ -1207,6 +1249,12 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                             drained_n + skipped_n);
                                     }
                                 }
+                                // Merge done — unpark the workers.
+                                // Drop the accumulator lock first so a
+                                // resuming worker that snapshots next
+                                // doesn't contend on it.
+                                drop(acc);
+                                snap_active_ref.store(false, Ordering::Release);
                             }
                             // _writer_guard releases here.
                         }

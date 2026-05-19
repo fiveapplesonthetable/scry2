@@ -844,7 +844,71 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     let snap_writer_mu_ref    = &snap_writer_mu;
     let last_snap_done_ref    = &last_snap_done;
     let snapshot_every        = args.snapshot_every;
+    // Heartbeat — a side thread that logs the run's vitals every
+    // ~30 s so any aspect of the indexing (throughput, snapshots,
+    // RSS, worker subprocess count) is visible without attaching a
+    // debugger or sampling `/proc`. The flag flips after all workers
+    // finish so the heartbeat exits cleanly with the scope.
+    let heartbeat_stop = std::sync::atomic::AtomicBool::new(false);
+    let heartbeat_stop_ref = &heartbeat_stop;
+    let done_ref           = &done;
+    let plan_total = plan_ref.len();
+    let run_start = Instant::now();
     std::thread::scope(|s| -> Result<()> {
+        s.spawn(move || {
+            use std::sync::atomic::Ordering;
+            const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+            const POLL_INTERVAL:      std::time::Duration = std::time::Duration::from_millis(250);
+            loop {
+                // Wait `HEARTBEAT_INTERVAL`, but poll the stop
+                // flag every 250 ms so the scope can collapse
+                // promptly when workers finish.
+                let deadline = std::time::Instant::now() + HEARTBEAT_INTERVAL;
+                while std::time::Instant::now() < deadline {
+                    if heartbeat_stop_ref.load(Ordering::Relaxed) { return; }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                if heartbeat_stop_ref.load(Ordering::Relaxed) { return; }
+                let elapsed = run_start.elapsed().as_secs_f64();
+                let n_done = done_ref.load(Ordering::Relaxed);
+                let cu_per_min = if elapsed > 1.0 { n_done as f64 * 60.0 / elapsed } else { 0.0 };
+                let snap_at = last_snap_done_ref.load(Ordering::Relaxed);
+                let rss_gb = {
+                    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                    s.lines()
+                        .find(|l| l.starts_with("VmRSS:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|kb| kb.parse::<u64>().ok())
+                        .map(|kb| kb as f64 / 1024.0 / 1024.0)
+                        .unwrap_or(0.0)
+                };
+                let partial_bytes = std::fs::metadata(partial_s2db_path_ref)
+                    .map(|m| m.len()).unwrap_or(0);
+                let partial_gb = partial_bytes as f64 / 1e9;
+                // Count live subprocess indexers. Cheap-ish; we
+                // scan /proc/<pid>/comm names. Bounded by process
+                // table size (a few thousand).
+                let active_idx = std::fs::read_dir("/proc")
+                    .map(|rd| rd.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            let name = e.file_name();
+                            let s = name.to_string_lossy();
+                            if !s.chars().all(|c| c.is_ascii_digit()) { return false; }
+                            let comm = std::fs::read_to_string(e.path().join("comm"))
+                                .unwrap_or_default();
+                            let c = comm.trim();
+                            c == "java" || c == "cxx_indexer" || c == "jvm_indexer"
+                                || c == "go_indexer" || c == "proto_indexer"
+                                || c == "textproto_indexer"
+                        })
+                        .count())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[heartbeat] +{:.0}s done={n_done}/{plan_total} ({:.1}/min) snap@={snap_at} partial={:.2}G rss={:.1}G indexers={active_idx}",
+                    elapsed, cu_per_min, partial_gb, rss_gb,
+                );
+            }
+        });
         let mut handles = Vec::with_capacity(n_workers);
         for w_id in 0..n_workers {
             let staging = staging.clone();
@@ -1119,6 +1183,10 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
         for h in handles {
             h.join().map_err(|_| anyhow::anyhow!("worker thread panicked"))??;
         }
+        // All CU workers joined. Signal the heartbeat to exit so
+        // the scope can collapse — without this the scope blocks
+        // waiting for the 30 s sleep cycle.
+        heartbeat_stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     })?;
 

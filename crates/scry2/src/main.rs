@@ -832,6 +832,13 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // near-empty machine regardless of how large the prior has grown.
     let snap_active = std::sync::atomic::AtomicBool::new(false);
     let snap_active_ref = &snap_active;
+    // Count of CUs currently being processed (subprocess spawned →
+    // output merged). After raising `snap_active`, the snapshotter
+    // waits for this to drain to 0 so the merge runs with worker RSS
+    // freed — rather than guessing with a fixed sleep. Bounded by a
+    // cap so a single long-running CU can't stall the snapshot.
+    let active_cus = std::sync::atomic::AtomicUsize::new(0);
+    let active_cus_ref = &active_cus;
 
     // Split the plan into N work shards by index. Static partition
     // is simpler than a work-stealing queue and load-balances well
@@ -943,6 +950,13 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     while snap_active_ref.load(std::sync::atomic::Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
+                    // Count this CU as in-flight for the whole body. The
+                    // guard decrements on every exit path (the `continue`s
+                    // below, normal end, or panic), so the snapshotter can
+                    // wait on `active_cus` reaching 0 to know the workers
+                    // have quiesced — deterministic, no fixed sleep.
+                    active_cus_ref.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    let _active = ActiveGuard(active_cus_ref);
                     let (kind, unit) = plan_ref[i];
                     let label = lang_label(kind);
                     let sub_path = staging.join(format!("{}.kzip", unit.sha));
@@ -1138,7 +1152,28 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                 // lands in the next snap), so a single
                                 // slow CU never stalls the snapshot.
                                 snap_active_ref.store(true, Ordering::Release);
-                                std::thread::sleep(std::time::Duration::from_secs(3));
+                                // Wait for in-flight CUs to quiesce so the
+                                // merge runs with worker subprocess RSS
+                                // freed. Workers finishing their current CU
+                                // decrement `active_cus` and park; we
+                                // proceed the instant only this snapshotter
+                                // remains active (its own guard keeps the
+                                // count at >= 1 through this block, so the
+                                // floor we wait for is 1, not 0). Common
+                                // case: a second or two. A hard cap stops a
+                                // single long-running CU from stalling the
+                                // snapshot — its sink is skipped by the
+                                // `try_lock` drain below and folds into the
+                                // next snap.
+                                {
+                                    let cap = std::time::Instant::now()
+                                        + std::time::Duration::from_secs(30);
+                                    while active_cus_ref.load(Ordering::Acquire) > 1
+                                        && std::time::Instant::now() < cap
+                                    {
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                    }
+                                }
                                 // Drain every worker sink we can
                                 // grab via `try_lock`. Sinks mid-CU
                                 // (lock held by the ingesting worker)
@@ -1326,6 +1361,18 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     eprintln!("[from-kzip] done in {:.2}s → {} ({:.2} GB)",
         t0.elapsed().as_secs_f64(), args.out.display(), bytes as f64 / 1e9);
     Ok(())
+}
+
+/// RAII counter for in-flight CUs. Decrements `active_cus` on every
+/// exit path of the per-CU loop body — the `continue`s on
+/// extract/spawn failure, the normal end, and panic unwind — so the
+/// snapshotter's quiesce-wait can never under- or over-count.
+struct ActiveGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// RAII path cleanup. Tracks a sub-kzip file or jvm tmp dir so a panic

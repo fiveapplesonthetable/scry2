@@ -140,19 +140,60 @@ kzip, output ~same size as input.
 
 ## Step 5 — build the `.s2db` index
 
+The recommended path for a real AOSP slice (scope narrowed to the
+layers worth querying, durable across a kill):
+
+```bash
+export ANDROID_BUILD_TOP=~/aosp
+./scripts/aosp-from-kzip.sh ~/aosp/out/dist/aosp-norm.kzip \
+    --in frameworks/base,frameworks/native,system/,art/,libcore/ \
+    --snapshot-every 2000 \
+    -o ~/scry2-setup/aosp.s2db
+```
+
+The wrapper bakes in the AOSP defaults — `KYTHE_ROOT`, language set
+(cxx, java, jvm), JVM heap (12 g), the libcore `--patch-module`
+quirk — and forwards everything else to `scry2 from-kzip`.
+
+If the run gets killed (OOM, reboot, operator), re-run with
+`--resume`:
+
+```bash
+./scripts/aosp-from-kzip.sh ~/aosp/out/dist/aosp-norm.kzip \
+    --in frameworks/base,frameworks/native,system/,art/,libcore/ \
+    --snapshot-every 2000 --resume \
+    -o ~/scry2-setup/aosp.s2db
+```
+
+`--resume` opens `~/scry2-setup/aosp.s2db.partial.s2db` (a queryable
+mid-run snapshot taken every `--snapshot-every` successful CUs)
+plus `~/scry2-setup/aosp.s2db.partial.shas` (the list of CUs already
+folded in) and continues with only the CUs not yet processed. The
+partial files are removed once the final s2db is written.
+
+Equivalent without the wrapper:
+
 ```bash
 scry2 from-kzip \
     --kzip ~/aosp/out/dist/aosp-norm.kzip \
     --kythe-root ~/scry2-setup/kythe-v0.0.75 \
-    -o ~/scry2-setup/aosp.s2db \
-    --jvm-heap 8g
+    --in frameworks/base,frameworks/native,system/,art/,libcore/ \
+    --inject-cu-arg 'libcore/ojluni/src/main/java/::--patch-module=java.base=libcore/ojluni/src/main/java' \
+    --jvm-heap 12g --workers $(nproc) \
+    --snapshot-every 2000 \
+    -o ~/scry2-setup/aosp.s2db
 ```
 
-`from-kzip` spawns cxx / java / jvm / go / proto / textproto
-indexers in sequence, streams each one's stdout straight into ingest,
-sorts every table once, and atomic-renames the result into place.
-Expect ~30 min wall on a full AOSP kzip — the long pole is
-java_indexer chewing through ~50 k Java CUs.
+Per-CU dispatch: each compilation unit is extracted to a tiny
+sub-kzip and fed to the matching indexer (`cxx_indexer`,
+`java_indexer.jar`, `jvm_indexer.jar`) in its own subprocess.
+One bad CU no longer takes the batch down; its stderr tail lands in
+the per-language failure summary. Workers run in parallel and
+serialize only on the in-memory builder.
+
+Expect ~30 min wall on the AOSP slice above; ~1-2 h on a full
+unfiltered AOSP kzip — long pole is java_indexer chewing through
+the Java CUs.
 
 ## Step 5 — query
 

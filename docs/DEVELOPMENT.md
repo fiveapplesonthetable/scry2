@@ -346,6 +346,101 @@ If you find another patched-module / extra-flag quirk (e.g.
 add another `--inject-cu-arg` line to `scripts/aosp-from-kzip.sh` —
 no scry2 code change required.
 
+### Filtered ingest via cheap primary-path peek
+
+A full AOSP `aosp.kzip` carries ~118 k compilation units. Decoding
+every one to apply an `--in frameworks/base,…` filter is wasted work
+— the kept set is usually a few thousand. `read_units_filtered` peeks
+just the proto-3 / JSON `source_file` (or first `required_input`)
+without paying the multi-MB full decode, then drops CUs the filter
+would reject anyway. On a normalized AOSP kzip this turns the walk
+phase from ~3 min into ~30 s. The fallback path is also correct: if
+the peek can't locate a recognizable primary path (corrupted or
+non-standard CU layout), the orchestrator full-decodes and re-checks
+the filter, so no CU is silently dropped.
+
+### Resume on kill: `--resume` + rolling snapshots
+
+Long AOSP runs get killed (host reboot, OOM, operator). `from-kzip`
+maintains a rolling builder snapshot so the next invocation picks up
+where the last one stopped.
+
+```bash
+# First run — gets killed mid-way through 12 000 CUs.
+scry2 from-kzip --kzip aosp.kzip --kythe-root … \
+    --in frameworks/base,frameworks/native,system/,art/,libcore/ \
+    --snapshot-every 2000 \
+    -o /var/scry2/aosp.s2db
+
+# Restart picks up from /var/scry2/aosp.s2db.partial.{s2db,shas}.
+scry2 from-kzip --kzip aosp.kzip --kythe-root … \
+    --in frameworks/base,frameworks/native,system/,art/,libcore/ \
+    --resume \
+    -o /var/scry2/aosp.s2db
+```
+
+What `--snapshot-every N` does, in detail:
+
+1. After every `N` *successful* CUs (`ingest_tolerant` returned Ok
+   AND child exited 0 AND the entry stream was non-empty) one
+   worker locks `snap_state_mu`, locks `builder_mu`, calls
+   `FileIdAllocator::push_to(&mut builder)` to flush deferred
+   `(path, file_id)` mappings, clones the live builder, and releases
+   `builder_mu`. The clone is the snapshot's data.
+2. The shas that became successful since the last snapshot move
+   from `pending` into `committed` under the same lock — so the
+   snapshot's `<out>.partial.shas` reflects exactly what the clone
+   captured.
+3. `write_snapshot` does `clone.finish(<out>.partial.s2db.tmp)` →
+   atomic rename → write `<out>.partial.shas.tmp` → atomic rename
+   (in that order so a crash between the two renames leaves the
+   newer `.s2db` partial paired with a strictly older `.shas`,
+   which `--resume` rejects with a clear error rather than silently
+   double-counting).
+4. Empty / failed CUs DO NOT get a sha. On resume those CUs are
+   re-run — safe, because a failed CU contributed zero rows the
+   first time around.
+
+What `--resume` does:
+
+1. If `<out>.partial.s2db` and `<out>.partial.shas` are both
+   present, open the s2db as an `Index`, then
+   `IndexBuilder::populate_from_index(&ix)` replays every
+   xref / sym / file / inherit / call / alias back into a fresh
+   builder via the reader's `iter_*` methods.
+2. The shas file populates a `HashSet<String>` skip set; the plan
+   loop drops every CU whose sha is in that set.
+3. Indexing continues from where the snapshot left off, taking
+   further snapshots every `--snapshot-every` successes.
+4. On final `builder.finish(<out>.s2db)` success, the `partial.*`
+   files are removed.
+
+Failure modes the design handles:
+- **Mid-snapshot crash** between the `.s2db.tmp` rename and the
+  `.shas.tmp` rename: the next `--resume` sees mismatched files
+  (newer s2db, older shas) and bails with `partial state is
+  incomplete` rather than double-counting.
+- **Crash with no shas yet committed**: only one of the two files
+  is present; same `--resume` failure path.
+- **Both files absent under --resume**: starts fresh, prints a
+  reassuring note.
+- **Worker panic mid-CU**: `CleanupPath` Drop guards remove the
+  sub-kzip / jvm_tmp paths from `--staging` even during unwind.
+  External `kill -9` bypasses Drop, leaving a few files in
+  staging which the next clean run wipes (`remove_dir_all(&staging)`
+  at end of `cmd_from_kzip`).
+- **`FileIdAllocator` state lost in snapshot**: handled by
+  `push_to(&mut builder)` immediately before the clone — without
+  this, mid-run snapshots would carry zero `files` rows and
+  resumed `ref` queries couldn't resolve file paths.
+
+Picking `--snapshot-every`: snapshot wall is dominated by the
+builder clone (~1 s/GB of in-memory state) plus the `finish()`
+write (~10 s/GB compressed serialization). The default `2000`
+yields one snapshot per ~5 minutes of AOSP indexer wall — small
+enough that a kill costs at most 5 min of redo work, large
+enough that snapshots are <2 % overhead.
+
 ## Code style — what the reviewer will flag
 
 * Default to **no comments**. Add only when WHY isn't obvious — never

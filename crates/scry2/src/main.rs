@@ -381,18 +381,18 @@ fn cmd_normalize_kzip(in_: &std::path::Path, out: &std::path::Path) -> Result<()
 
 fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
     let mut builder = IndexBuilder::new();
-    let mut file_ids = kythe::FileIdAllocator::default();
+    let file_ids = kythe::FileIdAllocator::default();
     let t0 = Instant::now();
     for path in entries {
         let label = path.display();
         let stats = if path.as_os_str() == "-" {
             eprintln!("[index] reading from stdin");
-            kythe::ingest(std::io::stdin().lock(), &mut builder, &mut file_ids)?
+            kythe::ingest(std::io::stdin().lock(), &mut builder, &file_ids)?
         } else {
             eprintln!("[index] reading {label}");
             let f = std::fs::File::open(path)
                 .with_context(|| format!("open {label}"))?;
-            kythe::ingest(f, &mut builder, &mut file_ids)?
+            kythe::ingest(f, &mut builder, &file_ids)?
         };
         eprintln!(
             "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} completes={}",
@@ -798,7 +798,10 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // Only the snapshotter and the post-scope finalizer write to
     // it, so contention is rare.
     let accumulator_mu = std::sync::Mutex::new(starting_builder);
-    let file_ids_mu = std::sync::Mutex::new(kythe::FileIdAllocator::default());
+    // `FileIdAllocator` is shared by-reference (interior mutex inside
+    // `intern`). Workers hit it once per file path during ingest,
+    // not once per CU — there's no whole-CU lock to serialize on.
+    let file_ids = kythe::FileIdAllocator::default();
     let by_lang_mu: std::sync::Mutex<std::collections::HashMap<&'static str, LangStats>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
     // Atomic progress counter so workers can report a coherent
@@ -837,7 +840,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             let my_builder  = &worker_builders_ref[w_id];
             let all_builders = worker_builders_ref;
             let accumulator_mu = accumulator_mu_ref;
-            let file_ids_mu = &file_ids_mu;
+            let file_ids = &file_ids;
             let by_lang_mu  = &by_lang_mu;
             let done = &done;
             let progress_mu = &progress_mu;
@@ -918,13 +921,13 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     // workers' subprocesses keep running while we hold
                     // the lock.
                     // Ingest into THIS worker's local builder — no
-                    // cross-worker contention. file_ids is still
-                    // shared so file IDs are globally consistent;
-                    // intern() is O(hash) and rarely the bottleneck.
+                    // cross-worker contention on the builder side.
+                    // `file_ids` is shared by-reference: its interior
+                    // mutex is taken only per intern (O(hash)), not
+                    // for the whole CU, so workers don't serialize.
                     let ingest_res = {
                         let mut builder  = my_builder.lock().unwrap();
-                        let mut file_ids = file_ids_mu.lock().unwrap();
-                        scry2::kythe::ingest_tolerant(stdout_h, &mut builder, &mut file_ids, true)
+                        scry2::kythe::ingest_tolerant(stdout_h, &mut builder, file_ids, true)
                     };
                     // On ingest failure the subprocess may still be
                     // writing; killing it now unblocks the pipe and
@@ -1030,8 +1033,13 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                         let drained = std::mem::take(&mut *wb.lock().unwrap());
                                         acc.merge_from(drained);
                                     }
-                                    let fids = file_ids_mu.lock().unwrap();
-                                    fids.push_to(&mut acc);
+                                    // file_ids has interior mutex —
+                                    // share by reference, push current
+                                    // (path, id) map into the
+                                    // accumulator before clone so the
+                                    // snapshot carries every file_id
+                                    // any xref might reference.
+                                    file_ids.push_to(&mut acc);
                                     acc.clone()
                                 };
                                 let mut shas: Vec<String> = snap.committed
@@ -1071,7 +1079,6 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     for wb in worker_builders {
         builder.merge_from(wb.into_inner().unwrap());
     }
-    let file_ids    = file_ids_mu.into_inner().unwrap();
     let by_lang     = by_lang_mu.into_inner().unwrap();
 
     // Report per-language summary + first failure tails.

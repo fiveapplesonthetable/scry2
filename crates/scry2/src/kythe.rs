@@ -111,7 +111,7 @@ pub struct Entry {
 pub fn ingest<R: Read>(
     reader: R,
     builder: &mut IndexBuilder,
-    file_ids: &mut FileIdAllocator,
+    file_ids: &FileIdAllocator,
 ) -> Result<IngestStats> {
     ingest_tolerant(reader, builder, file_ids, /*tolerate_trunc=*/ false)
 }
@@ -123,7 +123,7 @@ pub fn ingest<R: Read>(
 pub fn ingest_tolerant<R: Read>(
     reader: R,
     builder: &mut IndexBuilder,
-    file_ids: &mut FileIdAllocator,
+    file_ids: &FileIdAllocator,
     tolerate_trunc: bool,
 ) -> Result<IngestStats> {
     let mut r = std::io::BufReader::with_capacity(64 * 1024, reader);
@@ -226,21 +226,30 @@ pub struct IngestStats {
 }
 
 /// Maps file path → u32 id. The mapping is stable for the lifetime of
-/// the allocator: two CUs that reference the same file get the same id.
+/// the allocator: two CUs that reference the same file get the same
+/// id.
+///
+/// Interior mutability is intentional: `from-kzip` workers all share
+/// a single `&FileIdAllocator` and call `intern` concurrently. The
+/// mutex is held only for the O(hash) lookup, not for the whole CU
+/// ingest — that's the difference between "real parallelism" and
+/// the prior single-allocator-mutex shape where 36 workers all
+/// parked in futex_wait_queue.
 #[derive(Default)]
 pub struct FileIdAllocator {
-    map: HashMap<String, u32>,
+    map: std::sync::Mutex<HashMap<String, u32>>,
 }
 
 impl FileIdAllocator {
-    pub fn intern(&mut self, path: &str) -> u32 {
-        if let Some(&id) = self.map.get(path) { return id; }
-        let id = self.map.len() as u32;
-        self.map.insert(path.to_string(), id);
+    pub fn intern(&self, path: &str) -> u32 {
+        let mut m = self.map.lock().unwrap();
+        if let Some(&id) = m.get(path) { return id; }
+        let id = m.len() as u32;
+        m.insert(path.to_string(), id);
         id
     }
     pub fn drain_into(self, builder: &mut IndexBuilder) {
-        for (path, id) in self.map {
+        for (path, id) in self.map.into_inner().unwrap() {
             builder.upsert_file(id, &path);
         }
     }
@@ -251,7 +260,8 @@ impl FileIdAllocator {
     /// repeatedly and safe to interleave with the final
     /// `drain_into`.
     pub fn push_to(&self, builder: &mut IndexBuilder) {
-        for (path, &id) in &self.map {
+        let m = self.map.lock().unwrap();
+        for (path, &id) in m.iter() {
             builder.upsert_file(id, path);
         }
     }
@@ -297,7 +307,7 @@ fn process_entry(
     e: &Entry,
     state: &mut IngestState,
     builder: &mut IndexBuilder,
-    file_ids: &mut FileIdAllocator,
+    file_ids: &FileIdAllocator,
     stats: &mut IngestStats,
 ) {
     // Local aliases so the body code stays terse; the compiler elides
@@ -439,7 +449,7 @@ fn flush_ready(
     body_anchors: &mut Vec<(u32, u32, u32, u64)>,
     call_sites:   &mut Vec<(u32, u32, u64, u8)>,
     builder: &mut IndexBuilder,
-    file_ids: &mut FileIdAllocator,
+    file_ids: &FileIdAllocator,
     stats: &mut IngestStats,
 ) {
     if !a.is_anchor || a.start.is_none() { return; }
@@ -1138,8 +1148,8 @@ mod tests {
         }
 
         let mut builder = IndexBuilder::new();
-        let mut fids = FileIdAllocator::default();
-        let stats = ingest(&stream[..], &mut builder, &mut fids).unwrap();
+        let fids = FileIdAllocator::default();
+        let stats = ingest(&stream[..], &mut builder, &fids).unwrap();
         assert_eq!(stats.entries, 4);
         assert_eq!(stats.anchors_flushed, 1);
         assert_eq!(stats.xrefs_emitted, 1);

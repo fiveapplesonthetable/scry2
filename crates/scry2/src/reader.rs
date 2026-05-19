@@ -115,6 +115,42 @@ impl Index {
         None
     }
 
+    /// Diagnostic: yield up to `limit` name rows whose stored bytes
+    /// match `prefix`. Walks the alphabetical name index from the
+    /// lower bound for `prefix` until the prefix no longer matches.
+    /// Used by `scry2 names PREFIX` to inspect what aliases actually
+    /// landed in the index — non-obvious failures (trailing
+    /// whitespace, unicode normalisation, missing aliases) are then
+    /// obvious from the dump.
+    pub fn names_with_prefix(&self, prefix: &str, limit: usize) -> Vec<(String, u64)> {
+        let names = self.names_slice();
+        let n = self.hdr.names_n as usize;
+        let pb = prefix.as_bytes();
+        // Binary search for the first row whose name >= prefix.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let row_off = mid * NAME_LEN;
+            let off = u32::from_be_bytes(names[row_off..row_off + 4].try_into().unwrap());
+            let len = u16::from_be_bytes(names[row_off + 4..row_off + 6].try_into().unwrap());
+            let row = self.blob_str(off, len);
+            if row.as_bytes() < pb { lo = mid + 1; } else { hi = mid; }
+        }
+        let mut out = Vec::with_capacity(limit.min(64));
+        let mut i = lo;
+        while i < n && out.len() < limit {
+            let row_off = i * NAME_LEN;
+            let off = u32::from_be_bytes(names[row_off..row_off + 4].try_into().unwrap());
+            let len = u16::from_be_bytes(names[row_off + 4..row_off + 6].try_into().unwrap());
+            let row = self.blob_str(off, len);
+            if !row.as_bytes().starts_with(pb) { break; }
+            let sym = u64::from_be_bytes(names[row_off + 8..row_off + 16].try_into().unwrap());
+            out.push((row.to_string(), sym));
+            i += 1;
+        }
+        out
+    }
+
     /// Return all syms whose qualified name contains `needle` (case-
     /// sensitive substring). Linear scan over the name index; for 5M
     /// syms × 64 B/name = 320 MB this is 1 SSD pass, ~few hundred ms cold,

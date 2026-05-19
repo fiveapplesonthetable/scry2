@@ -306,11 +306,22 @@ fn process_entry(
             return;
         }
         // `/kythe/edge/named` — source = real sym VName, target = name
-        // VName whose signature is the human FQN.
+        // VName whose signature is the human FQN. The Java indexer
+        // appends a JVM method descriptor (e.g. `()J`, `(II)V`); we
+        // store both the raw alias AND a descriptor-stripped form so
+        // `def android.os.Binder.clearCallingIdentity` resolves
+        // without the user knowing the descriptor.
         if is_named_edge(&e.edge_kind) && !e.target.signature.is_empty() {
             let sym = sym_of(&source_key);
-            builder.add_alias(sym, &e.target.signature);
+            let raw = e.target.signature.as_ref();
+            builder.add_alias(sym, raw);
             stats.aliases_emitted += 1;
+            if let Some(stripped) = strip_jvm_method_descriptor(raw) {
+                if stripped.len() != raw.len() {
+                    builder.add_alias(sym, stripped);
+                    stats.aliases_emitted += 1;
+                }
+            }
             return;
         }
         // inheritance edges → inh[] table
@@ -361,6 +372,17 @@ fn process_entry(
 
     // Node fact.
     match e.fact_name.as_str() {
+        // C++ has no `/kythe/edge/named` — the human-readable name is
+        // encoded as a MarkedSource proto under `/kythe/code`. Parse
+        // it and emit the rendered FQN as a sym alias so
+        // `def android::Parcel::writeStrongBinder` resolves.
+        "/kythe/code" => {
+            if let Some(fqn) = parse_marked_source_fqn(&e.fact_value) {
+                let sym = sym_of(&source_key);
+                builder.add_alias(sym, &fqn);
+                stats.aliases_emitted += 1;
+            }
+        }
         "/kythe/node/kind" => {
             let value = std::str::from_utf8(&e.fact_value).unwrap_or("");
             if value == "anchor" {
@@ -516,6 +538,174 @@ fn is_named_edge(kind: &str) -> bool {
     base == "/kythe/edge/named"
 }
 
+/// Parse a Kythe MarkedSource proto (from `/kythe/code` facts emitted
+/// by cxx_indexer) and render it to a flat C++ FQN like
+/// `android::Parcel::writeStrongBinder`. Returns None if the proto is
+/// malformed or yields no IDENTIFIER content. Parameter lists are
+/// truncated at the first `(` so the caller can still query by FQN
+/// without knowing the parameter types.
+///
+/// MarkedSource schema (kythe/proto/common.proto):
+///   field 1: kind (varint enum) — BOX=0, IDENTIFIER=3, CONTEXT=4, ...
+///   field 2: pre_text (string)
+///   field 3: child (repeated submessage, recurse)
+///   field 4: post_child_text (string — joiner between children)
+///   field 5: post_text (string)
+///   (other fields ignored)
+/// MarkedSource kind values per kythe/proto/common.proto.
+const MS_BOX:        u32 = 0;
+const MS_TYPE:       u32 = 1;
+const MS_IDENTIFIER: u32 = 3;
+const MS_CONTEXT:    u32 = 4;
+
+fn parse_marked_source_fqn(buf: &[u8]) -> Option<String> {
+    /// Returns (rendered_string, this_node_kind).
+    fn render(buf: &[u8]) -> Option<(String, u32)> {
+        let mut kind: u32 = MS_BOX;
+        let mut pre = String::new();
+        let mut joiner = String::new();
+        let mut post = String::new();
+        let mut child_renders: Vec<(String, u32)> = Vec::new();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field, wire, val_end, val_start) = read_proto_field(buf, pos)?;
+            pos = val_end;
+            match (field, wire) {
+                (1, 0) => {
+                    // kind enum (varint). Re-read the value.
+                    if let Some((v, _)) = read_varint_at(&buf[val_start..val_end], 0) {
+                        kind = v as u32;
+                    }
+                }
+                (2, 2) => pre = String::from_utf8_lossy(&buf[val_start..val_end]).into_owned(),
+                (3, 2) => {
+                    if let Some(c) = render(&buf[val_start..val_end]) {
+                        child_renders.push(c);
+                    }
+                }
+                (4, 2) => joiner = String::from_utf8_lossy(&buf[val_start..val_end]).into_owned(),
+                (5, 2) => post = String::from_utf8_lossy(&buf[val_start..val_end]).into_owned(),
+                _      => {}
+            }
+        }
+        // cxx_indexer emits a fact for every PARAMETER whose
+        // MarkedSource is `[TYPE, " ", BOX(CONTEXT+IDENT_function), IDENT_param_name]`.
+        // The trailing bare IDENTIFIER after a BOX is the parameter
+        // name and concatenating it into the function FQN gives bogus
+        // aliases like "android::Parcel::writeAlignedval". Detect
+        // that pattern at THIS level and drop the trailing IDENT.
+        if child_renders.len() >= 2 {
+            let last_kind = child_renders.last().map(|(_, k)| *k).unwrap_or(MS_BOX);
+            let earlier_has_box = child_renders[..child_renders.len() - 1]
+                .iter().any(|(_, k)| *k == MS_BOX);
+            if last_kind == MS_IDENTIFIER && earlier_has_box {
+                child_renders.pop();
+            }
+        }
+        let parts: Vec<&str> = child_renders.iter().map(|(s, _)| s.as_str()).collect();
+        let mut out = String::with_capacity(pre.len() + post.len());
+        out.push_str(&pre);
+        out.push_str(&parts.join(&joiner));
+        out.push_str(&post);
+        if out.is_empty() { None } else { Some((out, kind)) }
+    }
+    let (full, _) = render(buf)?;
+    // Truncate at the first `(` — cxx_indexer's parameter list lives
+    // inside a BOX child whose pre_text starts with `(`.
+    let cut = full.find('(').unwrap_or(full.len());
+    let trimmed = full[..cut].trim_end();
+    // cxx_indexer prefixes method MarkedSources with return type and
+    // export modifiers ("LIBBINDER_EXPORTED status_t android::Parcel::foo").
+    // The FQN itself never contains whitespace (C++ uses `::`), so the
+    // last whitespace-separated token is the FQN.
+    let fqn = trimmed.rsplit_once(char::is_whitespace)
+        .map(|(_, fqn)| fqn).unwrap_or(trimmed);
+    if fqn.is_empty() { None } else { Some(fqn.to_string()) }
+}
+
+// Silence the "unused" warnings on the constants — they document the
+// kind enum even when only MS_BOX and MS_IDENTIFIER are referenced
+// in the current render heuristic.
+#[allow(dead_code)] const _MS_KINDS_USED: (u32, u32) = (MS_TYPE, MS_CONTEXT);
+
+/// Read one proto field header (varint tag + wire-size payload) at
+/// `pos` from `buf`. Returns `(field, wire, val_end, val_start)` where
+/// `val_start..val_end` is the payload slice. Returns None on EOF.
+fn read_proto_field(buf: &[u8], mut pos: usize) -> Option<(u32, u8, usize, usize)> {
+    let (tag, p1) = read_varint_at(buf, pos)?;
+    pos = p1;
+    let field = (tag >> 3) as u32;
+    let wire  = (tag & 0x7) as u8;
+    let (val_start, val_end) = match wire {
+        0 => { // varint
+            let (_, p2) = read_varint_at(buf, pos)?;
+            (pos, p2)
+        }
+        1 => (pos, pos + 8),                 // fixed64
+        2 => {                               // length-delim
+            let (len, p2) = read_varint_at(buf, pos)?;
+            let end = p2.checked_add(len as usize)?;
+            if end > buf.len() { return None; }
+            (p2, end)
+        }
+        5 => (pos, pos + 4),                 // fixed32
+        _ => return None,
+    };
+    Some((field, wire, val_end, val_start))
+}
+
+fn read_varint_at(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
+    let mut val: u64 = 0;
+    let mut shift = 0u32;
+    for _ in 0..10 {
+        if pos >= buf.len() { return None; }
+        let b = buf[pos];
+        pos += 1;
+        val |= ((b & 0x7F) as u64) << shift;
+        if b & 0x80 == 0 { return Some((val, pos)); }
+        shift += 7;
+    }
+    None
+}
+
+/// Strip the trailing JVM method descriptor from a Java named-edge
+/// signature. The java_indexer emits aliases like
+/// `android.os.Binder.clearCallingIdentity()J` — the `()J` is a JVM
+/// method descriptor (no args → returns long). Users expect to query
+/// by `android.os.Binder.clearCallingIdentity` (no descriptor) so we
+/// store both forms.
+///
+/// Returns `Some(prefix)` when a descriptor is found, else `None`.
+/// Non-method symbols (classes, fields) don't have a descriptor and
+/// the function returns None — caller already stored the raw form.
+fn strip_jvm_method_descriptor(sig: &str) -> Option<&str> {
+    // Find the LAST `(` — descriptors are at the end of the
+    // signature, never embedded.
+    let open = sig.rfind('(')?;
+    // Walk from `open` forward to find the matching `)`. JVM type
+    // descriptors don't nest parens, so a simple search suffices.
+    let bytes = sig.as_bytes();
+    let close_rel = bytes[open..].iter().position(|&b| b == b')')?;
+    let close = open + close_rel;
+    // Everything between `(` and `)` must be valid JVM type
+    // descriptor chars (or empty for no-arg methods).
+    if !bytes[open + 1..close].iter().all(is_jvm_type_byte) { return None; }
+    // Everything AFTER `)` must be a single return-type descriptor.
+    let ret = &bytes[close + 1..];
+    if ret.is_empty() || !ret.iter().all(is_jvm_type_byte) { return None; }
+    Some(&sig[..open])
+}
+
+/// JVM type descriptor characters: B C D F I J S V Z (primitives),
+/// L<class>; (reference), [ (array). Also '/' and '$' and identifier
+/// chars for class names.
+fn is_jvm_type_byte(b: &u8) -> bool {
+    matches!(*b,
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'V' | b'Z'
+        | b'L' | b';' | b'[' | b'/' | b'$' | b'_'
+        | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9')
+}
+
 
 fn node_kind_byte(s: &str) -> u8 {
     match s {
@@ -628,6 +818,248 @@ fn parse_vname(buf: &[u8]) -> Result<VName> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_descriptor_method_with_primitive_return() {
+        assert_eq!(
+            strip_jvm_method_descriptor("android.os.Binder.clearCallingIdentity()J"),
+            Some("android.os.Binder.clearCallingIdentity"),
+        );
+    }
+
+    #[test]
+    fn strip_descriptor_method_with_reference_return() {
+        assert_eq!(
+            strip_jvm_method_descriptor("java.lang.String.toString()Ljava/lang/String;"),
+            Some("java.lang.String.toString"),
+        );
+    }
+
+    #[test]
+    fn strip_descriptor_method_with_args() {
+        assert_eq!(
+            strip_jvm_method_descriptor("foo.Bar.baz(II)V"),
+            Some("foo.Bar.baz"),
+        );
+        assert_eq!(
+            strip_jvm_method_descriptor("foo.Bar.baz(Ljava/lang/String;I)Z"),
+            Some("foo.Bar.baz"),
+        );
+    }
+
+    #[test]
+    fn strip_descriptor_array_return() {
+        assert_eq!(
+            strip_jvm_method_descriptor("foo.Bar.bytes()[B"),
+            Some("foo.Bar.bytes"),
+        );
+    }
+
+    #[test]
+    fn parse_marked_source_renders_cxx_fqn() {
+        // Build a MarkedSource proto for `android::Parcel::writeStrongBinder(args)`.
+        // Layout: outer BOX with children [CONTEXT, IDENTIFIER, BOX(params)].
+        // CONTEXT has children [ID "android", ID "Parcel"] joined by "::"
+        // and a post_text of "::".
+        fn varint(mut v: u64, out: &mut Vec<u8>) {
+            while v >= 0x80 { out.push(((v & 0x7F) | 0x80) as u8); v >>= 7; }
+            out.push(v as u8);
+        }
+        fn submsg(field: u64, body: &[u8], out: &mut Vec<u8>) {
+            out.push(((field << 3) | 2) as u8);
+            varint(body.len() as u64, out);
+            out.extend_from_slice(body);
+        }
+        fn strfield(field: u64, s: &str, out: &mut Vec<u8>) {
+            out.push(((field << 3) | 2) as u8);
+            varint(s.len() as u64, out);
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn id(name: &str) -> Vec<u8> {
+            let mut buf = Vec::new();
+            // field 1 (kind) = IDENTIFIER = 3, wire 0 (varint)
+            buf.push(0x08); buf.push(3);
+            strfield(2, name, &mut buf);  // pre_text
+            buf
+        }
+        let android = id("android");
+        let parcel  = id("Parcel");
+        let writer  = id("writeStrongBinder");
+        let param_box = {
+            let mut b = Vec::new();
+            // BOX kind=0 (default, omittable); pre_text="(", post_text=")"
+            strfield(2, "(", &mut b);
+            strfield(5, ")", &mut b);
+            b
+        };
+
+        let mut context = Vec::new();
+        // field 1 kind = CONTEXT = 4
+        context.push(0x08); context.push(4);
+        submsg(3, &android, &mut context);
+        submsg(3, &parcel,  &mut context);
+        strfield(4, "::",  &mut context);  // post_child_text joins children
+        strfield(5, "::",  &mut context);  // post_text after the context
+
+        let mut root = Vec::new();
+        // field 1 kind = BOX = 0 (optional)
+        submsg(3, &context,   &mut root);
+        submsg(3, &writer,    &mut root);
+        submsg(3, &param_box, &mut root);
+
+        let fqn = parse_marked_source_fqn(&root).expect("renders");
+        assert_eq!(fqn, "android::Parcel::writeStrongBinder",
+            "params truncated at first '(', context joined by '::'");
+    }
+
+    #[test]
+    fn parse_marked_source_returns_none_on_empty() {
+        assert_eq!(parse_marked_source_fqn(&[]), None);
+    }
+
+    #[test]
+    fn parse_marked_source_drops_trailing_param_name() {
+        // cxx_indexer also emits /kythe/code facts for parameter
+        // symbols with structure [TYPE, " ", BOX(CONTEXT+IDENT_func),
+        // IDENT_param_name]. Without the trailing-IDENT drop the
+        // rendered FQN becomes e.g. "android::Parcel::writeAlignedval".
+        // We want the LAST IDENT dropped so the alias matches the
+        // enclosing function FQN (the param's own sym still gets the
+        // canonical Kythe VName for identification).
+        fn varint(mut v: u64, out: &mut Vec<u8>) {
+            while v >= 0x80 { out.push(((v & 0x7F) | 0x80) as u8); v >>= 7; }
+            out.push(v as u8);
+        }
+        fn lendelim(field: u64, body: &[u8], out: &mut Vec<u8>) {
+            out.push(((field << 3) | 2) as u8);
+            varint(body.len() as u64, out);
+            out.extend_from_slice(body);
+        }
+        fn strf(field: u64, s: &str, out: &mut Vec<u8>) {
+            out.push(((field << 3) | 2) as u8);
+            varint(s.len() as u64, out);
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn id(name: &str) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.push(0x08); b.push(3);            // kind=IDENTIFIER
+            strf(2, name, &mut b);
+            b
+        }
+
+        // BOX containing CONTEXT(android, Parcel) post=:: + IDENT(writeAligned).
+        // Default kind=BOX (0) — omit field 1 entirely.
+        let mut ctx = Vec::new();
+        ctx.push(0x08); ctx.push(4);            // kind=CONTEXT
+        lendelim(3, &id("android"), &mut ctx);
+        lendelim(3, &id("Parcel"),  &mut ctx);
+        strf(4, "::", &mut ctx);
+        strf(5, "::", &mut ctx);
+        let mut name_box = Vec::new();          // kind defaults to BOX
+        lendelim(3, &ctx, &mut name_box);
+        lendelim(3, &id("writeAligned"), &mut name_box);
+
+        // TYPE("T")
+        let mut t = Vec::new(); t.push(0x08); t.push(1); strf(2, "T", &mut t);
+        // BOX(" ") separator
+        let mut sep = Vec::new(); strf(2, " ", &mut sep);
+        // IDENT("val") trailing param name
+        let val = id("val");
+
+        // Outer MarkedSource (kind=BOX default) with these 4 children.
+        let mut root = Vec::new();
+        lendelim(3, &t,        &mut root);
+        lendelim(3, &sep,      &mut root);
+        lendelim(3, &name_box, &mut root);
+        lendelim(3, &val,      &mut root);
+
+        let fqn = parse_marked_source_fqn(&root).expect("renders");
+        assert_eq!(fqn, "android::Parcel::writeAligned",
+            "trailing IDENT(param-name) must be dropped");
+    }
+
+    #[test]
+    fn parse_marked_source_strips_return_type_and_modifiers() {
+        // Real-world cxx_indexer shape for `LIBBINDER_EXPORTED status_t
+        // android::Parcel::writeStrongBinder(...)`. Top-level pre_text
+        // carries the modifier "LIBBINDER_EXPORTED "; a TYPE child
+        // carries the return type "status_t"; the next non-type child
+        // is the actual name BOX. After truncating at `(` and taking
+        // the last whitespace-separated token we want the FQN clean.
+        fn varint(mut v: u64, out: &mut Vec<u8>) {
+            while v >= 0x80 { out.push(((v & 0x7F) | 0x80) as u8); v >>= 7; }
+            out.push(v as u8);
+        }
+        fn lendelim(field: u64, body: &[u8], out: &mut Vec<u8>) {
+            out.push(((field << 3) | 2) as u8);
+            varint(body.len() as u64, out);
+            out.extend_from_slice(body);
+        }
+        fn str_field(field: u64, s: &str, out: &mut Vec<u8>) {
+            out.push(((field << 3) | 2) as u8);
+            varint(s.len() as u64, out);
+            out.extend_from_slice(s.as_bytes());
+        }
+        fn id(name: &str) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.push(0x08); buf.push(3);            // kind=IDENTIFIER
+            str_field(2, name, &mut buf);            // pre_text
+            buf
+        }
+
+        // Inner FQN BOX: CONTEXT(android, Parcel) post_text="::" + IDENTIFIER("foo")
+        let mut context = Vec::new();
+        context.push(0x08); context.push(4);         // kind=CONTEXT
+        lendelim(3, &id("android"), &mut context);
+        lendelim(3, &id("Parcel"),  &mut context);
+        str_field(4, "::", &mut context);            // joiner
+        str_field(5, "::", &mut context);            // post_text
+        let mut name_box = Vec::new();
+        lendelim(3, &context, &mut name_box);
+        lendelim(3, &id("foo"), &mut name_box);
+
+        // TYPE child: "status_t"
+        let mut type_child = Vec::new();
+        type_child.push(0x08); type_child.push(1);   // kind=TYPE
+        str_field(2, "status_t", &mut type_child);
+
+        // Param BOX: pre_text="(", post_text=")"
+        let mut param_box = Vec::new();
+        str_field(2, "(", &mut param_box);
+        str_field(5, ")", &mut param_box);
+
+        // Outer MarkedSource: pre_text="LIBBINDER_EXPORTED " + TYPE +
+        // " " + name_box + param_box.
+        let mut root = Vec::new();
+        str_field(2, "LIBBINDER_EXPORTED ", &mut root);
+        lendelim(3, &type_child, &mut root);
+        // A " " separator child (a BOX with pre_text=" ").
+        let mut space = Vec::new();
+        str_field(2, " ", &mut space);
+        lendelim(3, &space, &mut root);
+        lendelim(3, &name_box,  &mut root);
+        lendelim(3, &param_box, &mut root);
+
+        let fqn = parse_marked_source_fqn(&root).expect("renders");
+        assert_eq!(fqn, "android::Parcel::foo",
+            "modifier + return-type prefix stripped, params truncated");
+    }
+
+    #[test]
+    fn strip_descriptor_no_descriptor_is_none() {
+        // A class or field has no method descriptor — return None
+        // so the caller doesn't add a duplicate alias.
+        assert_eq!(strip_jvm_method_descriptor("android.os.Binder"), None);
+        assert_eq!(strip_jvm_method_descriptor("foo.Bar.someField"), None);
+        // C++-style names with `::` don't have descriptors.
+        assert_eq!(strip_jvm_method_descriptor("android::Parcel::writeStrongBinder"), None);
+        // Truncated / malformed — don't strip.
+        assert_eq!(strip_jvm_method_descriptor("foo.bar()"), None);  // no return type
+        assert_eq!(strip_jvm_method_descriptor("foo.bar(II"), None);  // no `)`
+        // Looks like a method-call paren in some non-Kythe text — only
+        // strip if the suffix LOOKS like a real descriptor.
+        assert_eq!(strip_jvm_method_descriptor("foo (something) bar"), None);
+    }
 
     /// Build a wire-format Entry by hand and confirm we decode it.
     /// One anchor at path=Binder.java offset 12345 binds clearCallingIdentity.

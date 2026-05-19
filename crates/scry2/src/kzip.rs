@@ -182,44 +182,50 @@ pub fn read_units(path: &Path) -> Result<Vec<Unit>> {
 pub fn read_units_progress<P: Progress>(path: &Path, mut progress: P) -> Result<Vec<Unit>> {
     let f = File::open(path).with_context(|| format!("open kzip {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(f).with_context(|| "open zip")?;
-    // Count pbunits/units up front so the callback can show a real
-    // percentage instead of a spinner from the first call.
-    let mut total_units = 0usize;
+    // Walk the central directory once and bucket the per-prefix
+    // indices. Two cheap wins:
+    //   1. `total_units` is known before we decode anything, so the
+    //      progress callback shows a real percentage from the first
+    //      call.
+    //   2. We skip the central-dir walk a second time. The previous
+    //      naive form did `for i in 0..zip.len()` three times; on a
+    //      59 GB AOSP kzip with ~700k entries that wasted ~60 s of
+    //      wall time on a kzip whose JSON-units bucket was empty
+    //      after normalize-kzip.
+    let mut pbunit_idx: Vec<(usize, String)> = Vec::new();  // (zip-index, sha)
+    let mut json_idx:   Vec<(usize, String)> = Vec::new();
     for i in 0..zip.len() {
         let name = zip.by_index(i)?.name().to_string();
-        if strip_prefix(&name, "root/pbunits/").is_some()
-            || strip_prefix(&name, "root/units/").is_some()
-        { total_units += 1; }
+        if let Some(sha) = strip_prefix(&name, "root/pbunits/") {
+            pbunit_idx.push((i, sha.to_string()));
+        } else if let Some(sha) = strip_prefix(&name, "root/units/") {
+            json_idx.push((i, sha.to_string()));
+        }
     }
+    let total_units = pbunit_idx.len() + json_idx.len();
     let mut proto_shas: HashSet<String> = HashSet::new();
     let mut out: Vec<Unit> = Vec::with_capacity(total_units);
     // First pass: proto-encoded units (they win on collision).
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i)?;
-        let name = f.name().to_string();
-        if let Some(sha) = strip_prefix(&name, "root/pbunits/") {
-            let mut buf = Vec::with_capacity(f.size() as usize);
-            f.read_to_end(&mut buf)?;
-            let cu = parse_indexed_compilation(&buf)
-                .with_context(|| format!("decode proto unit {sha}"))?;
-            proto_shas.insert(sha.to_string());
-            out.push(Unit { sha: sha.to_string(), cu, raw_proto: Some(buf) });
-            progress.report("read", out.len(), total_units);
-        }
+    for (i, sha) in &pbunit_idx {
+        let mut f = zip.by_index(*i)?;
+        let mut buf = Vec::with_capacity(f.size() as usize);
+        f.read_to_end(&mut buf)?;
+        let cu = parse_indexed_compilation(&buf)
+            .with_context(|| format!("decode proto unit {sha}"))?;
+        proto_shas.insert(sha.clone());
+        out.push(Unit { sha: sha.clone(), cu, raw_proto: Some(buf) });
+        progress.report("read", out.len(), total_units);
     }
     // Second pass: JSON-encoded units, skipping any with a proto twin.
-    for i in 0..zip.len() {
-        let mut f = zip.by_index(i)?;
-        let name = f.name().to_string();
-        if let Some(sha) = strip_prefix(&name, "root/units/") {
-            if proto_shas.contains(sha) { continue; }
-            let mut buf = String::with_capacity(f.size() as usize);
-            f.read_to_string(&mut buf)?;
-            let cu: IndexedCompilation = serde_json::from_str(&buf)
-                .with_context(|| format!("decode JSON unit {sha}"))?;
-            out.push(Unit { sha: sha.to_string(), cu, raw_proto: None });
-            progress.report("read", out.len(), total_units);
-        }
+    for (i, sha) in &json_idx {
+        if proto_shas.contains(sha) { continue; }
+        let mut f = zip.by_index(*i)?;
+        let mut buf = String::with_capacity(f.size() as usize);
+        f.read_to_string(&mut buf)?;
+        let cu: IndexedCompilation = serde_json::from_str(&buf)
+            .with_context(|| format!("decode JSON unit {sha}"))?;
+        out.push(Unit { sha: sha.clone(), cu, raw_proto: None });
+        progress.report("read", out.len(), total_units);
     }
     Ok(out)
 }

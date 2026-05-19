@@ -152,6 +152,16 @@ enum Cmd {
         #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
+    /// `names PREFIX` — diagnostic: list alphabetically-sorted name
+    /// index entries starting with PREFIX. Useful for confirming what
+    /// aliases the indexer actually emitted (debug "why doesn't
+    /// `def foo.Bar.baz` work?" — see if "foo.Bar.baz" or
+    /// "foo.Bar.baz()" is in the index).
+    Names {
+        prefix: String,
+        #[arg(long, default_value = "32")] limit: usize,
+    },
+
     /// `serve --socket PATH` — long-lived daemon over a Unix socket.
     /// For when N unrelated processes share one warm index. Most
     /// callers want `repl` instead.
@@ -233,6 +243,13 @@ fn main() -> Result<()> {
             return server::serve(&cli.index, &sock);
         }
         Cmd::Repl => return server::repl(&cli.index),
+        Cmd::Names { prefix, limit } => {
+            let ix = Index::open(&cli.index)?;
+            for (name, sym) in ix.names_with_prefix(&prefix, limit) {
+                println!("0x{sym:016x}  {name}");
+            }
+            return Ok(());
+        }
         _ => {}
     }
     // Query-side: build a Request, dispatch in-process or via socket.

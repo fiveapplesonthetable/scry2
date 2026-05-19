@@ -59,6 +59,59 @@ Output during build looks like:
 All examples assume `--index your.s2db`, which can also be the
 default (`./scry2.s2db`).
 
+**Output mode.** Every query verb accepts `--json` for machine-
+readable output. The wire shape is identical to what `scry2 repl`
+prints on stdout and what `scry2 serve` returns over a Unix socket
+— so a tool that consumes `--json` works unchanged against any of
+the three modes.
+
+```bash
+$ scry2 --json --index aosp.s2db stat
+{"cmd":"stat","xrefs":215164,"syms":128628,"files":895,"inhs":1998,"calls":64093}
+```
+
+## Long-lived modes — REPL and serve
+
+Each query verb costs ~10 ms of process startup + mmap before the
+microsecond-scale lookup. For an LLM that runs hundreds of queries in
+one session, that startup dominates. Two ways to amortize it.
+
+### `repl` — stdin/stdout JSON loop (recommended)
+
+```bash
+$ scry2 --index aosp.s2db repl <<EOF
+{"cmd":"stat"}
+{"cmd":"def","name":"Binder","substr":true,"limit":3}
+{"cmd":"callers","name":"clearCallingIdentity","substr":true,"max_hits":5}
+EOF
+{"cmd":"stat","xrefs":…}
+{"cmd":"xrefs","groups":[…],"total":…}
+{"cmd":"xrefs","groups":[…],"total":…}
+```
+
+One JSON request per line in, one JSON reply per line out. The
+process opens the .s2db once and serves requests until stdin closes.
+Subsequent queries cost ~5 µs of pipe overhead instead of ~10 ms of
+fork+mmap. No socket, no daemon, no system state — when the parent
+closes the pipe, scry2 exits.
+
+### `serve` — daemon over a Unix socket (rare)
+
+```bash
+# Start the daemon once
+scry2 --index aosp.s2db serve --socket /tmp/scry2.sock &
+
+# Now any number of processes can query the warm Index:
+scry2 --socket /tmp/scry2.sock --json def Binder --substr
+scry2 --socket /tmp/scry2.sock --json callers clearCallingIdentity --substr
+```
+
+Pick this only when *N unrelated processes* need to share one warm
+Index (e.g. multiple developers on a shared host). For one LLM, REPL
+is leaner.
+
+## Query verbs — by example
+
 ### `stat` — sanity check
 
 ```bash

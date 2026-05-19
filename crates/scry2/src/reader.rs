@@ -39,6 +39,7 @@ impl Index {
     pub fn n_syms(&self)  -> u64 { self.hdr.syms_n }
     pub fn n_files(&self) -> u64 { self.hdr.files_n }
     pub fn n_inh(&self)   -> u64 { self.hdr.inh_n }
+    pub fn n_calls(&self) -> u64 { self.hdr.calls_n }
 
     // -- raw section slices --------------------------------------------------
 
@@ -65,6 +66,16 @@ impl Index {
     fn inh_slice(&self) -> &[u8] {
         let off = self.hdr.inh_off as usize;
         let len = self.hdr.inh_n as usize * INH_LEN;
+        &self.map[off..off + len]
+    }
+    fn calls_slice(&self) -> &[u8] {
+        let off = self.hdr.calls_off as usize;
+        let len = self.hdr.calls_n as usize * CALL_LEN;
+        &self.map[off..off + len]
+    }
+    fn crev_slice(&self) -> &[u8] {
+        let off = self.hdr.crev_off as usize;
+        let len = self.hdr.crev_n as usize * CALL_LEN;
         &self.map[off..off + len]
     }
     fn blob(&self) -> &[u8] {
@@ -219,6 +230,53 @@ impl Index {
                 let c: [u8; 8] = inh[off..off + 8].try_into().unwrap();
                 out.push(u64::from_be_bytes(c));
             }
+        }
+        out
+    }
+
+    // -- callgraph -----------------------------------------------------------
+
+    /// Direct callees of `caller`. O(log n) — binary search the calls
+    /// table by caller, then walk forward.
+    pub fn calls_from(&self, caller: u64) -> Vec<(u64, u8)> {
+        let calls = self.calls_slice();
+        let n = self.hdr.calls_n as usize;
+        let c_be = caller.to_be_bytes();
+        let mut start = [0u8; CALL_LEN];
+        start[0..8].copy_from_slice(&c_be);
+        let mut end = [0u8; CALL_LEN];
+        end[0..8].copy_from_slice(&(caller.wrapping_add(1)).to_be_bytes());
+        let lo = lower_bound(calls, n, CALL_LEN, &start);
+        let hi = lower_bound(calls, n, CALL_LEN, &end);
+        let mut out = Vec::with_capacity(hi - lo);
+        for i in lo..hi {
+            let off = i * CALL_LEN;
+            let callee = u64::from_be_bytes(calls[off + 8..off + 16].try_into().unwrap());
+            let role   = calls[off + 16];
+            out.push((callee, role));
+        }
+        out
+    }
+
+    /// Direct callers of `callee`. O(log n) — binary search the
+    /// callee-sorted `crev` table.
+    pub fn called_by(&self, callee: u64) -> Vec<(u64, u8)> {
+        let crev = self.crev_slice();
+        let n = self.hdr.crev_n as usize;
+        let c_be = callee.to_be_bytes();
+        let mut start = [0u8; CALL_LEN];
+        start[0..8].copy_from_slice(&c_be);
+        let mut end = [0u8; CALL_LEN];
+        end[0..8].copy_from_slice(&(callee.wrapping_add(1)).to_be_bytes());
+        let lo = lower_bound(crev, n, CALL_LEN, &start);
+        let hi = lower_bound(crev, n, CALL_LEN, &end);
+        let mut out = Vec::with_capacity(hi - lo);
+        for i in lo..hi {
+            let off = i * CALL_LEN;
+            // crev layout: (callee u64 BE, caller u64 BE, role u8)
+            let caller = u64::from_be_bytes(crev[off + 8..off + 16].try_into().unwrap());
+            let role   = crev[off + 16];
+            out.push((caller, role));
         }
         out
     }

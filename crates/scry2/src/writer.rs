@@ -18,6 +18,11 @@ pub struct IndexBuilder {
     files:    HashMap<u32, String>,             // file_id → path
     inherits: Vec<(u64, u64)>,                  // (child, parent)
     aliases:  Vec<(u64, String)>,               // sym → human-typeable name
+    /// Call-graph edges. (caller_sym, callee_sym, role). `role` is
+    /// `role::CALL` for a direct call, `role::REF` for any other
+    /// reference inside the caller's body — the LLM can ask
+    /// "what does X touch" not just "what does X call".
+    calls:    Vec<(u64, u64, u8)>,
 }
 
 impl IndexBuilder {
@@ -63,11 +68,20 @@ impl IndexBuilder {
         self.aliases.push((sym, alias.to_string()));
     }
 
+    /// Record a call-graph edge: function `caller` directly references
+    /// (`role::CALL`) or refers to (`role::REF`) function/type `callee`.
+    /// Used by `scry2 callgraph NAME --direction down` for O(log n)
+    /// traversal of "what does X reach?".
+    pub fn add_call(&mut self, caller: u64, callee: u64, role: u8) {
+        self.calls.push((caller, callee, role));
+    }
+
     pub fn n_xrefs(&self) -> usize { self.xrefs.len() }
     pub fn n_syms(&self)  -> usize { self.syms.len() }
     pub fn n_files(&self) -> usize { self.files.len() }
     pub fn n_inh(&self)   -> usize { self.inherits.len() }
     pub fn n_aliases(&self) -> usize { self.aliases.len() }
+    pub fn n_calls(&self) -> usize { self.calls.len() }
 
     /// Sort all tables and serialize to `path` atomically. Returns total
     /// bytes written.
@@ -137,13 +151,26 @@ impl IndexBuilder {
         self.inherits.dedup();
         let n_inh = self.inherits.len() as u64;
 
+        // ---- 4b. Sort calls (callgraph), once by caller for
+        //          `calls_from`, once by callee for `called_by`.
+        self.calls.sort_unstable();
+        self.calls.dedup();
+        let n_calls = self.calls.len() as u64;
+        let mut calls_rev: Vec<(u64, u64, u8)> = self.calls.iter()
+            .map(|(caller, callee, role)| (*callee, *caller, *role))
+            .collect();
+        calls_rev.sort_unstable();
+        let n_crev = calls_rev.len() as u64;
+
         // ---- 5. Compute section offsets ----
         let xrefs_off = pad_up(size_of_header() as u64);
         let syms_off  = pad_up(xrefs_off + n_xrefs * XREF_LEN as u64);
         let names_off = pad_up(syms_off  + n_syms  * SYM_LEN  as u64);
         let files_off = pad_up(names_off + n_names * NAME_LEN as u64);
         let inh_off   = pad_up(files_off + n_files * FILE_LEN as u64);
-        let blob_off  = pad_up(inh_off   + n_inh   * INH_LEN  as u64);
+        let calls_off = pad_up(inh_off   + n_inh   * INH_LEN  as u64);
+        let crev_off  = pad_up(calls_off + n_calls * CALL_LEN as u64);
+        let blob_off  = pad_up(crev_off  + n_crev  * CALL_LEN as u64);
 
         // ---- 6. Write to a tempfile, then atomic rename ----
         let tmp_path: PathBuf = path.with_extension("s2db.tmp");
@@ -158,6 +185,8 @@ impl IndexBuilder {
             names_off, names_n: n_names,
             files_off, files_n: n_files,
             inh_off,   inh_n:   n_inh,
+            calls_off, calls_n: n_calls,
+            crev_off,  crev_n:  n_crev,
             blob_off,  blob_len: blob.len() as u64,
             ..Default::default()
         };
@@ -199,6 +228,24 @@ impl IndexBuilder {
         for (c, p) in &self.inherits {
             w.write_all(&c.to_be_bytes())?;
             w.write_all(&p.to_be_bytes())?;
+        }
+
+        seek_to(&mut w, calls_off)?;
+        for (caller, callee, role) in &self.calls {
+            w.write_all(&caller.to_be_bytes())?;
+            w.write_all(&callee.to_be_bytes())?;
+            w.write_all(&[*role])?;
+        }
+
+        // calls_rev is sorted by (callee, caller, role) but we serialize
+        // each row in the SAME byte layout as the forward table —
+        // `(field0_u64, field1_u64, role_u8)` — so the reader code is
+        // identical. The first u64 in this section is the callee.
+        seek_to(&mut w, crev_off)?;
+        for (callee, caller, role) in &calls_rev {
+            w.write_all(&callee.to_be_bytes())?;
+            w.write_all(&caller.to_be_bytes())?;
+            w.write_all(&[*role])?;
         }
 
         seek_to(&mut w, blob_off)?;

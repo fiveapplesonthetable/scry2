@@ -113,23 +113,97 @@ pub fn ingest<R: Read>(
     builder: &mut IndexBuilder,
     file_ids: &mut FileIdAllocator,
 ) -> Result<IngestStats> {
+    ingest_tolerant(reader, builder, file_ids, /*tolerate_trunc=*/ false)
+}
+
+/// Like [`ingest`], but if the stream is truncated mid-entry we log a
+/// warning and return the partial stats instead of erroring. Used by
+/// `from-kzip` where one indexer crashing shouldn't sink the whole
+/// multi-language ingest.
+pub fn ingest_tolerant<R: Read>(
+    reader: R,
+    builder: &mut IndexBuilder,
+    file_ids: &mut FileIdAllocator,
+    tolerate_trunc: bool,
+) -> Result<IngestStats> {
     let mut r = std::io::BufReader::with_capacity(64 * 1024, reader);
     let mut anchors: HashMap<String, AnchorAccum> = HashMap::new();
     let mut completes_bridges: HashMap<String, String> = HashMap::new();
+    // Callgraph emission: we cannot rely on `/kythe/edge/childof` —
+    // in cxx_indexer's output that edge connects sym scopes
+    // (namespace nesting, class membership), not anchors to their
+    // enclosing function. The Kythe-correct way is to use body
+    // anchors: an anchor that carries a `/kythe/edge/defines` edge
+    // (not `defines/binding`) spans the whole function definition,
+    // start..end. Every call/ref anchor whose offset falls inside a
+    // body anchor's range belongs to that function.
+    //
+    // We collect both at anchor-flush time, then post-stream do an
+    // O(log n) lookup per call site against the sorted body table.
+    //
+    // Layout:
+    //   body_anchors: (file_id, start, end, def_sym), sorted by (file_id, start)
+    //   call_sites:   (file_id, start, target_sym, role)
+    let mut body_anchors: Vec<(u32, u32, u32, u64)> = Vec::new();
+    let mut call_sites:   Vec<(u32, u32, u64, u8)>  = Vec::new();
     let mut stats = IngestStats::default();
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     loop {
-        let len = match read_varint(&mut r)? {
-            Some(v) => v as usize,
-            None    => break,
+        let len = match read_varint(&mut r) {
+            Ok(Some(v)) => v as usize,
+            Ok(None)    => break,
+            Err(e) if tolerate_trunc => {
+                eprintln!("[ingest] tolerated truncated varint after {} entries: {e}",
+                    stats.entries);
+                break;
+            }
+            Err(e) => return Err(e),
         };
         buf.resize(len, 0);
-        r.read_exact(&mut buf)
-            .with_context(|| format!("truncated entry stream after {} entries", stats.entries))?;
-        let entry = parse_entry(&buf)
-            .with_context(|| format!("decode Entry #{}", stats.entries))?;
+        match r.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if tolerate_trunc => {
+                eprintln!("[ingest] tolerated truncated entry body after {} entries: {e}",
+                    stats.entries);
+                break;
+            }
+            Err(e) => return Err(e).context("truncated entry stream"),
+        }
+        let entry = match parse_entry(&buf) {
+            Ok(e) => e,
+            Err(e) if tolerate_trunc => {
+                eprintln!("[ingest] tolerated malformed Entry #{}: {e}", stats.entries);
+                break;
+            }
+            Err(e) => return Err(e.context(format!("decode Entry #{}", stats.entries))),
+        };
         stats.entries += 1;
-        process_entry(&entry, &mut anchors, &mut completes_bridges, builder, file_ids, &mut stats);
+        process_entry(
+            &entry, &mut anchors, &mut completes_bridges,
+            &mut body_anchors, &mut call_sites,
+            builder, file_ids, &mut stats,
+        );
+    }
+    // -- Callgraph emission: resolve call_sites against body_anchors.
+    //
+    // Sort body anchors by (file_id, start). For each call_site
+    // (file, off, target, role), binary-search the slice of body
+    // anchors with that file_id for the smallest range that contains
+    // `off`. The Kythe convention is non-overlapping body anchors
+    // PER FUNCTION but functions can nest (lambdas, inner classes).
+    // We pick the innermost (= shortest span) containing range so
+    // an `inner_lambda → calls → foo` edge is attributed to the
+    // lambda, not the outer function.
+    body_anchors.sort_unstable_by_key(|(f, s, _, _)| (*f, *s));
+    stats.diag_defines_seen = body_anchors.len() as u64;
+    stats.diag_pending      = call_sites.len() as u64;
+    for (file, off, target_sym, role_byte) in call_sites {
+        if let Some(enc) = innermost_containing(&body_anchors, file, off) {
+            builder.add_call(enc, target_sym, role_byte);
+            stats.calls_emitted += 1;
+        } else {
+            stats.diag_unresolved += 1;
+        }
     }
     // Apply per-stream completes bridges: rewrite any sym that came in
     // as a definition-VName to its declaration-VName when an explicit
@@ -147,7 +221,15 @@ pub struct IngestStats {
     pub xrefs_emitted:     u64,
     pub inherits_emitted:  u64,
     pub aliases_emitted:   u64,
+    pub calls_emitted:     u64,
     pub completes_bridges: usize,
+    // Diagnostic: side-table sizes at resolution time. Useful for
+    // spotting "0 calls emitted" failures — typically a sign that an
+    // indexer used a different edge kind for childof than expected.
+    pub diag_defines_seen: u64,
+    pub diag_childof_seen: u64,
+    pub diag_pending:      u64,
+    pub diag_unresolved:   u64,
 }
 
 /// Maps file path → u32 id. The mapping is stable for the lifetime of
@@ -178,12 +260,20 @@ struct AnchorAccum {
     start:     Option<u32>,
     end:       Option<u32>,
     pending:   Vec<(VName, u8)>,  // (target_vn, role)
+    /// Sym this anchor binds via a `/kythe/edge/defines` edge. That
+    /// edge marks the anchor as covering the WHOLE function body —
+    /// distinct from `defines/binding` which is just the name. Body
+    /// anchors are what we use to attribute call-site offsets to their
+    /// enclosing function for callgraph emission.
+    body_def_sym: Option<u64>,
 }
 
 fn process_entry(
     e: &Entry,
     anchors: &mut HashMap<String, AnchorAccum>,
     completes_bridges: &mut HashMap<String, String>,
+    body_anchors: &mut Vec<(u32, u32, u32, u64)>,
+    call_sites:   &mut Vec<(u32, u32, u64, u8)>,
     builder: &mut IndexBuilder,
     file_ids: &mut FileIdAllocator,
     stats: &mut IngestStats,
@@ -199,9 +289,7 @@ fn process_entry(
             return;
         }
         // `/kythe/edge/named` — source = real sym VName, target = name
-        // VName whose signature is the human FQN (e.g.
-        // "android.os.Binder.clearCallingIdentity"). Register the name
-        // as an alias so `scry2 def NAME` works without --substr.
+        // VName whose signature is the human FQN.
         if is_named_edge(&e.edge_kind) && !e.target.signature.is_empty() {
             let sym = sym_of(&source_key);
             builder.add_alias(sym, &e.target.signature);
@@ -216,15 +304,37 @@ fn process_entry(
             stats.inherits_emitted += 1;
             return;
         }
+        // /kythe/edge/childof in cxx_indexer connects sym scopes
+        // (namespace / class nesting), NOT anchors to functions —
+        // not useful for callgraph. We ignore it here. Function
+        // containment is reconstructed from body anchors instead.
+
         // xref edges
         if let Some(role_byte) = edge_to_role(&e.edge_kind) {
-            // We need the anchor's path + start to emit the xref. If
-            // facts haven't arrived yet, stash on the accumulator.
+            let target_sym = sym_of(&e.target.to_symbol_string());
             let a = anchors.entry(source_key.clone()).or_default();
             if a.path.is_empty() { a.path = e.source.path.clone(); }
+            // `defines` (NOT defines/binding) anchors cover the whole
+            // function body — that's the range we attribute call
+            // sites against. Stash on the accumulator so flush_ready
+            // can record it once start+end land.
+            if role_byte == role::DEF {
+                a.body_def_sym = Some(target_sym);
+            }
             if a.is_anchor && a.start.is_some() {
-                emit_xref(&e.target, role_byte, &a.path, a.start.unwrap(),
-                          builder, file_ids, stats);
+                let file_id = file_ids.intern(&a.path);
+                emit_xref_resolved(target_sym, &e.target, role_byte, file_id, a.start.unwrap(),
+                                   builder, stats);
+                if role_byte == role::REF || role_byte == role::CALL {
+                    call_sites.push((file_id, a.start.unwrap(), target_sym, role_byte));
+                }
+                // If this is a body-defining anchor and end is known,
+                // record the body range now.
+                if role_byte == role::DEF {
+                    if let (Some(start), Some(end)) = (a.start, a.end) {
+                        body_anchors.push((file_id, start, end, target_sym));
+                    }
+                }
             } else {
                 a.pending.push((e.target.clone(), role_byte));
             }
@@ -240,7 +350,7 @@ fn process_entry(
                 let a = anchors.entry(source_key.clone()).or_default();
                 a.is_anchor = true;
                 if a.path.is_empty() { a.path = e.source.path.clone(); }
-                flush_ready(a, builder, file_ids, stats);
+                flush_ready(a, body_anchors, call_sites, builder, file_ids, stats);
             } else {
                 // Symbol node. Register name (= source_key for now —
                 // FQN normalization via `named` edges is a follow-up)
@@ -255,13 +365,19 @@ fn process_entry(
                 let a = anchors.entry(source_key.clone()).or_default();
                 if a.path.is_empty() { a.path = e.source.path.clone(); }
                 a.start = Some(v);
-                flush_ready(a, builder, file_ids, stats);
+                flush_ready(a, body_anchors, call_sites, builder, file_ids, stats);
             }
         }
         "/kythe/loc/end" => {
             if let Some(v) = parse_ascii_u32(&e.fact_value) {
                 let a = anchors.entry(source_key.clone()).or_default();
                 a.end = Some(v);
+                // If end is the field that completes a body anchor,
+                // record the body range now.
+                if let (true, Some(start), Some(sym)) = (a.is_anchor, a.start, a.body_def_sym) {
+                    let file_id = file_ids.intern(&a.path);
+                    body_anchors.push((file_id, start, v, sym));
+                }
             }
         }
         _ => {}
@@ -270,6 +386,8 @@ fn process_entry(
 
 fn flush_ready(
     a: &mut AnchorAccum,
+    body_anchors: &mut Vec<(u32, u32, u32, u64)>,
+    call_sites:   &mut Vec<(u32, u32, u64, u8)>,
     builder: &mut IndexBuilder,
     file_ids: &mut FileIdAllocator,
     stats: &mut IngestStats,
@@ -277,30 +395,73 @@ fn flush_ready(
     if !a.is_anchor || a.start.is_none() { return; }
     let start = a.start.unwrap();
     let path  = a.path.clone();
+    let file_id = file_ids.intern(&path);
     let pend  = std::mem::take(&mut a.pending);
     for (target, role_byte) in pend {
-        emit_xref(&target, role_byte, &path, start, builder, file_ids, stats);
+        let target_sym = sym_of(&target.to_symbol_string());
+        emit_xref_resolved(target_sym, &target, role_byte, file_id, start, builder, stats);
+        if role_byte == role::REF || role_byte == role::CALL {
+            call_sites.push((file_id, start, target_sym, role_byte));
+        }
+        if role_byte == role::DEF {
+            // Record body-anchor range if end is known.
+            if let Some(end) = a.end {
+                body_anchors.push((file_id, start, end, target_sym));
+                a.body_def_sym = None; // consumed
+            } else {
+                a.body_def_sym = Some(target_sym);
+            }
+        }
     }
     stats.anchors_flushed += 1;
 }
 
-fn emit_xref(
+fn emit_xref_resolved(
+    sym: u64,
     target: &VName,
     role_byte: u8,
-    path: &str,
+    file_id: u32,
     offset: u32,
     builder: &mut IndexBuilder,
-    file_ids: &mut FileIdAllocator,
     stats: &mut IngestStats,
 ) {
     if target.is_empty() { return; }
     let sym_str = target.to_symbol_string();
-    let sym     = sym_of(&sym_str);
-    // Register the target symbol if first time seen.
     builder.upsert_sym(sym, kind::UNK, target.lang_byte(), &sym_str);
-    let file_id = file_ids.intern(path);
     builder.add_xref(sym, role_byte, file_id, offset);
     stats.xrefs_emitted += 1;
+}
+
+/// Find the SHORTEST body anchor that contains `(file, off)` — the
+/// innermost enclosing function. O(log n) into the file's range, then
+/// O(matching-bodies) linear within (which is tiny in practice — a
+/// few nested lambdas at most).
+fn innermost_containing(
+    body_anchors: &[(u32, u32, u32, u64)],
+    file: u32,
+    off: u32,
+) -> Option<u64> {
+    // Binary-search the first row with file_id == `file` AND start >= 0.
+    // We want all rows with file_id == file and start <= off.
+    // body_anchors is sorted by (file_id, start) ascending.
+    let n = body_anchors.len();
+    let file_start = match body_anchors.binary_search_by_key(&(file, 0u32), |(f, s, _, _)| (*f, *s)) {
+        Ok(i) | Err(i) => i,
+    };
+    let mut best: Option<(u32, u64)> = None;  // (span_len, sym)
+    let mut i = file_start;
+    while i < n && body_anchors[i].0 == file {
+        let (_, start, end, sym) = body_anchors[i];
+        if start > off { break; }                  // sorted; rest start later
+        if end > off {
+            let span = end - start;
+            if best.map_or(true, |(b_span, _)| span < b_span) {
+                best = Some((span, sym));
+            }
+        }
+        i += 1;
+    }
+    best.map(|(_, sym)| sym)
 }
 
 fn edge_to_role(kind: &str) -> Option<u8> {
@@ -337,6 +498,7 @@ fn is_named_edge(kind: &str) -> bool {
     let base = kind.split('.').next().unwrap_or(kind);
     base == "/kythe/edge/named"
 }
+
 
 fn node_kind_byte(s: &str) -> u8 {
     match s {

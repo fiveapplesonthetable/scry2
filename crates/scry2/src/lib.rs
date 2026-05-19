@@ -121,6 +121,67 @@ mod tests {
     }
 
     #[test]
+    fn callgraph_round_trip_both_directions() {
+        // Three-function call chain: foo() → bar() → baz()
+        let path = tmp("callgraph");
+        let mut b = IndexBuilder::new();
+        let s_foo = sym_of("kythe:c++:test###foo");
+        let s_bar = sym_of("kythe:c++:test###bar");
+        let s_baz = sym_of("kythe:c++:test###baz");
+        b.upsert_sym(s_foo, kind::FUNCTION, lang::CXX, "foo");
+        b.upsert_sym(s_bar, kind::FUNCTION, lang::CXX, "bar");
+        b.upsert_sym(s_baz, kind::FUNCTION, lang::CXX, "baz");
+        b.add_call(s_foo, s_bar, role::CALL);
+        b.add_call(s_bar, s_baz, role::CALL);
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // Down from foo:
+        let down: Vec<_> = ix.calls_from(s_foo).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(down, vec![s_bar], "foo calls bar");
+        // Down from bar:
+        let down: Vec<_> = ix.calls_from(s_bar).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(down, vec![s_baz], "bar calls baz");
+        // Down from baz:
+        assert!(ix.calls_from(s_baz).is_empty(), "baz calls nothing");
+        // Up: who calls baz?
+        let up: Vec<_> = ix.called_by(s_baz).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(up, vec![s_bar], "baz called by bar");
+        // Up: who calls bar?
+        let up: Vec<_> = ix.called_by(s_bar).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(up, vec![s_foo], "bar called by foo");
+        // Up: who calls foo? Nobody.
+        assert!(ix.called_by(s_foo).is_empty(), "nobody calls foo");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn callgraph_many_callees_dedup() {
+        // One caller, many callees — confirms dedup of duplicate edges
+        // and that calls_from returns ALL distinct callees, not just one.
+        let path = tmp("multi");
+        let mut b = IndexBuilder::new();
+        let caller = sym_of("caller");
+        b.upsert_sym(caller, kind::FUNCTION, lang::JAVA, "caller");
+        for i in 0..50 {
+            let callee = sym_of(&format!("callee_{i}"));
+            b.upsert_sym(callee, kind::FUNCTION, lang::JAVA, &format!("callee_{i}"));
+            b.add_call(caller, callee, role::CALL);
+            // Add duplicates that should dedup.
+            b.add_call(caller, callee, role::CALL);
+        }
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+        let callees = ix.calls_from(caller);
+        assert_eq!(callees.len(), 50, "50 distinct callees (50 dups dropped)");
+        // Up direction from one of them:
+        let one = sym_of("callee_17");
+        let up: Vec<_> = ix.called_by(one).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(up, vec![caller]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn name_substring_match() {
         let path = tmp("substr");
         let mut b = IndexBuilder::new();

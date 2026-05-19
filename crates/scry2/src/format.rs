@@ -27,8 +27,8 @@
 
 use std::mem::size_of;
 
-pub const MAGIC: [u8; 8]   = *b"S2DBv1\0\0";
-pub const VERSION: u32     = 1;
+pub const MAGIC: [u8; 8]   = *b"S2DBv2\0\0";
+pub const VERSION: u32     = 2;
 pub const PAGE: usize      = 4096;
 
 /// File header — first 256 bytes. Numbers count rows, *not* bytes.
@@ -54,10 +54,16 @@ pub struct Header {
     pub inh_off:      u64,
     pub inh_n:        u64,
 
+    pub calls_off:    u64,    // (caller, callee, role) — sorted by caller
+    pub calls_n:      u64,
+
+    pub crev_off:     u64,    // same rows, sorted by callee  (O(log n) reverse lookup)
+    pub crev_n:       u64,
+
     pub blob_off:     u64,
     pub blob_len:     u64,
 
-    pub _reserved:    [u8; 256 - 8 - 4 - 4 - 8*12],
+    pub _reserved:    [u8; 256 - 8 - 4 - 4 - 8*16],
 }
 
 impl Default for Header {
@@ -69,8 +75,10 @@ impl Default for Header {
             names_off: 0, names_n: 0,
             files_off: 0, files_n: 0,
             inh_off:   0, inh_n:   0,
+            calls_off: 0, calls_n: 0,
+            crev_off:  0, crev_n:  0,
             blob_off:  0, blob_len: 0,
-            _reserved: [0; 256 - 8 - 4 - 4 - 8*12],
+            _reserved: [0; 256 - 8 - 4 - 4 - 8*16],
         }
     }
 }
@@ -174,6 +182,22 @@ pub struct InhRow {
 }
 pub const INH_LEN: usize = 16;
 const _: () = assert!(size_of::<InhRow>() == INH_LEN);
+
+// (CallRow declared below — keep the type alias `CALL_LEN` accessible
+//  from the writer module without an extra import.)
+
+/// One callgraph edge: (caller, callee, role). Sorted by
+/// (caller, callee, role). 17 bytes — `caller` is the function body
+/// containing the call, `callee` is the symbol being called.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallRow {
+    pub caller:  [u8; 8],
+    pub callee:  [u8; 8],
+    pub role:    u8,        // role::CALL or role::REF
+}
+pub const CALL_LEN: usize = 17;
+const _: () = assert!(size_of::<CallRow>() == CALL_LEN);
 
 /// Page-align a byte offset up to the next 4 KB boundary.
 #[inline] pub fn pad_up(n: u64) -> u64 {

@@ -115,6 +115,47 @@ enum Cmd {
 
     /// `sub NAME` — print direct subtype(s) of a type.
     Sub { name: String },
+
+    /// `callgraph NAME` — transitive walk of the call graph.
+    ///
+    /// `--direction up`   = who-calls-who chains *into* NAME (default)
+    /// `--direction down` = what-does-NAME-call chains *out of* NAME
+    /// `--direction both` = both at once
+    /// `--depth N`        = max hops (default 3)
+    Callgraph {
+        name: String,
+        #[arg(long, value_parser = ["up", "down", "both"], default_value = "up")]
+        direction: String,
+        #[arg(long, default_value = "3")]
+        depth: usize,
+        /// Cap distinct syms reported. Stops BFS early if exceeded.
+        #[arg(long, default_value = "200")]
+        max_syms: usize,
+    },
+
+    /// `from-kzip` — build an .s2db by running each Kythe indexer
+    /// against KZIP and ingesting all entries.
+    ///
+    /// Spawns cxx_indexer, java_indexer.jar, jvm_indexer.jar, go_indexer,
+    /// proto_indexer, textproto_indexer in sequence; each indexer's
+    /// stdout is streamed straight into ingest. Indexers silently skip
+    /// CUs they don't understand; missing indexer binaries are skipped
+    /// with a warning, not an error.
+    FromKzip {
+        /// Path to the .kzip to ingest.
+        #[arg(long)] kzip: PathBuf,
+        /// Path to a Kythe v0.0.75 release dir — `indexers/<binary>`
+        /// must exist underneath.
+        #[arg(long = "kythe-root")] kythe_root: PathBuf,
+        /// Output .s2db.
+        #[arg(short, long, default_value = "scry2.s2db")] out: PathBuf,
+        /// Which indexers to run. Default: all. Comma-separated subset
+        /// of: cxx,java,jvm,go,proto,textproto.
+        #[arg(long, default_value = "cxx,java,jvm,go,proto,textproto")]
+        langs: String,
+        /// JVM heap for java/jvm indexers (e.g. 8g). Default 8g.
+        #[arg(long, default_value = "8g")] jvm_heap: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -136,7 +177,138 @@ fn main() -> Result<()> {
         }
         Cmd::Super { name } => cmd_inherits(&Index::open(&cli.index)?, &name, /*sub=*/false),
         Cmd::Sub   { name } => cmd_inherits(&Index::open(&cli.index)?, &name, /*sub=*/true),
+        Cmd::Callgraph { name, direction, depth, max_syms } =>
+            cmd_callgraph(&Index::open(&cli.index)?, &name, &direction, depth, max_syms),
+        Cmd::FromKzip { kzip, kythe_root, out, langs, jvm_heap } =>
+            cmd_from_kzip(&kzip, &kythe_root, &out, &langs, &jvm_heap),
     }
+}
+
+fn cmd_callgraph(ix: &Index, name: &str, direction: &str, depth: usize, max_syms: usize) -> Result<()> {
+    let root = match ix.sym_for_name(name) {
+        Some(s) => s,
+        None => { eprintln!("callgraph: no such symbol '{name}'"); return Ok(()); }
+    };
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    seen.insert(root);
+    let mut frontier: Vec<u64> = vec![root];
+    let mut total = 0usize;
+    let print_sym = |s: u64| -> String {
+        match ix.sym_meta(s) {
+            Some((n, _, _)) => n.to_string(),
+            None            => format!("<sym {:016x}>", s),
+        }
+    };
+    let go_up   = direction == "up"   || direction == "both";
+    let go_down = direction == "down" || direction == "both";
+
+    for hop in 1..=depth {
+        let mut next: Vec<u64> = Vec::new();
+        for &cur in &frontier {
+            if go_up {
+                for (caller, _) in ix.called_by(cur) {
+                    if seen.insert(caller) {
+                        println!("hop={hop} up   {}  ←  {}", print_sym(caller), print_sym(cur));
+                        next.push(caller);
+                        total += 1;
+                        if total >= max_syms { eprintln!("(callgraph truncated at {max_syms} syms)"); return Ok(()); }
+                    }
+                }
+            }
+            if go_down {
+                for (callee, _) in ix.calls_from(cur) {
+                    if seen.insert(callee) {
+                        println!("hop={hop} down {}  →  {}", print_sym(cur), print_sym(callee));
+                        next.push(callee);
+                        total += 1;
+                        if total >= max_syms { eprintln!("(callgraph truncated at {max_syms} syms)"); return Ok(()); }
+                    }
+                }
+            }
+        }
+        if next.is_empty() { break; }
+        frontier = next;
+    }
+    eprintln!("hits={total}");
+    Ok(())
+}
+
+fn cmd_from_kzip(
+    kzip: &std::path::Path,
+    kythe_root: &std::path::Path,
+    out: &std::path::Path,
+    langs: &str,
+    jvm_heap: &str,
+) -> Result<()> {
+    use std::process::{Command, Stdio};
+    let want: std::collections::HashSet<&str> = langs.split(',').map(|s| s.trim()).collect();
+    let mut builder = scry2::IndexBuilder::new();
+    let mut file_ids = scry2::kythe::FileIdAllocator::default();
+    let t0 = Instant::now();
+
+    let cxx        = kythe_root.join("indexers/cxx_indexer");
+    let java_jar   = kythe_root.join("indexers/java_indexer.jar");
+    let jvm_jar    = kythe_root.join("indexers/jvm_indexer.jar");
+    let go         = kythe_root.join("indexers/go_indexer");
+    let proto      = kythe_root.join("indexers/proto_indexer");
+    let textproto  = kythe_root.join("indexers/textproto_indexer");
+
+    let make_jvm = |jar: &std::path::Path| -> Command {
+        let mut c = Command::new("java");
+        c.arg(format!("-Xmx{jvm_heap}"))
+            .arg("-jar").arg(jar)
+            .arg("--ignore_empty_kzip")
+            .arg(kzip);
+        c
+    };
+    let make_proto = |bin: &std::path::Path, dash: &str| -> Command {
+        let mut c = Command::new(bin);
+        c.arg(format!("{dash}index_file={}", kzip.display()));
+        c
+    };
+
+    let mut to_run: Vec<(&'static str, Command)> = Vec::new();
+    if want.contains("cxx") && cxx.exists()       { let mut c = Command::new(&cxx); c.arg(kzip); to_run.push(("cxx", c)); }
+    if want.contains("java") && java_jar.exists() { to_run.push(("java", make_jvm(&java_jar))); }
+    if want.contains("jvm")  && jvm_jar.exists()  { to_run.push(("jvm",  make_jvm(&jvm_jar))); }
+    if want.contains("go")   && go.exists()       { let mut c = Command::new(&go); c.arg(kzip); to_run.push(("go",   c)); }
+    if want.contains("proto") && proto.exists()   { to_run.push(("proto", make_proto(&proto, "-"))); }
+    if want.contains("textproto") && textproto.exists() {
+        to_run.push(("textproto", make_proto(&textproto, "--")));
+    }
+
+    if to_run.is_empty() {
+        anyhow::bail!("from-kzip: no indexer binaries found under {} for langs={langs}",
+            kythe_root.display());
+    }
+    for (label, mut cmd) in to_run {
+        let phase_t = Instant::now();
+        eprintln!("[from-kzip] running {label}");
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+            .with_context(|| format!("spawn {label} indexer"))?;
+        let stdout = child.stdout.take().unwrap();
+        // Tolerate truncation: a crashing cxx_indexer must not sink
+        // the multi-language ingest.
+        let stats = scry2::kythe::ingest_tolerant(stdout, &mut builder, &mut file_ids, true)?;
+        let exit = child.wait()?;
+        eprintln!(
+            "[from-kzip]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} (wall={:.1}s, exit={:?})",
+            stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
+            stats.inherits_emitted, stats.aliases_emitted, stats.calls_emitted,
+            phase_t.elapsed().as_secs_f64(), exit.code(),
+        );
+    }
+    file_ids.drain_into(&mut builder);
+    eprintln!(
+        "[from-kzip] writing — xrefs={} syms={} files={} inhs={} calls={}",
+        builder.n_xrefs(), builder.n_syms(), builder.n_files(), builder.n_inh(), builder.n_calls(),
+    );
+    let bytes = builder.finish(out)?;
+    eprintln!(
+        "[from-kzip] done in {:.2}s → {} ({:.2} GB)",
+        t0.elapsed().as_secs_f64(), out.display(), bytes as f64 / 1e9,
+    );
+    Ok(())
 }
 
 fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
@@ -155,9 +327,15 @@ fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
             kythe::ingest(f, &mut builder, &mut file_ids)?
         };
         eprintln!(
-            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} completes={}",
+            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} completes={}",
             stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
-            stats.inherits_emitted, stats.aliases_emitted, stats.completes_bridges,
+            stats.inherits_emitted, stats.aliases_emitted, stats.calls_emitted,
+            stats.completes_bridges,
+        );
+        eprintln!(
+            "[index]   {label}: diag defines_seen={} childof_seen={} pending={} unresolved={}",
+            stats.diag_defines_seen, stats.diag_childof_seen,
+            stats.diag_pending, stats.diag_unresolved,
         );
     }
     file_ids.drain_into(&mut builder);
@@ -178,6 +356,7 @@ fn cmd_stat(ix: &Index) -> Result<()> {
     println!("syms:   {}", ix.n_syms());
     println!("files:  {}", ix.n_files());
     println!("inhs:   {}", ix.n_inh());
+    println!("calls:  {}", ix.n_calls());
     Ok(())
 }
 

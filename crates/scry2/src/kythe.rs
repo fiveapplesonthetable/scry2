@@ -146,6 +146,7 @@ pub struct IngestStats {
     pub anchors_flushed:   u64,
     pub xrefs_emitted:     u64,
     pub inherits_emitted:  u64,
+    pub aliases_emitted:   u64,
     pub completes_bridges: usize,
 }
 
@@ -195,6 +196,16 @@ fn process_entry(
         // completes bridges (cxx DEFN↔DECL)
         if is_completes_edge(&e.edge_kind) && !e.target.is_empty() {
             completes_bridges.insert(source_key, e.target.to_symbol_string());
+            return;
+        }
+        // `/kythe/edge/named` — source = real sym VName, target = name
+        // VName whose signature is the human FQN (e.g.
+        // "android.os.Binder.clearCallingIdentity"). Register the name
+        // as an alias so `scry2 def NAME` works without --substr.
+        if is_named_edge(&e.edge_kind) && !e.target.signature.is_empty() {
+            let sym = sym_of(&source_key);
+            builder.add_alias(sym, &e.target.signature);
+            stats.aliases_emitted += 1;
             return;
         }
         // inheritance edges → inh[] table
@@ -320,6 +331,11 @@ fn is_inherit_edge(kind: &str) -> bool {
 fn is_completes_edge(kind: &str) -> bool {
     let base = kind.split('.').next().unwrap_or(kind);
     matches!(base, "/kythe/edge/completes" | "/kythe/edge/completes/uniquely")
+}
+
+fn is_named_edge(kind: &str) -> bool {
+    let base = kind.split('.').next().unwrap_or(kind);
+    base == "/kythe/edge/named"
 }
 
 fn node_kind_byte(s: &str) -> u8 {

@@ -17,6 +17,39 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// Path filter applied to xref rows + target symbols. Matches `scry`'s
+/// `--in` / `--not-in` / `--def-in` semantics so muscle memory carries
+/// over.
+///
+/// **What path is matched?** scry2 stores Kythe's `path` field on every
+/// xref — that's the corpus-relative path the indexer emitted (e.g.
+/// `frameworks/base/core/java/android/os/Binder.java`). Substring match
+/// is done against that string. No normalization, no realpath, no
+/// resolving against a `--source-root`. If the corpus uses different
+/// roots for different CUs, those distinctions stay visible.
+#[derive(Debug, Clone, Default)]
+struct PathFilter<'a> {
+    in_:    Option<&'a str>,
+    not_in: Option<&'a str>,
+    def_in: Option<&'a str>,
+}
+
+impl<'a> PathFilter<'a> {
+    fn row_passes(&self, ref_path: &str) -> bool {
+        if let Some(p) = self.not_in { if ref_path.contains(p) { return false; } }
+        if let Some(p) = self.in_    { if !ref_path.contains(p) { return false; } }
+        true
+    }
+    fn sym_passes(&self, ix: &Index, sym: u64) -> bool {
+        let p = match self.def_in { Some(p) => p, None => return true };
+        for (_, _, file, _) in ix.xrefs(sym, role::DECL, role::DEF) {
+            let path = ix.file_path(file).unwrap_or("");
+            if path.contains(p) { return true; }
+        }
+        false
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Stats about an index file: row counts, size, sanity check.
@@ -38,13 +71,19 @@ enum Cmd {
     },
 
     /// `def NAME` — print the definition site (file:offset) of a symbol.
-    /// NAME is a fully-qualified Kythe name, or a substring (use --substr).
+    /// NAME is a fully-qualified Kythe name (or an alias learned from a
+    /// `/kythe/edge/named` edge), or a substring (use --substr).
     Def {
         name: String,
         /// Match `name` as a substring against any symbol's name.
         #[arg(long)] substr: bool,
         /// Cap matches when --substr is on.
         #[arg(long, default_value = "16")] limit: usize,
+        /// Restrict results to file paths containing SUBSTR (corpus-
+        /// relative). Substring match against the Kythe path field.
+        #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        /// Drop results whose file path contains SUBSTR.
+        #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
     },
 
     /// `ref NAME` — print every reference of a symbol.
@@ -52,8 +91,12 @@ enum Cmd {
         name: String,
         #[arg(long)] substr: bool,
         #[arg(long, default_value = "16")] limit: usize,
-        /// Cap rows printed per match.
         #[arg(long, default_value = "200")] max_hits: usize,
+        #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
+        /// Restrict to symbols whose decl/def file path contains SUBSTR.
+        /// Useful for `ref ClearCallingIdentity --def-in /Binder.java`.
+        #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
     /// `callers NAME` — print every call site of a function.
@@ -62,6 +105,9 @@ enum Cmd {
         #[arg(long)] substr: bool,
         #[arg(long, default_value = "16")] limit: usize,
         #[arg(long, default_value = "200")] max_hits: usize,
+        #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
+        #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
     /// `super NAME` — print direct supertype(s) of a type.
@@ -76,12 +122,18 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Index { entries, out } => cmd_index(&entries, &out),
         Cmd::Stat => cmd_stat(&Index::open(&cli.index)?),
-        Cmd::Def { name, substr, limit }
-            => cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, role::DECL, role::DEF, usize::MAX, "def"),
-        Cmd::Ref { name, substr, limit, max_hits }
-            => cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, 0, u8::MAX, max_hits, "ref"),
-        Cmd::Callers { name, substr, limit, max_hits }
-            => cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, role::CALL, role::CALL, max_hits, "callers"),
+        Cmd::Def { name, substr, limit, in_, not_in } => {
+            let f = PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: None };
+            cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, role::DECL, role::DEF, usize::MAX, "def", &f)
+        }
+        Cmd::Ref { name, substr, limit, max_hits, in_, not_in, def_in } => {
+            let f = PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() };
+            cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, 0, u8::MAX, max_hits, "ref", &f)
+        }
+        Cmd::Callers { name, substr, limit, max_hits, in_, not_in, def_in } => {
+            let f = PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() };
+            cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, role::CALL, role::CALL, max_hits, "callers", &f)
+        }
         Cmd::Super { name } => cmd_inherits(&Index::open(&cli.index)?, &name, /*sub=*/false),
         Cmd::Sub   { name } => cmd_inherits(&Index::open(&cli.index)?, &name, /*sub=*/true),
     }
@@ -103,9 +155,9 @@ fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
             kythe::ingest(f, &mut builder, &mut file_ids)?
         };
         eprintln!(
-            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} completes={}",
+            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} completes={}",
             stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
-            stats.inherits_emitted, stats.completes_bridges,
+            stats.inherits_emitted, stats.aliases_emitted, stats.completes_bridges,
         );
     }
     file_ids.drain_into(&mut builder);
@@ -132,6 +184,7 @@ fn cmd_stat(ix: &Index) -> Result<()> {
 fn cmd_xrefs(
     ix: &Index, name: &str, substr: bool, name_limit: usize,
     role_lo: u8, role_hi: u8, max_hits: usize, label: &str,
+    filt: &PathFilter,
 ) -> Result<()> {
     let syms = resolve_syms(ix, name, substr, name_limit);
     if syms.is_empty() {
@@ -140,10 +193,16 @@ fn cmd_xrefs(
     }
     let mut total = 0usize;
     for sym in &syms {
+        if !filt.sym_passes(ix, *sym) { continue; }
         let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", kind::UNK, lang::UNK));
-        println!("# {sname}  [{}/{}]", kind_str(knd), lang_str(lng));
+        let mut header_printed = false;
         for (_, role, file, off) in ix.xrefs(*sym, role_lo, role_hi) {
             let path = ix.file_path(file).unwrap_or("?");
+            if !filt.row_passes(path) { continue; }
+            if !header_printed {
+                println!("# {sname}  [{}/{}]", kind_str(knd), lang_str(lng));
+                header_printed = true;
+            }
             println!("  {} {}@{}", role_str(role), path, off);
             total += 1;
             if total >= max_hits {

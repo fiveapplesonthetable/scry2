@@ -97,6 +97,30 @@ mod tests {
     }
 
     #[test]
+    fn alias_resolves_to_same_sym() {
+        let path = tmp("alias");
+        let mut b = IndexBuilder::new();
+        // Use a raw VName-style string as canonical, plus an alias
+        // representing the human-typeable FQN (what a `/kythe/edge/named`
+        // edge would give us).
+        let canon = "kythe:java:android##core/java/android/os/Binder.java#clearCallingIdentity()";
+        let alias = "android.os.Binder.clearCallingIdentity";
+        let s = sym_of(canon);
+        b.upsert_sym(s, kind::FUNCTION, lang::JAVA, canon);
+        b.add_alias(s, alias);
+        b.upsert_file(1, "/aosp/.../Binder.java");
+        b.add_xref(s, role::DECL, 1, 12345);
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        assert_eq!(ix.sym_for_name(canon), Some(s),
+            "canonical name still resolves");
+        assert_eq!(ix.sym_for_name(alias), Some(s),
+            "alias resolves to the same sym");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn name_substring_match() {
         let path = tmp("substr");
         let mut b = IndexBuilder::new();

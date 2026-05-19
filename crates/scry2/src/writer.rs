@@ -17,6 +17,7 @@ pub struct IndexBuilder {
     syms:     HashMap<u64, (u8, u8, String)>,   // sym → (kind, lang, name)
     files:    HashMap<u32, String>,             // file_id → path
     inherits: Vec<(u64, u64)>,                  // (child, parent)
+    aliases:  Vec<(u64, String)>,               // sym → human-typeable name
 }
 
 impl IndexBuilder {
@@ -52,10 +53,21 @@ impl IndexBuilder {
         self.inherits.push((child, parent));
     }
 
+    /// Register a human-typeable alias for `sym` — e.g. the FQN
+    /// "android.os.Binder.clearCallingIdentity" learned from a
+    /// `/kythe/edge/named` edge. The alphabetical name index will
+    /// contain a row per (alias, sym) pair, so both the raw VName
+    /// string and every alias resolve via `sym_for_name`.
+    pub fn add_alias(&mut self, sym: u64, alias: &str) {
+        if alias.is_empty() { return; }
+        self.aliases.push((sym, alias.to_string()));
+    }
+
     pub fn n_xrefs(&self) -> usize { self.xrefs.len() }
     pub fn n_syms(&self)  -> usize { self.syms.len() }
     pub fn n_files(&self) -> usize { self.files.len() }
     pub fn n_inh(&self)   -> usize { self.inherits.len() }
+    pub fn n_aliases(&self) -> usize { self.aliases.len() }
 
     /// Sort all tables and serialize to `path` atomically. Returns total
     /// bytes written.
@@ -80,6 +92,14 @@ impl IndexBuilder {
             name_pos.push((blob.len() as u32, name.len() as u16));
             blob.extend_from_slice(name.as_bytes());
         }
+        // Also lay out aliases in the blob. We collect `(sym, off, len)`
+        // tuples now and fold them into the alpha index later.
+        let mut alias_pos: Vec<(u64, u32, u16)> = Vec::with_capacity(self.aliases.len());
+        for (sym, alias) in &self.aliases {
+            assert!(alias.len() <= u16::MAX as usize, "alias longer than 64KB");
+            alias_pos.push((*sym, blob.len() as u32, alias.len() as u16));
+            blob.extend_from_slice(alias.as_bytes());
+        }
         let mut files_vec: Vec<(u32, String)> = self.files.into_iter().collect();
         files_vec.sort_unstable_by_key(|r| r.0);
         let n_files = files_vec.len() as u64;
@@ -91,12 +111,26 @@ impl IndexBuilder {
         }
 
         // ---- 3. Build alphabetical name index ----
-        // (sym_idx_in_syms_vec, name_off, name_len) sorted by name bytes.
-        let mut by_name: Vec<u32> = (0..syms_vec.len() as u32).collect();
-        by_name.sort_by(|&a, &b| {
-            syms_vec[a as usize].3.as_bytes()
-                .cmp(syms_vec[b as usize].3.as_bytes())
+        //
+        // Each entry is `(name_off, name_len, sym)`. Canonical-name
+        // entries come from `syms_vec` (one per sym); alias entries
+        // come from `alias_pos` (zero or more per sym). We merge both
+        // sources into one Vec and sort by the name bytes in `blob`.
+        let mut by_name: Vec<(u32, u16, u64)> =
+            Vec::with_capacity(syms_vec.len() + alias_pos.len());
+        for (i, (sym, _, _, _)) in syms_vec.iter().enumerate() {
+            let (off, len) = name_pos[i];
+            by_name.push((off, len, *sym));
+        }
+        for (sym, off, len) in &alias_pos {
+            by_name.push((*off, *len, *sym));
+        }
+        by_name.sort_by(|a, b| {
+            let an = &blob[a.0 as usize..a.0 as usize + a.1 as usize];
+            let bn = &blob[b.0 as usize..b.0 as usize + b.1 as usize];
+            an.cmp(bn)
         });
+        let n_names = by_name.len() as u64;
 
         // ---- 4. Sort inherits ----
         self.inherits.sort_unstable();
@@ -107,7 +141,7 @@ impl IndexBuilder {
         let xrefs_off = pad_up(size_of_header() as u64);
         let syms_off  = pad_up(xrefs_off + n_xrefs * XREF_LEN as u64);
         let names_off = pad_up(syms_off  + n_syms  * SYM_LEN  as u64);
-        let files_off = pad_up(names_off + n_syms  * NAME_LEN as u64);
+        let files_off = pad_up(names_off + n_names * NAME_LEN as u64);
         let inh_off   = pad_up(files_off + n_files * FILE_LEN as u64);
         let blob_off  = pad_up(inh_off   + n_inh   * INH_LEN  as u64);
 
@@ -121,7 +155,7 @@ impl IndexBuilder {
             version: VERSION,
             xrefs_off, xrefs_n: n_xrefs,
             syms_off,  syms_n:  n_syms,
-            names_off, names_n: n_syms,
+            names_off, names_n: n_names,
             files_off, files_n: n_files,
             inh_off,   inh_n:   n_inh,
             blob_off,  blob_len: blob.len() as u64,
@@ -146,9 +180,7 @@ impl IndexBuilder {
         }
 
         seek_to(&mut w, names_off)?;
-        for &idx in &by_name {
-            let (off, len) = name_pos[idx as usize];
-            let sym = syms_vec[idx as usize].0;
+        for (off, len, sym) in &by_name {
             w.write_all(&off.to_be_bytes())?;
             w.write_all(&len.to_be_bytes())?;
             w.write_all(&[0u8, 0u8])?;     // _pad

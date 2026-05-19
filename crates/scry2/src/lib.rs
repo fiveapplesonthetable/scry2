@@ -158,6 +158,82 @@ mod tests {
     }
 
     #[test]
+    fn inheritance_substr_unions_multiple_syms() {
+        // Two classes A and B both extend a common parent P. Asking
+        // `super` with substr that matches both should return P once
+        // (deduped), not twice.
+        let path = tmp("inh_substr");
+        let mut b = IndexBuilder::new();
+        let s_a = sym_of("foo.bar.Aclass");
+        let s_b = sym_of("foo.bar.Bclass");
+        let s_p = sym_of("foo.bar.Parent");
+        b.upsert_sym(s_a, kind::TYPE, lang::JAVA, "foo.bar.Aclass");
+        b.upsert_sym(s_b, kind::TYPE, lang::JAVA, "foo.bar.Bclass");
+        b.upsert_sym(s_p, kind::TYPE, lang::JAVA, "foo.bar.Parent");
+        b.add_inherit(s_a, s_p);
+        b.add_inherit(s_b, s_p);
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // Sanity: exact-match super of A returns P.
+        assert_eq!(ix.inherits_of(s_a), vec![s_p]);
+        // Two syms match "class" substring; their union of supertypes is just P.
+        let hits = ix.syms_matching_substring("class", 16);
+        assert_eq!(hits.len(), 2, "Aclass + Bclass both match 'class'");
+        let mut all_supers: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for s in hits { all_supers.extend(ix.inherits_of(s)); }
+        assert_eq!(all_supers, std::collections::HashSet::from([s_p]),
+            "deduped supertype union");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn callgraph_multi_root_forest() {
+        // Two distinct call chains, both seeded by a substring match.
+        // `foo_a` → `helper_a`,  `foo_b` → `helper_b`. Asking
+        // callgraph(--substr "foo_") --direction down --depth 1
+        // should give a 4-node FOREST: id=0 (foo_a), id=1 (foo_b),
+        // id=2 (helper_a, parent=0), id=3 (helper_b, parent=1).
+        let path = tmp("cg_forest");
+        let mut b = IndexBuilder::new();
+        let foo_a = sym_of("foo_a");
+        let foo_b = sym_of("foo_b");
+        let h_a = sym_of("helper_a");
+        let h_b = sym_of("helper_b");
+        for (s, n) in [(foo_a,"foo_a"),(foo_b,"foo_b"),(h_a,"helper_a"),(h_b,"helper_b")] {
+            b.upsert_sym(s, kind::FUNCTION, lang::CXX, n);
+        }
+        b.add_call(foo_a, h_a, role::CALL);
+        b.add_call(foo_b, h_b, role::CALL);
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        let roots = ix.syms_matching_substring("foo_", 16);
+        assert_eq!(roots.len(), 2);
+        // Reproduce the BFS-forest invariant we test in server.rs's
+        // do_callgraph: each root has parent=None and unique id, each
+        // child has parent = its discoverer.
+        let mut visited: Vec<(u64, Option<u32>, u32)> = Vec::new();
+        for &r in &roots {
+            let id = visited.len() as u32;
+            visited.push((r, None, id));
+        }
+        for i in 0..roots.len() {
+            let (cur, _, cur_id) = visited[i];
+            for (callee, _) in ix.calls_from(cur) {
+                let id = visited.len() as u32;
+                visited.push((callee, Some(cur_id), id));
+            }
+        }
+        assert_eq!(visited.len(), 4, "2 roots + 2 callees = 4 nodes");
+        assert_eq!(visited[0].1, None, "root has no parent");
+        assert_eq!(visited[1].1, None, "second root has no parent");
+        assert_eq!(visited[2].1, Some(0), "helper_a's parent is foo_a (id=0)");
+        assert_eq!(visited[3].1, Some(1), "helper_b's parent is foo_b (id=1)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn callgraph_many_callees_dedup() {
         // One caller, many callees — confirms dedup of duplicate edges
         // and that calls_from returns ALL distinct callees, not just one.

@@ -81,8 +81,7 @@ scry2/
         └── src/{main, workload, stats, backend, be_mmap, be_redb, be_rocks}.rs
 ```
 
-Every `.rs` file is under the 700-line cap (a scry-side convention
-that survives here).
+Every `.rs` file is under the 700-line cap.
 
 ## Adding a new Kythe edge type
 
@@ -123,8 +122,8 @@ two AOSP-shaped scenarios:
   `MethodSymbol`, no `named` edge is emitted to the JVM FQN, and
   write_tables can't bridge the call.
 
-scry's repo at `/mnt/agent/scry/docs/KYTHE_JVM_INDEXER_REBUILD.md`
-holds the complete repro. The summary of the four-patch chain:
+`kythe-patches/README.md` holds the per-patch detail. The summary of
+the four-patch chain:
 
 | # | file | change |
 |---|---|---|
@@ -135,19 +134,16 @@ holds the complete repro. The summary of the four-patch chain:
 
 ### Where the patches live
 
-The canonical patch files are in **scry's** repo at
-`kythe-patches/0001-asm.patch` through `0004-classpath.patch`. scry2
-doesn't ship its own copies because the patches target the Kythe
-codebase, not scry2 — they're a build-time prerequisite, not a
-runtime one. We may mirror them into `scry2/kythe-patches/` once
-v0.2 stabilises.
+`kythe-patches/000{1,2,3,4}-*.patch` at the repo root. The
+`kythe-patches/README.md` next to them documents each patch
+individually.
 
 ### Building patched Kythe from source
 
 ```bash
 git clone https://github.com/kythe/kythe ~/dev/kythe
 cd ~/dev/kythe
-git apply /path/to/scry/kythe-patches/000{1,2,3,4}-*.patch
+git apply /path/to/scry2/kythe-patches/000{1,2,3,4}-*.patch
 bazel run @unpinned_maven//:pin       # refresh maven_install.json after patch 1
 bazel build //kythe/java/com/google/devtools/kythe/analyzers/java:indexer
 bazel build //kythe/java/com/google/devtools/kythe/analyzers/jvm:indexer
@@ -168,8 +164,8 @@ For development we use `aosp_cf_x86_64_phone.kzip` built by AOSP's
 * java — ~50 k CUs, 4-6 hrs
 * jvm — depends on classpath fan-out; typically 30-90 min
 
-For a small loop, pick a single module's kzip from `/mnt/agent/aosp-out/soong/`
-and feed it directly:
+For a small loop, pick a single module's per-target kzip from
+`out/soong/.intermediates/...` and feed it directly:
 
 ```bash
 ~/kythe/kythe-v0.0.75/indexers/cxx_indexer \
@@ -180,6 +176,60 @@ and feed it directly:
 
 Iteration is fast: 30 MB cxx kzip → 489 MB entries → 30 MB `.s2db`
 in 3 s.
+
+### Reference run: full AOSP index
+
+End-to-end command for an AOSP corpus after `build_kzip.bash` has
+produced `out/dist/aosp.kzip`. Assumes the four Kythe patches are
+applied (see Path B in [INSTALL.md](INSTALL.md)).
+
+```bash
+# Outputs:
+#   /var/scry2/aosp.s2db                (~3-8 GB)
+#   /var/scry2/aosp.s2db.tmp            (atomically renamed at the end)
+# Logs:
+#   stderr captured to ~/scry2-aosp.log
+nohup scry2 from-kzip \
+    --kzip /aosp/out/dist/aosp.kzip \
+    --kythe-root ~/scry2-setup/kythe-v0.0.75 \
+    --langs cxx,java,jvm \
+    --jvm-heap 12g \
+    -o /var/scry2/aosp.s2db \
+    > ~/scry2-aosp.log 2>&1 &
+
+# Watch progress:
+tail -f ~/scry2-aosp.log
+```
+
+What this does:
+
+1. Spawns `cxx_indexer aosp.kzip`, streams its stdout through
+   ingest. ~2-3 hrs for the full AOSP corpus, ~150-250 M raw
+   entries, ~80-120 M xref rows landing in the builder.
+2. Then `java_indexer.jar` with `-Xmx12g --temp_directory`
+   (the JDK system-modules unpack needs the temp dir). ~2-3 hrs.
+3. Then `jvm_indexer.jar` with `-Xmx12g`. ~30-60 min.
+4. Sorts every table, dedupes, atomic-renames the result into place.
+
+End-to-end wall on a 36-vCPU host: 6-8 hours. Peak RSS during
+ingest: 10-15 GB (mostly the in-flight xref/calls vectors before
+sort). Disk peak: ~3-5 GB for the staged `.s2db.tmp`.
+
+If you only want C++:
+
+```bash
+scry2 from-kzip ... --langs cxx -o aosp-cxx.s2db
+```
+
+If you only have a Java/JVM kzip:
+
+```bash
+scry2 from-kzip ... --langs java,jvm -o aosp-jvm.s2db
+```
+
+`scry2 from-kzip` is idempotent on `-o`: the output `.s2db.tmp` is
+written first, fsynced, then renamed. A crash mid-build leaves the
+old index untouched.
 
 ## Code style — what the reviewer will flag
 
@@ -206,21 +256,12 @@ in 3 s.
 5. CI (when we add it) will rerun the bench gate at 10 M rows to
    confirm no warm-latency regression > 20%.
 
-## Where scry and scry2 diverge
+## Scope boundaries
 
-scry2 is built **alongside** scry — zero changes to scry's code. The
-two share a Kythe install but otherwise are independent:
-
-| | scry | scry2 |
-|---|---|---|
-| Storage | per-language sidecars + scry index dir | one `.s2db` mmap |
-| Precision filter | yes (strict / lexical / clang-precise) | no |
-| Build-graph reachability | yes (Soong / GN / kernel module graph) | no |
-| Incremental updates | yes | no — full rebuild from kzip |
-| Languages | cxx, java, jvm, go, proto, kotlin, rust (some via SCIP) | same six (Kythe-only) |
-| LOC | ~25 000 across many crates | ~2 000 across two crates |
-| Query verbs | def, ref, callers, callgraph, impact, prefix, fuzzy, grep, outline, coverage, stats, mcp, … | def, ref, callers, callgraph, super, sub, stat (+ build verbs) |
-
-If your contribution wants something only scry has (precision
-filter, module graph), send it to scry. If it's a new lean primitive
-or a tighter Kythe-edge story, scry2 is the right home.
+scry2 intentionally stays narrow. It does **not** post-filter Kythe
+output, does **not** parse the build graph for reachability, does
+**not** wrap itself in MCP (REPL gives ~95% of MCP's value with ~5%
+of the protocol surface — see [README](../README.md)). New
+contributions that fit the lean-Kythe-edge story are welcome;
+contributions that add a heuristic layer or a new query DSL are out
+of scope for this repo.

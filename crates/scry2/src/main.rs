@@ -79,10 +79,18 @@ enum Cmd {
     },
 
     /// `super NAME` — direct supertypes (extends / overrides / satisfies).
-    Super { name: String },
+    Super {
+        name: String,
+        #[arg(long)] substr: bool,
+        #[arg(long, default_value = "16")] limit: usize,
+    },
 
     /// `sub NAME` — direct subtypes.
-    Sub { name: String },
+    Sub {
+        name: String,
+        #[arg(long)] substr: bool,
+        #[arg(long, default_value = "16")] limit: usize,
+    },
 
     /// `callgraph NAME` — transitive walk of the call graph.
     Callgraph {
@@ -91,6 +99,12 @@ enum Cmd {
         direction: String,
         #[arg(long, default_value = "3")] depth: usize,
         #[arg(long, default_value = "200")] max_syms: usize,
+        /// Match `name` as a substring; every match seeds the BFS as
+        /// a separate root in the output forest. parent=None marks
+        /// each root; ids are unique across the whole reply.
+        #[arg(long)] substr: bool,
+        /// Cap roots when --substr is on. Default 16.
+        #[arg(long, default_value = "16")] root_limit: usize,
     },
 
     /// `serve --socket PATH` — long-lived daemon over a Unix socket.
@@ -142,10 +156,10 @@ fn main() -> Result<()> {
             => Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in },
         Cmd::Callers { name, substr, limit, max_hits, in_, not_in, def_in }
             => Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in },
-        Cmd::Super { name } => Request::Super { name },
-        Cmd::Sub   { name } => Request::Sub   { name },
-        Cmd::Callgraph { name, direction, depth, max_syms }
-            => Request::Callgraph { name, direction, depth, max_syms },
+        Cmd::Super { name, substr, limit } => Request::Super { name, substr, limit },
+        Cmd::Sub   { name, substr, limit } => Request::Sub   { name, substr, limit },
+        Cmd::Callgraph { name, direction, depth, max_syms, substr, root_limit }
+            => Request::Callgraph { name, direction, depth, max_syms, substr, root_limit },
         _ => unreachable!(),
     };
     let reply: Reply = if let Some(sock) = cli.socket {

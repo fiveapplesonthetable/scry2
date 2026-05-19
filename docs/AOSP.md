@@ -58,7 +58,7 @@ needs.
 
 scry2 needs four patches against stock Kythe to handle AOSP Java 21
 bytecode in `framework.jar` and to wire cross-CU classpath
-resolution. The patches live in scry's repo at `kythe-patches/`.
+resolution. The patches live in this repo at `kythe-patches/`.
 
 ```bash
 mkdir -p ~/scry2-setup && cd ~/scry2-setup
@@ -71,8 +71,8 @@ curl -fL https://github.com/kythe/kythe/releases/download/v0.0.75/kythe-v0.0.75.
 # patches, build with Bazel.
 git clone --depth=1 -b v0.0.75 https://github.com/kythe/kythe.git kythe-src
 cd kythe-src
-git clone --depth=1 https://github.com/fiveapplesonthetable/scry ../scry-patches
-git apply ../scry-patches/kythe-patches/000{1,2,3,4}-*.patch
+git clone --depth=1 https://github.com/fiveapplesonthetable/scry2 ../scry2-patches
+git apply ../scry2-patches/kythe-patches/000{1,2,3,4}-*.patch
 bazel run @unpinned_maven//:pin                       # refresh maven_install after Patch 1
 bazel build \
     //kythe/java/com/google/devtools/kythe/analyzers/java:indexer \

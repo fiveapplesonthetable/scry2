@@ -149,7 +149,7 @@ contribute to the `calls` table that `callgraph` walks.
 
 For pure cxx / Go / proto corpora the stock Kythe v0.0.75 indexers
 work as-is. **For AOSP Java + JVM cross-CU coverage** there are four
-patches scry / scry2 expect against the Kythe codebase — without them,
+patches scry2 expects against the Kythe codebase — without them,
 `services.core → Binder.clearCallingIdentity` returns 0 hits because
 the `/kythe/edge/named` bridge never fires.
 
@@ -160,13 +160,10 @@ the `/kythe/edge/named` bridge never fires.
 | 3 | `ClassFileIndexer.java` | new `--default_corpus` flag on `jvm_indexer`. Stock VName corpus on raw `.jar`/`.class` inputs is `""` while `java_indexer`'s `named`-edge targets carry the build's actual corpus — same signature, different corpus → different VName → `write_tables` can't merge them. |
 | 4 | `CompilationUnitPathFileManager.java` | derive `StandardLocation.CLASS_PATH` from `!CLASS_PATH_JAR!`-prefixed `required_input` entries when `JavaDetails` is absent on the CU. **Load-bearing.** Empirically: 0 → 1209 `named` edges to `android.os.Binder.*` JVM FQNs after the patch. |
 
-The complete repro (Bazel + bazel-bin output paths + the order to
-apply the patches) is in
+The patch files live in `kythe-patches/` at the repo root. The
+complete build repro (Bazel commands + bazel-bin output paths + the
+order to apply the patches) is in
 [`docs/DEVELOPMENT.md`](DEVELOPMENT.md#kythe-patches-required-for-aosp-java-jvm-cross-cu-coverage).
-
-scry's own write-up (with every diff inline) lives at
-`scry/docs/KYTHE_JVM_INDEXER_REBUILD.md` — that's the canonical source
-of truth for the patches themselves.
 
 ## Known limitations (honest)
 
@@ -174,9 +171,8 @@ of truth for the patches themselves.
   `completes` edges during ingest, but doesn't currently rewrite call-
   site VNames from the header DECL to the .cpp DEFN. That means
   cross-translation-unit C++ refs split between forward-decl call
-  sites and definition-site refs. Same family of issue scry hit; the
-  proper fix is a per-CU bridge map applied at xref emission. Tracked
-  as a v0.2 follow-up.
+  sites and definition-site refs. Proper fix is a per-CU bridge map
+  applied at xref emission. Tracked as a v0.2 follow-up.
 * **No MarkedSource decode.** Kythe's `/kythe/code` fact carries a
   proto-encoded pretty-printed name. For cxx symbols this is what
   would give us "clear demangled identifier" without falling back to

@@ -246,7 +246,7 @@ each edge. `--max-syms 200` caps total nodes so a hub function with
 
 ## Path filters — `--in`, `--not-in`, `--def-in`
 
-These match scry's flag shape. All three are **substring matches**
+All three are **substring matches**
 against Kythe's path field. **No realpath, no `--source-root`, no
 mixing of absolute/relative paths** — what the indexer stored is what
 you match against.
@@ -274,34 +274,22 @@ scry2 ref ProcessRecord --substr --not-in /test/
 
 ## Recall vs precision — how to think about it
 
-scry2 reports every edge Kythe emitted. There is no precision filter,
-no heuristic resolution. That means:
+scry2 reports every edge Kythe emitted. There is no post-filtering
+pass, no heuristic re-attribution. That means:
 
 * **Recall is bounded by what Kythe indexes.** If a kzip is missing
-  source files (a common AOSP build issue — see the kzip-build doc),
-  the indexer never emits entries for those translation units and
-  scry2 has nothing to return. The fix is at the kzip layer, not at
-  the query layer.
+  source files (a common AOSP build issue), the indexer never emits
+  entries for those translation units and scry2 has nothing to
+  return. The fix is at the kzip layer, not at the query layer.
 * **Precision is bounded by Kythe's VName logic.** If cxx_indexer
   emits 199 anchors targeting `incStrong`, all 199 land in the
   `xrefs` table. A user asking "who calls incStrong" gets 199 hits.
   An LLM with surrounding code context can prune; a CI gate that
   needs zero false positives should add its own filter on top.
 
-When you want to measure recall against a ground truth (e.g. scry's
-strict output), the canonical comparison is:
-
-```bash
-scry        callers FOO --strict --index AOSP_SCRY  > scry.txt
-scry2       callers FOO          --index AOSP_S2DB  | sort > scry2.txt
-comm -12 scry.txt scry2.txt | wc -l   # intersection = true positives
-comm -23 scry.txt scry2.txt | wc -l   # scry only    = scry2 missed
-comm -13 scry.txt scry2.txt | wc -l   # scry2 only   = scry2 over-reported
-```
-
-Expect scry2 to over-report relative to scry's `--strict` (because
-scry2 doesn't filter unresolved refs) and to never miss anything scry
-finds (because scry2 indexes the same Kythe entries).
+The output is structured (`--json`) so you can post-filter with `jq`
+or any tool — e.g. drop call sites in test files, or restrict to
+results whose target is defined in a specific module.
 
 ## Performance — what to expect on a real index
 

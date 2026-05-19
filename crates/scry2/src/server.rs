@@ -50,13 +50,25 @@ pub enum Request {
               #[serde(default, rename = "in")] in_: Option<String>,
               #[serde(default)] not_in: Option<String>,
               #[serde(default)] def_in: Option<String> },
-    Super { name: String },
-    Sub   { name: String },
+    Super { name: String, #[serde(default)] substr: bool,
+            #[serde(default = "lim16")] limit: usize },
+    Sub   { name: String, #[serde(default)] substr: bool,
+            #[serde(default = "lim16")] limit: usize },
     Callgraph { name: String,
                 #[serde(default = "default_direction")] direction: String,
                 #[serde(default = "default_depth")] depth: usize,
-                #[serde(default = "default_max_syms")] max_syms: usize },
+                #[serde(default = "default_max_syms")] max_syms: usize,
+                /// When true, `name` is matched as a substring against
+                /// every sym; each match becomes a root in the output
+                /// forest. parent=None marks each root; ids are
+                /// unique across the whole reply.
+                #[serde(default)] substr: bool,
+                /// When `substr` is true, cap how many roots seed the
+                /// BFS. Default 16. Cheap roots are fine — the BFS
+                /// dedupes downstream discoveries via the `seen` set.
+                #[serde(default = "default_root_limit")] root_limit: usize },
 }
+fn default_root_limit() -> usize { 16 }
 fn lim16() -> usize { 16 }
 fn lim_max_hits() -> usize { 200 }
 fn default_direction() -> String { "up".into() }
@@ -101,10 +113,10 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
             ix, name, *substr, *limit, role::CALL, role::CALL, *max_hits,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
         ),
-        Request::Super { name } => do_inh(ix, name, /*sub=*/false),
-        Request::Sub   { name } => do_inh(ix, name, /*sub=*/true),
-        Request::Callgraph { name, direction, depth, max_syms } =>
-            do_callgraph(ix, name, direction, *depth, *max_syms),
+        Request::Super { name, substr, limit } => do_inh(ix, name, *substr, *limit, /*sub=*/false),
+        Request::Sub   { name, substr, limit } => do_inh(ix, name, *substr, *limit, /*sub=*/true),
+        Request::Callgraph { name, direction, depth, max_syms, substr, root_limit } =>
+            do_callgraph(ix, name, direction, *depth, *max_syms, *substr, *root_limit),
     }
 }
 
@@ -164,36 +176,64 @@ fn do_xrefs(
     Reply::Xrefs { groups, total, truncated }
 }
 
-fn do_inh(ix: &Index, name: &str, sub: bool) -> Reply {
-    let Some(sym) = ix.sym_for_name(name) else {
-        return Reply::Inh { hits: Vec::new(), total: 0 };
+fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool) -> Reply {
+    let syms: Vec<u64> = if substr {
+        ix.syms_matching_substring(name, limit)
+    } else {
+        ix.sym_for_name(name).into_iter().collect()
     };
-    let related = if sub { ix.inherited_by(sym) } else { ix.inherits_of(sym) };
-    let hits: Vec<InhHit> = related.iter().map(|s| {
-        let name = ix.sym_meta(*s).map(|(n, _, _)| n.to_string())
-            .unwrap_or_else(|| format!("<sym {:016x}>", s));
-        InhHit { name }
-    }).collect();
+    let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
+        .unwrap_or_else(|| format!("<sym {:016x}>", s));
+    let mut hits: Vec<InhHit> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for sym in syms {
+        let related = if sub { ix.inherited_by(sym) } else { ix.inherits_of(sym) };
+        for r in related {
+            if seen.insert(r) {
+                hits.push(InhHit { name: name_of(r) });
+            }
+        }
+    }
     let total = hits.len();
     Reply::Inh { hits, total }
 }
 
-fn do_callgraph(ix: &Index, name: &str, direction: &str, depth: usize, max_syms: usize) -> Reply {
-    let Some(root) = ix.sym_for_name(name) else {
-        return Reply::Callgraph { nodes: Vec::new(), total: 0, truncated: false };
+// One callgraph BFS, supporting an arbitrary number of seed roots.
+// When `substr` is true the seeds are every sym whose name contains
+// `name`, capped at `root_limit`. Each seed is a separate root in
+// the output forest (`parent: None`); BFS visits roots in seed order
+// and any downstream node reachable from multiple roots is attributed
+// to whichever root saw it first.
+#[allow(clippy::too_many_arguments)]
+fn do_callgraph(
+    ix: &Index, name: &str, direction: &str,
+    depth: usize, max_syms: usize,
+    substr: bool, root_limit: usize,
+) -> Reply {
+    let roots: Vec<u64> = if substr {
+        ix.syms_matching_substring(name, root_limit)
+    } else {
+        ix.sym_for_name(name).into_iter().collect()
     };
+    if roots.is_empty() {
+        return Reply::Callgraph { nodes: Vec::new(), total: 0, truncated: false };
+    }
     let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
-    // BFS spanning tree. `seen` maps a sym to the dense node-id it
-    // got when first discovered; `nodes` is the result in BFS order.
+    // BFS spanning forest. `seen` maps a sym to the dense node-id it
+    // got when first discovered; `nodes` is the result in BFS order
+    // (across roots and hops).
     let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut nodes: Vec<CallNode> = Vec::new();
     let mut frontier: Vec<(u64, u32)> = Vec::new();  // (sym, node_id)
-    let root_id = 0u32;
-    seen.insert(root, root_id);
-    nodes.push(CallNode { id: root_id, parent: None, hop: 0,
-                          dir: "root".into(), name: name_of(root) });
-    frontier.push((root, root_id));
+    for &root in &roots {
+        if seen.contains_key(&root) { continue; }   // dedup overlap
+        let id = nodes.len() as u32;
+        seen.insert(root, id);
+        nodes.push(CallNode { id, parent: None, hop: 0,
+                              dir: "root".into(), name: name_of(root) });
+        frontier.push((root, id));
+    }
     let go_up   = direction == "up"   || direction == "both";
     let go_down = direction == "down" || direction == "both";
     let mut truncated = false;
@@ -228,8 +268,9 @@ fn do_callgraph(ix: &Index, name: &str, direction: &str, depth: usize, max_syms:
         if next.is_empty() { break; }
         frontier = next;
     }
-    // total = non-root edges discovered (the root itself isn't a hit).
-    let total = nodes.len().saturating_sub(1);
+    // total = non-root edges discovered. With N roots, there are N
+    // root entries which don't count as hits.
+    let total = nodes.len().saturating_sub(roots.len());
     Reply::Callgraph { nodes, total, truncated }
 }
 

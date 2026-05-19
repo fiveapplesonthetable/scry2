@@ -26,16 +26,20 @@ scry2 from-kzip --kzip K --kythe-root R -o out.s2db   # orchestrate indexers
 
 ## Why it exists
 
-scry2 is built alongside `scry` as a clean experiment. Same upstream
-data (Kythe v0.0.75), different shape: **mmap'd packed-array index,
-no daemon, no precision filter, no incremental updates** — rebuild from
-the kzip in 12 s (projected at AOSP scale) and trust whatever Kythe
-emitted.
+Existing Kythe-backed tools wrap the indexer output in a B+tree or
+LSM database (LevelDB, RocksDB) plus a query daemon. That's the
+right call for the cs.android.com use case — hundreds of concurrent
+users hitting one warm server. For an LLM walking code in a single
+session, it's overkill: the daemon's serialization, the database's
+key encoding, and the bloom-filter-then-block-decompress chain
+dominate the actual lookup.
 
-It is **not a replacement for scry** — scry has years of scope around
-precision filtering, build-graph reachability, and code-walking
-heuristics that scry2 deliberately doesn't carry. scry2 is the
-sub-millisecond index an LLM uses to navigate, full stop.
+scry2 strips it down to **one mmap'd packed-array file + binary
+search**. Same upstream data, fewer layers between the query and
+the bytes. The bench (`docs/BENCH.md`) shows this beats redb's
+B+tree by 4× and rocksdb's LSM by 12× on warm point lookups —
+because there's no allocator, no parser, no syscall on the hot
+path. Every read is a memcmp on mmap'd bytes.
 
 ## Docs
 

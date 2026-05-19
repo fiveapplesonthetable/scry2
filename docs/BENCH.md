@@ -10,10 +10,9 @@
 
 ## Why a backend bench at all
 
-scry's existing precision sidecars (`clang_usrs.bin`, `scip_index.bin`)
-are plain mmap'd packed arrays — sorted records, binary search. The
-question for scry2 is whether to keep that or move to a richer engine
-(redb's ACID B+tree, RocksDB's LSM tree). Each tradeoff:
+The question is whether to store the Kythe-derived xref table in a
+plain mmap'd packed array (sorted records + binary search), an ACID
+B+tree (redb), or an LSM tree (RocksDB). Each tradeoff:
 
 | | mmap (packed) | redb (B+tree) | RocksDB (LSM) |
 |---|---|---|---|
@@ -91,8 +90,7 @@ Logs: `/mnt/agent/tmp/scry2-bench/run-80M.log` (mmap+redb), `run-80M-rocks.log` 
 
 ## Decision
 
-**Plain mmap, sorted packed-array shape (same family as scry's existing
-`precision_packed`).**
+**Plain mmap, sorted packed-array shape.**
 
 Reasoning:
 

@@ -586,16 +586,29 @@ struct LangStats {
 const MAX_FAIL_TAILS: usize = 8;
 const STDERR_TAIL_BYTES: usize = 4096;
 
-/// Snapshot accounting shared across the worker threads. See the
-/// `--resume` doc on `Cmd::FromKzip` for the wire definition of the
-/// resulting partial files. The two-bucket design (`committed` vs
-/// `pending`) keeps the on-disk `.partial.shas` in lock-step with
-/// the most recent `.partial.s2db`: a sha only moves into `committed`
-/// at the moment the new snapshot is durable on disk.
-struct SnapshotState {
-    committed: std::collections::HashSet<String>,
-    pending:   Vec<String>,
-    last_done: usize,
+/// One worker's owned ingest state. Each worker thread holds a
+/// `Mutex<WorkerSink>` and is the only contender for the lock in
+/// the normal path; the snapshotter occasionally takes the lock
+/// briefly (microseconds when the worker is between CUs, the
+/// remaining ingest time if the worker is mid-CU). Coupling
+/// `builder` and `pending_shas` under one mutex is the load-bearing
+/// invariant: snapshotting both atomically guarantees the on-disk
+/// `.partial.shas` never lists a CU whose data isn't in
+/// `.partial.s2db`.
+#[derive(Default)]
+struct WorkerSink {
+    builder:      IndexBuilder,
+    pending_shas: Vec<String>,
+}
+
+/// The accumulator carries the snapshot history: every drained
+/// worker sink merges into `builder`, and the corresponding shas
+/// land in `committed_shas`. On `--resume` both are seeded from the
+/// partial `.s2db` + `.shas`. Lock contention is rare — only the
+/// snapshotter writes; workers never touch it.
+struct Accumulator {
+    builder:        IndexBuilder,
+    committed_shas: std::collections::HashSet<String>,
 }
 
 /// Write a fresh `<partial>.s2db` and `<partial>.shas` pair atomically
@@ -782,22 +795,24 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // Per-worker IndexBuilders. AOSP CUs carry 600k+ entries each
-    // (~8 s of ingest wall on a single mutex), so a shared builder
-    // serialized 36 workers down to ~7 CUs/min — load avg <10 % of
-    // a 72-core box, with every worker thread parked in
-    // futex_wait_queue. Each worker now owns its own builder; the
-    // snapshotter and the final write drain them into a shared
-    // `accumulator` via `IndexBuilder::merge_from`.
+    // Per-worker sinks (builder + pending shas, atomically swappable).
+    // AOSP CUs carry 600k+ entries (~8 s of ingest wall each); with a
+    // shared `Mutex<IndexBuilder>` 36 workers all parked in
+    // futex_wait_queue and throughput pegged at ~7 CUs/min. Each
+    // worker now owns its sink, so the per-CU ingest holds only its
+    // own lock — uncontended in the normal path.
     let workers_n = workers;
-    let worker_builders: Vec<std::sync::Mutex<IndexBuilder>> = (0..workers_n)
-        .map(|_| std::sync::Mutex::new(IndexBuilder::new()))
+    let worker_sinks: Vec<std::sync::Mutex<WorkerSink>> = (0..workers_n)
+        .map(|_| std::sync::Mutex::new(WorkerSink::default()))
         .collect();
-    // `accumulator` carries the snapshot history. On resume it's
-    // seeded with the partial replay; otherwise it starts empty.
-    // Only the snapshotter and the post-scope finalizer write to
-    // it, so contention is rare.
-    let accumulator_mu = std::sync::Mutex::new(starting_builder);
+    // The accumulator carries the snapshot history. On `--resume` it's
+    // seeded with the partial replay plus its sha set; otherwise it
+    // starts empty. Workers never touch this mutex — only the active
+    // snapshotter does, so contention is rare.
+    let accumulator_mu = std::sync::Mutex::new(Accumulator {
+        builder:        starting_builder,
+        committed_shas: done_shas,
+    });
     // `FileIdAllocator` is shared by-reference (interior mutex inside
     // `intern`). Workers hit it once per file path during ingest,
     // not once per CU — there's no whole-CU lock to serialize on.
@@ -808,16 +823,14 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // completed-CU count.
     let done = std::sync::atomic::AtomicUsize::new(0);
     let progress_mu = std::sync::Mutex::new(CliProgress::new("from-kzip"));
-    // Rolling-snapshot state. `committed` is the historical set of
-    // CU shas that are baked into the on-disk partial s2db (loaded
-    // from a prior --resume). `pending` is shas successful since the
-    // last snapshot. `last_done` is the global `done` count at the
-    // last snapshot, used to decide when to roll the next.
-    let snap_state_mu = std::sync::Mutex::new(SnapshotState {
-        committed: done_shas,
-        pending: Vec::new(),
-        last_done: 0,
-    });
+    // Snapshot serialization. `snap_writer_mu` ensures only one
+    // snapshotter writes at a time; `last_snap_done` is the value of
+    // `done` at the last triggered snapshot, used by workers to decide
+    // (lock-free) whether to attempt a snapshot. Workers never block on
+    // these in the normal path — the trigger check is an atomic load,
+    // and only the would-be snapshotter even tries `snap_writer_mu`.
+    let snap_writer_mu = std::sync::Mutex::new(());
+    let last_snap_done = std::sync::atomic::AtomicUsize::new(0);
 
     // Split the plan into N work shards by index. Static partition
     // is simpler than a work-stealing queue and load-balances well
@@ -826,9 +839,10 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     let plan_ref = &plan;
     let partial_s2db_path_ref = &partial_s2db_path;
     let partial_shas_path_ref = &partial_shas_path;
-    let snap_state_mu_ref     = &snap_state_mu;
     let accumulator_mu_ref    = &accumulator_mu;
-    let worker_builders_ref   = &worker_builders;
+    let worker_sinks_ref      = &worker_sinks;
+    let snap_writer_mu_ref    = &snap_writer_mu;
+    let last_snap_done_ref    = &last_snap_done;
     let snapshot_every        = args.snapshot_every;
     std::thread::scope(|s| -> Result<()> {
         let mut handles = Vec::with_capacity(n_workers);
@@ -837,9 +851,11 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             let inject_rules = args.inject_rules;
             let kythe_root = args.kythe_root;
             let jvm_heap = args.jvm_heap.to_string();
-            let my_builder  = &worker_builders_ref[w_id];
-            let all_builders = worker_builders_ref;
+            let my_sink     = &worker_sinks_ref[w_id];
+            let all_sinks   = worker_sinks_ref;
             let accumulator_mu = accumulator_mu_ref;
+            let snap_writer_mu = snap_writer_mu_ref;
+            let last_snap_done = last_snap_done_ref;
             let file_ids = &file_ids;
             let by_lang_mu  = &by_lang_mu;
             let done = &done;
@@ -848,7 +864,6 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             let kzip_path = args.kzip;
             let partial_s2db_path = partial_s2db_path_ref;
             let partial_shas_path = partial_shas_path_ref;
-            let snap_state_mu     = snap_state_mu_ref;
             handles.push(s.spawn(move || -> Result<()> {
                 let mut extractor = kzip::SubKzipWriter::open(kzip_path)?;
                 let mut i = w_id;
@@ -920,14 +935,21 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     // of MB/s), not the indexer subprocess. Other
                     // workers' subprocesses keep running while we hold
                     // the lock.
-                    // Ingest into THIS worker's local builder — no
+                    // Ingest into THIS worker's local sink — no
                     // cross-worker contention on the builder side.
+                    // The same lock guards `pending_shas`, so a
+                    // successful CU's sha is committed to the sink
+                    // atomically with its data; the snapshotter then
+                    // takes both via one `mem::take` and never sees
+                    // a "data without sha" gap (which would re-run
+                    // already-applied CUs on resume).
+                    //
                     // `file_ids` is shared by-reference: its interior
                     // mutex is taken only per intern (O(hash)), not
                     // for the whole CU, so workers don't serialize.
                     let ingest_res = {
-                        let mut builder  = my_builder.lock().unwrap();
-                        scry2::kythe::ingest_tolerant(stdout_h, &mut builder, file_ids, true)
+                        let mut sink = my_sink.lock().unwrap();
+                        scry2::kythe::ingest_tolerant(stdout_h, &mut sink.builder, file_ids, true)
                     };
                     // On ingest failure the subprocess may still be
                     // writing; killing it now unblocks the pipe and
@@ -992,71 +1014,82 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                         stats.empty += 1;
                     }
                     drop(by_lang);
+                    // Register the sha *inside* my_sink (same lock as
+                    // the builder) — guarantees the on-disk
+                    // `.partial.shas` never names a CU whose data
+                    // isn't in `.partial.s2db`. Only successful CUs
+                    // (had entries, ingested cleanly, exited 0) earn
+                    // a sha; failures and empties are safe to re-run.
+                    let cu_succeeded = !failed && any_entries;
+                    if cu_succeeded {
+                        my_sink.lock().unwrap().pending_shas.push(unit.sha.clone());
+                    }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     progress_mu.lock().unwrap().report("index", n, plan_len);
 
-                    // Register the sha for the rolling snapshot, and
-                    // if we just crossed the snapshot threshold, take
-                    // the snapshot. Only `succeeded` CUs (had entries,
-                    // ingested cleanly, exited 0) contribute a sha —
-                    // failures / empties are safe to re-run on resume.
-                    let cu_succeeded = !failed && any_entries;
-                    if cu_succeeded && snapshot_every > 0 {
-                        let snapshot_data: Option<(IndexBuilder, Vec<String>)> = {
-                            let mut snap = snap_state_mu.lock().unwrap();
-                            snap.pending.push(unit.sha.clone());
-                            if n < snap.last_done + snapshot_every {
-                                None
-                            } else {
-                                snap.last_done = n;
-                                let drained = std::mem::take(&mut snap.pending);
-                                for s in drained { snap.committed.insert(s); }
-                                // Drain every worker's local
-                                // builder into the accumulator and
-                                // clone for the snapshot, all while
-                                // holding snap_state_mu so no new
-                                // shas register against state we
-                                // didn't capture. Each worker lock
-                                // is held only for the swap (microsec
-                                // -onds); the per-worker `merge_from`
-                                // is in-memory and bounded by the
-                                // worker's row count since the last
-                                // drain.
-                                //
-                                // File IDs also flow into the
-                                // accumulator before the clone so
-                                // the snapshot s2db carries every
-                                // path any xref might reference.
-                                let cloned = {
+                    // Snapshot trigger — lock-free check. If the
+                    // threshold is crossed and we can grab the writer
+                    // lock, we become the snapshotter. Other workers
+                    // never block on this path: they only contend
+                    // when *they* are also trying to write a snapshot,
+                    // and `try_lock` makes a losing candidate fall
+                    // through immediately.
+                    use std::sync::atomic::Ordering;
+                    if snapshot_every > 0 && n >= last_snap_done.load(Ordering::Relaxed) + snapshot_every {
+                        if let Ok(_writer_guard) = snap_writer_mu.try_lock() {
+                            // Re-check under the writer lock so a
+                            // racing worker that snuck in first
+                            // doesn't double-snapshot.
+                            if n >= last_snap_done.load(Ordering::Relaxed) + snapshot_every {
+                                last_snap_done.store(n, Ordering::Relaxed);
+                                // Drain every worker sink. Per-sink
+                                // lock is brief (microseconds for
+                                // sinks between CUs; the remaining
+                                // ingest time for sinks mid-CU).
+                                // Crucially the drain does NOT hold
+                                // any global lock, so other workers
+                                // can continue past their next CU
+                                // boundary even while we drain a
+                                // slow sink.
+                                let mut drained_data = IndexBuilder::new();
+                                let mut drained_shas: Vec<String> = Vec::new();
+                                for ws in all_sinks {
+                                    let mut sink = ws.lock().unwrap();
+                                    let taken_builder = std::mem::take(&mut sink.builder);
+                                    let taken_shas    = std::mem::take(&mut sink.pending_shas);
+                                    drop(sink);
+                                    drained_data.merge_from(taken_builder);
+                                    drained_shas.extend(taken_shas);
+                                }
+                                // Fold drained state into the
+                                // accumulator + capture a clone for
+                                // the snapshot write. The accumulator
+                                // lock is only contended by snapshot
+                                // writers (and we hold snap_writer_mu
+                                // so there's at most one of us at a
+                                // time), so it's effectively
+                                // uncontended.
+                                let (cloned, shas) = {
                                     let mut acc = accumulator_mu.lock().unwrap();
-                                    for wb in all_builders {
-                                        let drained = std::mem::take(&mut *wb.lock().unwrap());
-                                        acc.merge_from(drained);
-                                    }
-                                    // file_ids has interior mutex —
-                                    // share by reference, push current
-                                    // (path, id) map into the
-                                    // accumulator before clone so the
-                                    // snapshot carries every file_id
-                                    // any xref might reference.
-                                    file_ids.push_to(&mut acc);
-                                    acc.clone()
+                                    acc.builder.merge_from(drained_data);
+                                    for s in drained_shas { acc.committed_shas.insert(s); }
+                                    file_ids.push_to(&mut acc.builder);
+                                    let cloned = acc.builder.clone();
+                                    let mut shas: Vec<String> = acc.committed_shas
+                                        .iter().cloned().collect();
+                                    shas.sort();
+                                    (cloned, shas)
                                 };
-                                let mut shas: Vec<String> = snap.committed
-                                    .iter().cloned().collect();
-                                shas.sort();
-                                Some((cloned, shas))
+                                if let Err(e) = write_snapshot(cloned, &shas,
+                                    partial_s2db_path, partial_shas_path)
+                                {
+                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed: {e:#}");
+                                } else {
+                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable",
+                                        shas.len());
+                                }
                             }
-                        };
-                        if let Some((cloned, shas)) = snapshot_data {
-                            if let Err(e) = write_snapshot(cloned, &shas,
-                                partial_s2db_path, partial_shas_path)
-                            {
-                                eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed: {e:#}");
-                            } else {
-                                eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable",
-                                    shas.len());
-                            }
+                            // _writer_guard releases here.
                         }
                     }
                     i += n_workers;
@@ -1071,13 +1104,18 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     })?;
 
     // Drain any rows the workers ingested since the last snapshot
-    // into the accumulator, then take ownership of the accumulator
-    // for the final write. After std::thread::scope exits every
-    // worker thread is joined, so the per-worker mutexes have no
-    // other reference — into_inner() is the right primitive.
-    let mut builder = accumulator_mu.into_inner().unwrap();
-    for wb in worker_builders {
-        builder.merge_from(wb.into_inner().unwrap());
+    // into the accumulator, then take ownership of the accumulator's
+    // builder for the final write. After std::thread::scope exits
+    // every worker thread is joined, so the per-worker mutexes have
+    // no other reference — into_inner() is the right primitive.
+    let acc = accumulator_mu.into_inner().unwrap();
+    let mut builder = acc.builder;
+    for ws in worker_sinks {
+        let sink = ws.into_inner().unwrap();
+        builder.merge_from(sink.builder);
+        // We don't write a final .shas (the final s2db at args.out
+        // is the authoritative deliverable; the partial files get
+        // removed below), so dropped pending_shas are harmless.
     }
     let by_lang     = by_lang_mu.into_inner().unwrap();
 

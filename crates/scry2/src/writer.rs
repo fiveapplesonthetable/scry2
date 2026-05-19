@@ -83,6 +83,36 @@ impl IndexBuilder {
     pub fn n_aliases(&self) -> usize { self.aliases.len() }
     pub fn n_calls(&self) -> usize { self.calls.len() }
 
+    /// Move every row from `other` into `self`, leaving `other`
+    /// empty. The mirror of [`populate_from_index`] but in-memory
+    /// and zero-copy on the per-row vectors. Used by `from-kzip`
+    /// to merge per-worker `IndexBuilder`s into the accumulator
+    /// — workers ingest into their own builder (no contention),
+    /// the snapshotter drains them into the accumulator under a
+    /// short-held lock.
+    ///
+    /// Merge semantics match the single-builder ingest:
+    /// - Append-only tables (`xrefs`, `inherits`, `aliases`,
+    ///   `calls`): extend; the final `sort_unstable + dedup`
+    ///   inside `finish` handles ordering and duplicates.
+    /// - First-wins maps (`syms`, `files`): use
+    ///   `entry(...).or_insert(...)` so an earlier worker's
+    ///   kind/lang/name and file path win over a later one's,
+    ///   the same convention `upsert_sym` / `upsert_file` enforce
+    ///   in-builder.
+    pub fn merge_from(&mut self, mut other: Self) {
+        self.xrefs.append(&mut other.xrefs);
+        for (k, v) in other.syms {
+            self.syms.entry(k).or_insert(v);
+        }
+        for (k, v) in other.files {
+            self.files.entry(k).or_insert(v);
+        }
+        self.inherits.append(&mut other.inherits);
+        self.aliases.append(&mut other.aliases);
+        self.calls.append(&mut other.calls);
+    }
+
     /// Snapshot the current accumulated state to `path` without
     /// consuming `self`. Used by `from-kzip` to write a partial
     /// `.s2db` every N CUs so a killed run can resume via

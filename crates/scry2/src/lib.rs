@@ -100,6 +100,79 @@ mod tests {
     }
 
     #[test]
+    fn merge_from_combines_two_workers() {
+        // Per-worker builder shape: each worker has its own
+        // IndexBuilder, the accumulator drains them via merge_from.
+        // First-wins on syms/files; append-only on xrefs/calls/etc.
+        let path = tmp("merge");
+        let mut a = IndexBuilder::new();
+        let mut b = IndexBuilder::new();
+        let s_foo = sym_of("kythe:c++:test###foo");
+        let s_bar = sym_of("kythe:c++:test###bar");
+        a.upsert_sym(s_foo, kind::FUNCTION, lang::CXX, "foo");
+        a.upsert_file(1, "/a/foo.cpp");
+        a.add_xref(s_foo, role::DECL, 1, 100);
+        a.add_alias(s_foo, "ns::foo");
+        b.upsert_sym(s_bar, kind::FUNCTION, lang::CXX, "bar");
+        b.upsert_file(2, "/b/bar.cpp");
+        b.add_xref(s_bar, role::DECL, 2, 200);
+        b.add_call(s_foo, s_bar, role::CALL);
+        b.add_inherit(s_bar, s_foo);
+
+        let mut acc = IndexBuilder::new();
+        acc.merge_from(a);
+        acc.merge_from(b);
+        acc.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        assert_eq!(ix.sym_for_name("foo"), Some(s_foo));
+        assert_eq!(ix.sym_for_name("bar"), Some(s_bar));
+        assert_eq!(ix.sym_for_name("ns::foo"), Some(s_foo));
+        assert_eq!(ix.file_path(1), Some("/a/foo.cpp"));
+        assert_eq!(ix.file_path(2), Some("/b/bar.cpp"));
+        assert_eq!(ix.inherits_of(s_bar), vec![s_foo]);
+        let calls: Vec<_> = ix.calls_from(s_foo).into_iter().map(|(s,_)|s).collect();
+        assert_eq!(calls, vec![s_bar]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn merge_from_first_wins_on_sym_metadata() {
+        // Two workers see the same sym; the first one's kind/lang/name
+        // wins, matching `upsert_sym`'s in-builder semantics.
+        let path = tmp("merge-first");
+        let s = sym_of("kythe:c++:test###same");
+        let mut a = IndexBuilder::new();
+        let mut b = IndexBuilder::new();
+        a.upsert_sym(s, kind::FUNCTION, lang::CXX, "first");
+        b.upsert_sym(s, kind::TYPE, lang::JAVA, "second");
+        a.upsert_file(7, "/first/path.cpp");
+        b.upsert_file(7, "/second/path.java");
+        a.add_xref(s, role::DECL, 7, 1);
+        a.finish(&path).unwrap();
+        let mut acc = IndexBuilder::new();
+        acc.merge_from(IndexBuilder::new());
+        // a first, then b
+        let mut a2 = IndexBuilder::new();
+        a2.upsert_sym(s, kind::FUNCTION, lang::CXX, "first");
+        a2.upsert_file(7, "/first/path.cpp");
+        a2.add_xref(s, role::DECL, 7, 1);
+        let mut b2 = IndexBuilder::new();
+        b2.upsert_sym(s, kind::TYPE, lang::JAVA, "second");
+        b2.upsert_file(7, "/second/path.java");
+        acc.merge_from(a2);
+        acc.merge_from(b2);
+        acc.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+        let (name, k, l) = ix.sym_meta(s).unwrap();
+        assert_eq!(name, "first");
+        assert_eq!(k, kind::FUNCTION);
+        assert_eq!(l, lang::CXX);
+        assert_eq!(ix.file_path(7), Some("/first/path.cpp"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn snapshot_then_resume_round_trips_all_rows() {
         // Populate a builder, snapshot to disk, open the snapshot as
         // an Index, replay it into a FRESH builder, then finish and

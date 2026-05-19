@@ -782,11 +782,22 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // Shared state for parallel workers. The IndexBuilder is the
-    // single sink for ingested entries — workers serialize on it for
-    // the ~50-100 ms it takes to fold one CU's stream, while the
-    // expensive bit (the indexer subprocess) runs concurrently.
-    let builder_mu  = std::sync::Mutex::new(starting_builder);
+    // Per-worker IndexBuilders. AOSP CUs carry 600k+ entries each
+    // (~8 s of ingest wall on a single mutex), so a shared builder
+    // serialized 36 workers down to ~7 CUs/min — load avg <10 % of
+    // a 72-core box, with every worker thread parked in
+    // futex_wait_queue. Each worker now owns its own builder; the
+    // snapshotter and the final write drain them into a shared
+    // `accumulator` via `IndexBuilder::merge_from`.
+    let workers_n = workers;
+    let worker_builders: Vec<std::sync::Mutex<IndexBuilder>> = (0..workers_n)
+        .map(|_| std::sync::Mutex::new(IndexBuilder::new()))
+        .collect();
+    // `accumulator` carries the snapshot history. On resume it's
+    // seeded with the partial replay; otherwise it starts empty.
+    // Only the snapshotter and the post-scope finalizer write to
+    // it, so contention is rare.
+    let accumulator_mu = std::sync::Mutex::new(starting_builder);
     let file_ids_mu = std::sync::Mutex::new(kythe::FileIdAllocator::default());
     let by_lang_mu: std::sync::Mutex<std::collections::HashMap<&'static str, LangStats>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
@@ -808,11 +819,13 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // Split the plan into N work shards by index. Static partition
     // is simpler than a work-stealing queue and load-balances well
     // because CU runtime is fairly uniform within a language family.
-    let n_workers = workers;
+    let n_workers = workers_n;
     let plan_ref = &plan;
     let partial_s2db_path_ref = &partial_s2db_path;
     let partial_shas_path_ref = &partial_shas_path;
     let snap_state_mu_ref     = &snap_state_mu;
+    let accumulator_mu_ref    = &accumulator_mu;
+    let worker_builders_ref   = &worker_builders;
     let snapshot_every        = args.snapshot_every;
     std::thread::scope(|s| -> Result<()> {
         let mut handles = Vec::with_capacity(n_workers);
@@ -821,7 +834,9 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             let inject_rules = args.inject_rules;
             let kythe_root = args.kythe_root;
             let jvm_heap = args.jvm_heap.to_string();
-            let builder_mu  = &builder_mu;
+            let my_builder  = &worker_builders_ref[w_id];
+            let all_builders = worker_builders_ref;
+            let accumulator_mu = accumulator_mu_ref;
             let file_ids_mu = &file_ids_mu;
             let by_lang_mu  = &by_lang_mu;
             let done = &done;
@@ -902,8 +917,12 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     // of MB/s), not the indexer subprocess. Other
                     // workers' subprocesses keep running while we hold
                     // the lock.
+                    // Ingest into THIS worker's local builder — no
+                    // cross-worker contention. file_ids is still
+                    // shared so file IDs are globally consistent;
+                    // intern() is O(hash) and rarely the bottleneck.
                     let ingest_res = {
-                        let mut builder  = builder_mu.lock().unwrap();
+                        let mut builder  = my_builder.lock().unwrap();
                         let mut file_ids = file_ids_mu.lock().unwrap();
                         scry2::kythe::ingest_tolerant(stdout_h, &mut builder, &mut file_ids, true)
                     };
@@ -989,27 +1008,31 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                 snap.last_done = n;
                                 let drained = std::mem::take(&mut snap.pending);
                                 for s in drained { snap.committed.insert(s); }
-                                // Clone the builder while we still
-                                // hold snap_state_mu so no other
-                                // worker can register a new sha
-                                // between the clone and the
-                                // collection of `committed` below.
-                                // The lock blocks `pending` pushes for
-                                // ~1s on AOSP — acceptable per ~5min
-                                // of indexer wall time.
+                                // Drain every worker's local
+                                // builder into the accumulator and
+                                // clone for the snapshot, all while
+                                // holding snap_state_mu so no new
+                                // shas register against state we
+                                // didn't capture. Each worker lock
+                                // is held only for the swap (microsec
+                                // -onds); the per-worker `merge_from`
+                                // is in-memory and bounded by the
+                                // worker's row count since the last
+                                // drain.
                                 //
-                                // Sync the FileIdAllocator into the
-                                // builder before the clone — otherwise
-                                // the snapshot has zero `files` rows
-                                // (intern() stages mappings in the
-                                // allocator until the final
-                                // `drain_into`) and resumed xrefs lose
-                                // their file paths.
+                                // File IDs also flow into the
+                                // accumulator before the clone so
+                                // the snapshot s2db carries every
+                                // path any xref might reference.
                                 let cloned = {
-                                    let mut b = builder_mu.lock().unwrap();
-                                    let fids  = file_ids_mu.lock().unwrap();
-                                    fids.push_to(&mut b);
-                                    b.clone()
+                                    let mut acc = accumulator_mu.lock().unwrap();
+                                    for wb in all_builders {
+                                        let drained = std::mem::take(&mut *wb.lock().unwrap());
+                                        acc.merge_from(drained);
+                                    }
+                                    let fids = file_ids_mu.lock().unwrap();
+                                    fids.push_to(&mut acc);
+                                    acc.clone()
                                 };
                                 let mut shas: Vec<String> = snap.committed
                                     .iter().cloned().collect();
@@ -1039,7 +1062,15 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
         Ok(())
     })?;
 
-    let mut builder = builder_mu.into_inner().unwrap();
+    // Drain any rows the workers ingested since the last snapshot
+    // into the accumulator, then take ownership of the accumulator
+    // for the final write. After std::thread::scope exits every
+    // worker thread is joined, so the per-worker mutexes have no
+    // other reference — into_inner() is the right primitive.
+    let mut builder = accumulator_mu.into_inner().unwrap();
+    for wb in worker_builders {
+        builder.merge_from(wb.into_inner().unwrap());
+    }
     let file_ids    = file_ids_mu.into_inner().unwrap();
     let by_lang     = by_lang_mu.into_inner().unwrap();
 

@@ -24,14 +24,27 @@ pub struct SymbolGroup {
     pub rows: Vec<XrefHit>,
 }
 
-/// One edge in a callgraph BFS — produced by `callgraph`.
+/// One node in a callgraph BFS — produced by `callgraph`. Each node
+/// carries an `id` (dense, unique within the reply) and a `parent`
+/// pointing at the node that *discovered* it. The set of nodes is
+/// the BFS spanning tree from the query root:
+///
+/// * `parent: None` → this is the root the user asked about.
+/// * `parent: Some(p)` → this node was reached from node `p` in one
+///   `up` or `down` hop. Re-walking parent pointers from any node
+///   gives the exact path back to the root.
+///
+/// Nodes are emitted in BFS order (parents always before children),
+/// so a streaming consumer can build the tree on the fly.
 #[derive(Serialize, Deserialize, Debug)]
-pub struct CallEdge {
-    pub hop:  usize,
-    /// "up" or "down"
-    pub dir:  String,
-    pub from: String,
-    pub to:   String,
+pub struct CallNode {
+    pub id:     u32,
+    pub parent: Option<u32>,
+    pub hop:    usize,
+    /// "up" (this node calls `parent`) or "down" (this node is called
+    /// by `parent`). For the root, `dir` is "root".
+    pub dir:    String,
+    pub name:   String,
 }
 
 /// One inheritance hit — produced by `super` / `sub`.
@@ -45,7 +58,7 @@ pub enum Reply {
     Stat   { xrefs: u64, syms: u64, files: u64, inhs: u64, calls: u64 },
     Xrefs  { groups: Vec<SymbolGroup>, total: usize, truncated: bool },
     Inh    { hits: Vec<InhHit>, total: usize },
-    Callgraph { edges: Vec<CallEdge>, total: usize, truncated: bool },
+    Callgraph { nodes: Vec<CallNode>, total: usize, truncated: bool },
     Error  { error: String },
 }
 
@@ -111,10 +124,15 @@ pub fn emit(reply: &Reply, as_json: bool) {
             for h in hits { println!("{}", h.name); }
             eprintln!("hits={total}");
         }
-        Reply::Callgraph { edges, total, truncated } => {
-            for e in edges {
-                let arrow = if e.dir == "up" { "←" } else { "→" };
-                println!("hop={} {} {}  {}  {}", e.hop, e.dir, e.from, arrow, e.to);
+        Reply::Callgraph { nodes, total, truncated } => {
+            // Print as `id=N parent=P  hop=H  dir  name` so a human
+            // can trace `parent` back to the root or pipe the output
+            // into a tree-rendering tool. The structured `--json`
+            // shape is the source of truth for programmatic use.
+            for n in nodes {
+                let p = n.parent.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+                println!("  id={:<3} parent={:<3} hop={} {:<4} {}",
+                         n.id, p, n.hop, n.dir, n.name);
             }
             if *truncated { eprintln!("(callgraph truncated)"); }
             eprintln!("hits={total}");

@@ -196,30 +196,53 @@ hits=3
 Transitive walk over the calls table. Defaults: `--direction up`,
 `--depth 3`, `--max-syms 200`.
 
+Output is a **BFS spanning tree** — every node carries an `id` and a
+`parent` pointing at the node that discovered it. Walk `parent`
+pointers back to the root to reconstruct exact discovery paths. The
+root has `parent: null` (JSON) or `parent=-` (human).
+
 ```bash
 $ scry2 --index aosp.s2db callgraph \
     'kythe:java:android##.../Binder.java#clearCallingIdentity()' \
     --direction up --depth 2
-hop=1 up   ActivityManagerService.startActivityAsUser     ←  clearCallingIdentity
-hop=1 up   BroadcastQueueImpl.deliverToReceiverLocked     ←  clearCallingIdentity
-hop=2 up   ActivityStarter.execute                        ←  ActivityManagerService.startActivityAsUser
-hits=…
+  id=0   parent=-   hop=0 root  clearCallingIdentity
+  id=1   parent=0   hop=1 up    ActivityManagerService.startActivityAsUser
+  id=2   parent=0   hop=1 up    BroadcastQueueImpl.deliverToReceiverLocked
+  id=3   parent=1   hop=2 up    ActivityStarter.execute
+hits=3
 ```
 
-Down direction shows what NAME calls:
+Reading the tree:
 
-```bash
-$ scry2 --index aosp.s2db callgraph BroadcastQueueImpl.skipReceiverLocked \
-    --direction down --depth 2
-hop=1 down BroadcastQueueImpl.skipReceiverLocked  →  Binder.clearCallingIdentity
-hop=1 down BroadcastQueueImpl.skipReceiverLocked  →  Binder.restoreCallingIdentity
-hop=2 down Binder.clearCallingIdentity            →  Binder.getCallingIdentity
-hits=…
+* `id=1`, `id=2` are direct callers of `clearCallingIdentity` (`parent=0`).
+* `id=3` is a transitive caller — reached via `id=1` (`ActivityStarter
+  → ActivityManagerService → clearCallingIdentity`).
+* If you see the same name appear under multiple parents in a `--both`
+  walk, those are genuinely different discovery paths.
+
+JSON shape (canonical):
+
+```json
+{
+  "cmd": "callgraph",
+  "nodes": [
+    {"id": 0, "parent": null, "hop": 0, "dir": "root", "name": "clearCallingIdentity"},
+    {"id": 1, "parent": 0,    "hop": 1, "dir": "up",   "name": "AMS.startActivityAsUser"},
+    {"id": 2, "parent": 0,    "hop": 1, "dir": "up",   "name": "BroadcastQueueImpl.deliverToReceiverLocked"},
+    {"id": 3, "parent": 1,    "hop": 2, "dir": "up",   "name": "ActivityStarter.execute"}
+  ],
+  "total": 3,
+  "truncated": false
+}
 ```
 
-`--direction both` walks both at once. `--max-syms 200` caps the BFS so
-a hub function (10 000+ callers) doesn't run away — increase if you
-need more.
+Nodes are emitted in BFS order (parents always before children), so a
+streaming consumer can build the tree on the fly.
+
+`--direction down` shows what NAME calls. `--direction both` walks
+both directions from the root — `dir: "up"` and `dir: "down"` mark
+each edge. `--max-syms 200` caps total nodes so a hub function with
+10 000+ callers doesn't run away.
 
 ## Path filters — `--in`, `--not-in`, `--def-in`
 

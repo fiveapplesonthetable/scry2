@@ -23,7 +23,7 @@
 
 use crate::format::role;
 use crate::reader::Index;
-use crate::reply::{CallEdge, InhHit, Reply, SymbolGroup, XrefHit,
+use crate::reply::{CallNode, InhHit, Reply, SymbolGroup, XrefHit,
                    kind_str, lang_str, role_str};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -180,37 +180,47 @@ fn do_inh(ix: &Index, name: &str, sub: bool) -> Reply {
 
 fn do_callgraph(ix: &Index, name: &str, direction: &str, depth: usize, max_syms: usize) -> Reply {
     let Some(root) = ix.sym_for_name(name) else {
-        return Reply::Callgraph { edges: Vec::new(), total: 0, truncated: false };
+        return Reply::Callgraph { nodes: Vec::new(), total: 0, truncated: false };
     };
-    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    seen.insert(root);
-    let mut frontier: Vec<u64> = vec![root];
-    let mut edges: Vec<CallEdge> = Vec::new();
-    let go_up   = direction == "up"   || direction == "both";
-    let go_down = direction == "down" || direction == "both";
     let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
+    // BFS spanning tree. `seen` maps a sym to the dense node-id it
+    // got when first discovered; `nodes` is the result in BFS order.
+    let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    let mut nodes: Vec<CallNode> = Vec::new();
+    let mut frontier: Vec<(u64, u32)> = Vec::new();  // (sym, node_id)
+    let root_id = 0u32;
+    seen.insert(root, root_id);
+    nodes.push(CallNode { id: root_id, parent: None, hop: 0,
+                          dir: "root".into(), name: name_of(root) });
+    frontier.push((root, root_id));
+    let go_up   = direction == "up"   || direction == "both";
+    let go_down = direction == "down" || direction == "both";
     let mut truncated = false;
     'depth: for hop in 1..=depth {
-        let mut next: Vec<u64> = Vec::new();
-        for &cur in &frontier {
+        let mut next: Vec<(u64, u32)> = Vec::new();
+        for &(cur_sym, cur_id) in &frontier {
             if go_up {
-                for (caller, _) in ix.called_by(cur) {
-                    if seen.insert(caller) {
-                        edges.push(CallEdge { hop, dir: "up".into(),
-                            from: name_of(caller), to: name_of(cur) });
-                        next.push(caller);
-                        if edges.len() >= max_syms { truncated = true; break 'depth; }
+                for (caller, _) in ix.called_by(cur_sym) {
+                    if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(caller) {
+                        let id = nodes.len() as u32;
+                        v.insert(id);
+                        nodes.push(CallNode { id, parent: Some(cur_id), hop,
+                                              dir: "up".into(), name: name_of(caller) });
+                        next.push((caller, id));
+                        if nodes.len() >= max_syms { truncated = true; break 'depth; }
                     }
                 }
             }
             if go_down {
-                for (callee, _) in ix.calls_from(cur) {
-                    if seen.insert(callee) {
-                        edges.push(CallEdge { hop, dir: "down".into(),
-                            from: name_of(cur), to: name_of(callee) });
-                        next.push(callee);
-                        if edges.len() >= max_syms { truncated = true; break 'depth; }
+                for (callee, _) in ix.calls_from(cur_sym) {
+                    if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(callee) {
+                        let id = nodes.len() as u32;
+                        v.insert(id);
+                        nodes.push(CallNode { id, parent: Some(cur_id), hop,
+                                              dir: "down".into(), name: name_of(callee) });
+                        next.push((callee, id));
+                        if nodes.len() >= max_syms { truncated = true; break 'depth; }
                     }
                 }
             }
@@ -218,8 +228,9 @@ fn do_callgraph(ix: &Index, name: &str, direction: &str, depth: usize, max_syms:
         if next.is_empty() { break; }
         frontier = next;
     }
-    let total = edges.len();
-    Reply::Callgraph { edges, total, truncated }
+    // total = non-root edges discovered (the root itself isn't a hit).
+    let total = nodes.len().saturating_sub(1);
+    Reply::Callgraph { nodes, total, truncated }
 }
 
 /// One request → one reply over a `BufRead` + `Write` pair. Shared by

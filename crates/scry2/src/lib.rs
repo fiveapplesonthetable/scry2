@@ -4,6 +4,7 @@
 
 pub mod format;
 pub mod kythe;
+pub mod kzip;
 pub mod reader;
 pub mod reply;
 pub mod server;

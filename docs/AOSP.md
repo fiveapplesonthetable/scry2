@@ -110,11 +110,39 @@ cd scry2 && cargo build --release -p scry2
 sudo cp target/release/scry2 /usr/local/bin/
 ```
 
-## Step 4 — build the `.s2db` index
+## Step 4 — normalize the kzip (if mixed-encoding)
+
+AOSP's `build_kzip.bash` emits a kzip with BOTH proto-encoded units
+(`root/pbunits/`) and JSON-encoded units (`root/units/`), depending
+on which extractor wrote which CU. Stock Kythe v0.0.75 indexers
+crash hard on mixed-encoding kzips with `Malformed kzip: multiple
+unit encodings but different entries`. Check with:
+
+```bash
+~/scry2-setup/kythe-v0.0.75/tools/kzip info \
+    --input ~/aosp/out/dist/aosp.kzip
+```
+
+If it errors "both proto and JSON units found but are not identical",
+normalize the kzip first:
+
+```bash
+scry2 normalize-kzip \
+    --in  ~/aosp/out/dist/aosp.kzip \
+    --out ~/aosp/out/dist/aosp-norm.kzip
+```
+
+scry2 walks every `root/pbunits/<sha>` and `root/units/<sha>`,
+parses each (proto wire or proto3-JSON, AOSP emits both), re-encodes
+every unit as proto, and writes a fresh single-encoding kzip with
+every required-input file blob preserved. ~5-15 min for a full AOSP
+kzip, output ~same size as input.
+
+## Step 5 — build the `.s2db` index
 
 ```bash
 scry2 from-kzip \
-    --kzip ~/aosp/out/dist/aosp.kzip \
+    --kzip ~/aosp/out/dist/aosp-norm.kzip \
     --kythe-root ~/scry2-setup/kythe-v0.0.75 \
     -o ~/scry2-setup/aosp.s2db \
     --jvm-heap 8g

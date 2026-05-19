@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use scry2::{Index, IndexBuilder, kythe, reply::{Reply, emit}, server::{self, Request}};
+use scry2::{Index, IndexBuilder, kythe, kzip, reply::{Reply, emit}, server::{self, Request}};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -121,6 +121,17 @@ enum Cmd {
     /// to amortize startup across many queries.
     Repl,
 
+    /// `normalize-kzip` — read a mixed-encoding (`pbunits/` + `units/`)
+    /// kzip and write a proto-only kzip that every stock Kythe
+    /// indexer accepts. AOSP's `build_kzip.bash` produces mixed-
+    /// encoding output that crashes stock `cxx_indexer` with
+    /// "Malformed kzip: multiple unit encodings but different entries".
+    /// Run this once before `from-kzip`.
+    NormalizeKzip {
+        #[arg(long = "in",  value_name = "PATH")] in_:  PathBuf,
+        #[arg(long = "out", value_name = "PATH")] out: PathBuf,
+    },
+
     /// `from-kzip` — build an .s2db by running each Kythe indexer
     /// against KZIP and ingesting all entries.
     FromKzip {
@@ -138,6 +149,7 @@ fn main() -> Result<()> {
     // Build-side verbs don't go through Reply.
     match cli.cmd {
         Cmd::Index { entries, out }  => return cmd_index(&entries, &out),
+        Cmd::NormalizeKzip { in_, out } => return cmd_normalize_kzip(&in_, &out),
         Cmd::FromKzip { kzip, kythe_root, out, langs, jvm_heap } =>
             return cmd_from_kzip(&kzip, &kythe_root, &out, &langs, &jvm_heap),
         Cmd::Serve { socket } => {
@@ -169,6 +181,17 @@ fn main() -> Result<()> {
         server::dispatch(&ix, &req)
     };
     emit(&reply, cli.json);
+    Ok(())
+}
+
+fn cmd_normalize_kzip(in_: &std::path::Path, out: &std::path::Path) -> Result<()> {
+    let t0 = Instant::now();
+    eprintln!("[normalize] reading {}", in_.display());
+    let (n_units, n_files) = kzip::normalize(in_, out)?;
+    eprintln!(
+        "[normalize] done in {:.1}s — {} units, {} unique file blobs → {}",
+        t0.elapsed().as_secs_f64(), n_units, n_files, out.display(),
+    );
     Ok(())
 }
 

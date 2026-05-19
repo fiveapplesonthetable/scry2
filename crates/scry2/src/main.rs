@@ -1042,24 +1042,42 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                             // doesn't double-snapshot.
                             if n >= last_snap_done.load(Ordering::Relaxed) + snapshot_every {
                                 last_snap_done.store(n, Ordering::Relaxed);
-                                // Drain every worker sink. Per-sink
-                                // lock is brief (microseconds for
-                                // sinks between CUs; the remaining
-                                // ingest time for sinks mid-CU).
-                                // Crucially the drain does NOT hold
-                                // any global lock, so other workers
-                                // can continue past their next CU
-                                // boundary even while we drain a
-                                // slow sink.
+                                // Drain every worker sink we can
+                                // grab via `try_lock`. Sinks mid-CU
+                                // (lock held by the ingesting worker)
+                                // are SKIPPED — their data + shas
+                                // stay together in the sink and land
+                                // in the NEXT snapshot. This is the
+                                // load-bearing guarantee: a single
+                                // 25-min mega-CU never blocks the
+                                // snapshot from making progress, so
+                                // memory pressure releases on every
+                                // tick and the partial files always
+                                // advance.
+                                //
+                                // Correctness: each sink's
+                                // (builder, pending_shas) pair is
+                                // atomic — skipping the sink keeps
+                                // them together. On resume the
+                                // mid-CU worker's CUs aren't in the
+                                // shas file, so they get re-run.
+                                // Idempotent.
                                 let mut drained_data = IndexBuilder::new();
                                 let mut drained_shas: Vec<String> = Vec::new();
+                                let mut drained_n = 0usize;
+                                let mut skipped_n = 0usize;
                                 for ws in all_sinks {
-                                    let mut sink = ws.lock().unwrap();
-                                    let taken_builder = std::mem::take(&mut sink.builder);
-                                    let taken_shas    = std::mem::take(&mut sink.pending_shas);
-                                    drop(sink);
-                                    drained_data.merge_from(taken_builder);
-                                    drained_shas.extend(taken_shas);
+                                    match ws.try_lock() {
+                                        Ok(mut sink) => {
+                                            let taken_builder = std::mem::take(&mut sink.builder);
+                                            let taken_shas    = std::mem::take(&mut sink.pending_shas);
+                                            drop(sink);
+                                            drained_data.merge_from(taken_builder);
+                                            drained_shas.extend(taken_shas);
+                                            drained_n += 1;
+                                        }
+                                        Err(_) => { skipped_n += 1; }
+                                    }
                                 }
                                 // Fold drained state into the
                                 // accumulator + capture a clone for
@@ -1083,10 +1101,11 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                 if let Err(e) = write_snapshot(cloned, &shas,
                                     partial_s2db_path, partial_shas_path)
                                 {
-                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed: {e:#}");
+                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed (sinks drained={drained_n}/{}, busy={skipped_n}): {e:#}",
+                                        drained_n + skipped_n);
                                 } else {
-                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable",
-                                        shas.len());
+                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable (sinks drained={drained_n}/{}, busy={skipped_n})",
+                                        shas.len(), drained_n + skipped_n);
                                 }
                             }
                             // _writer_guard releases here.

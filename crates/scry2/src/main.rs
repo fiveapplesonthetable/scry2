@@ -1227,8 +1227,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                 let mut acc = accumulator_mu.lock().unwrap();
                                 acc.builder.merge_from(drained_data);
                                 file_ids.push_to(&mut acc.builder);
-                                let staged_shas: Vec<String> = drained_shas;
-                                for s in &staged_shas { acc.committed_shas.insert(s.clone()); }
+                                for s in drained_shas { acc.committed_shas.insert(s); }
                                 let mut shas: Vec<String> = acc.committed_shas
                                     .iter().cloned().collect();
                                 shas.sort();
@@ -1269,19 +1268,23 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                             shas.len(), drained_n + skipped_n);
                                     }
                                     Err(e) => {
-                                        // The delta was consumed by the
-                                        // merge attempt; the prior partial
-                                        // on disk is unchanged (atomic
-                                        // rename only happens on success).
-                                        // Roll back the in-memory shas so
-                                        // they don't get double-credited.
-                                        // Subsequent snaps will retry with
-                                        // a fresh delta from the workers.
-                                        for s in &staged_shas {
-                                            acc.committed_shas.remove(s);
-                                        }
-                                        eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed (sinks drained={drained_n}/{}, busy={skipped_n}): {e:#}",
-                                            drained_n + skipped_n);
+                                        // The merge consumed `delta`, so the
+                                        // drained CUs are unrecoverable in
+                                        // memory. The prior partial on disk
+                                        // is untouched (atomic rename only
+                                        // fires on success), so it stays a
+                                        // valid resume point. Abort rather
+                                        // than silently drop those CUs from
+                                        // the final index — `--resume` re-
+                                        // indexes them, since their shas were
+                                        // never committed to `.partial.shas`.
+                                        // Unpark workers first so the scope
+                                        // can collapse instead of deadlocking
+                                        // on the park loop.
+                                        drop(acc);
+                                        snap_active_ref.store(false, Ordering::Release);
+                                        return Err(e).with_context(|| format!(
+                                            "snapshot @ {n}/{plan_len}"));
                                     }
                                 }
                                 // Merge done — unpark the workers.

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/scry2-bench",
+    "crates/scry2",
 ]
 
 [workspace.package]
@@ -15,6 +16,8 @@ memmap2 = "0.9"
 anyhow = "1"
 rand = "0.8"
 libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+twox-hash = "1.6"
 
 # Release profile — every ns must be accounted, so optimize aggressively
 # but keep debug symbols for perf / flamegraph.

@@ -113,6 +113,34 @@ impl IndexBuilder {
         self.calls.append(&mut other.calls);
     }
 
+    /// Collapse exact-duplicate rows in the append-only tables
+    /// (`xrefs`, `inherits`, `calls`, `aliases`). The maps (`syms`,
+    /// `files`) are already keyed and need no dedup.
+    ///
+    /// A freshly-ingested per-CU builder carries heavy intra-CU
+    /// redundancy: the indexer emits the same `/kythe/edge/named`
+    /// alias on every node that references a symbol (≈30× per CU,
+    /// documented in [`finish`]), and repeats xref rows. `finish` /
+    /// `write_merged_snapshot` dedup at write time, but if a per-CU
+    /// builder is *accumulated* into a long-lived sink first, that
+    /// redundancy sits in RAM until the next snapshot — the dominant
+    /// driver of from-kzip's in-memory delta. Calling this on each CU
+    /// before merging keeps the sink proportional to distinct facts.
+    ///
+    /// Returns the number of rows remaining after dedup (xrefs +
+    /// inherits + calls + aliases), for buffer accounting.
+    pub fn dedup_tables(&mut self) -> usize {
+        self.xrefs.sort_unstable();
+        self.xrefs.dedup();
+        self.inherits.sort_unstable();
+        self.inherits.dedup();
+        self.calls.sort_unstable();
+        self.calls.dedup();
+        self.aliases.sort_unstable();
+        self.aliases.dedup();
+        self.xrefs.len() + self.inherits.len() + self.calls.len() + self.aliases.len()
+    }
+
     /// Snapshot the current accumulated state to `path` without
     /// consuming `self`. Used by `from-kzip` to write a partial
     /// `.s2db` every N CUs so a killed run can resume via

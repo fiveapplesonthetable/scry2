@@ -839,6 +839,14 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // cap so a single long-running CU can't stall the snapshot.
     let active_cus = std::sync::atomic::AtomicUsize::new(0);
     let active_cus_ref = &active_cus;
+    // Live gauge of append-only rows (xrefs + inherits + calls +
+    // aliases, post per-CU dedup) currently buffered in the worker
+    // sinks awaiting the next snapshot drain. Workers add their CU's
+    // deduped row count; the snapshotter subtracts what it drains.
+    // Logged each heartbeat so the in-memory delta is observable
+    // rather than inferred from RSS.
+    let delta_rows = std::sync::atomic::AtomicU64::new(0);
+    let delta_rows_ref = &delta_rows;
 
     // Split the plan into N work shards by index. Static partition
     // is simpler than a work-stealing queue and load-balances well
@@ -911,9 +919,10 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                         })
                         .count())
                     .unwrap_or(0);
+                let buffered_rows = delta_rows_ref.load(std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
-                    "[heartbeat] +{:.0}s done={n_done}/{plan_total} ({:.1}/min) snap@={snap_at} partial={:.2}G rss={:.1}G indexers={active_idx}",
-                    elapsed, cu_per_min, partial_gb, rss_gb,
+                    "[heartbeat] +{:.0}s done={n_done}/{plan_total} ({:.1}/min) snap@={snap_at} partial={:.2}G rss={:.1}G indexers={active_idx} delta_rows={:.1}M",
+                    elapsed, cu_per_min, partial_gb, rss_gb, buffered_rows as f64 / 1e6,
                 );
             }
         });
@@ -1117,9 +1126,20 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     // a sha; failures and empties are safe to re-run.
                     let cu_succeeded = !failed && any_entries;
                     if cu_succeeded {
+                        // Dedup the per-CU builder BEFORE accumulating it.
+                        // The indexer emits ~30× redundant alias rows per
+                        // CU (same /kythe/edge/named on every referencing
+                        // node) plus repeated xrefs; collapsing them here
+                        // keeps the worker sink — and thus the in-memory
+                        // delta carried between snapshots — proportional
+                        // to distinct facts, not raw emission count.
+                        let mut cu_builder = cu_builder;
+                        let rows = cu_builder.dedup_tables();
                         let mut sink = my_sink.lock().unwrap();
                         sink.builder.merge_from(cu_builder);
                         sink.pending_shas.push(unit.sha.clone());
+                        drop(sink);
+                        delta_rows_ref.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     progress_mu.lock().unwrap().report("index", n, plan_len);
@@ -1211,6 +1231,15 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                         Err(_) => { skipped_n += 1; }
                                     }
                                 }
+                                // These rows are leaving the sinks for the
+                                // accumulator (which is written to disk and
+                                // dropped), so they're no longer part of the
+                                // live in-memory delta gauge.
+                                let drained_rows = (drained_data.n_xrefs()
+                                    + drained_data.n_inh()
+                                    + drained_data.n_calls()
+                                    + drained_data.n_aliases()) as u64;
+                                delta_rows_ref.fetch_sub(drained_rows, Ordering::Relaxed);
                                 // Fold drained state into the
                                 // accumulator's delta, then snapshot
                                 // via streaming-merge against the

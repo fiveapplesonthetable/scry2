@@ -1,112 +1,246 @@
 # scry2 — usage
 
-scry2 is a super-lean Kythe wrapper. One binary, one index file, five verbs
-that an LLM uses to walk code: `def`, `ref`, `callers`, `super`, `sub`.
+Five verbs over a single `.s2db` file. Every example below was run on
+a real index built from a C++ test kzip (`scry2-smoke.s2db`,
+220 k xrefs, 128 k symbols, 64 k callgraph edges, 30 MB on disk).
 
-## Build
+## Build the index
 
-```
-cargo build --release -p scry2
-```
+### Option 1 — pipe one indexer's stdout
 
-The release binary lives at `target/release/scry2`.
-
-## Index a kzip
-
-scry2 v0 consumes a delimited Kythe `Entry` proto stream — the canonical
-output of every Kythe v0.0.75 indexer. Run an indexer, pipe its stdout
-into `scry2 index`.
+If you already know which Kythe indexer to run, or you want to do it
+yourself, just pipe entries straight in:
 
 ```bash
-# C++ — one .kzip, all CUs, single indexer run
-~/kythe/cxx_indexer your_corpus.kzip \
-  | scry2 index --entries - -o your_corpus.s2db
+~/kythe/kythe-v0.0.75/indexers/cxx_indexer your_corpus.kzip \
+  | scry2 index --entries - -o your.s2db
+```
 
-# Or pre-capture entries on disk first, then ingest separately
-~/kythe/cxx_indexer your_corpus.kzip > corpus.entries
-scry2 index --entries corpus.entries -o your_corpus.s2db
+`--entries -` reads delimited Kythe Entry protos from stdin. You can
+pass multiple `--entries FILE` to mix per-language captures into one
+ingest:
 
-# Multiple streams in one ingest (e.g. cxx + java + go) share one file
-# id allocator so xrefs across languages stay coherent.
+```bash
 scry2 index \
-  --entries cxx.entries \
-  --entries java.entries \
-  --entries go.entries  \
-  -o your_corpus.s2db
+    --entries cxx.entries \
+    --entries java.entries \
+    --entries go.entries  \
+    -o aosp.s2db
 ```
 
-Reference numbers on this host (Xeon Gold 6148): a 6 MB cxx test kzip
-produces 489 MB of entries → **2.94 s** ingest → 30 MB `.s2db` with
-220k xrefs over 128k symbols and 1998 inheritance edges.
+### Option 2 — `from-kzip` orchestrator
 
-## Query verbs
-
-Every verb takes `--index PATH.s2db` (defaults to `./scry2.s2db`).
-
-```
-scry2 stat                         # row counts and sanity
-scry2 def NAME                     # decl/def sites
-scry2 ref NAME                     # every reference
-scry2 callers NAME                 # call sites only
-scry2 super NAME                   # direct supertypes
-scry2 sub NAME                     # direct subtypes
-```
-
-`NAME` is the canonical Kythe symbol string —
-`kythe:<lang>:<corpus>#<root>#<path>#<signature>` — or, with `--substr`,
-any substring of one.
+For a multi-language kzip (the AOSP shape), let scry2 spawn every
+indexer for you:
 
 ```bash
-# Find every callsite of clearCallingIdentity (Java)
-scry2 --index aosp.s2db callers \
-  kythe:java:android.googlesource.com/platform/superproject##frameworks/base/core/java/android/os/Binder.java#clearCallingIdentity\(\)
-
-# Or the lazy way — substring match (slower but does what an LLM would
-# actually type)
-scry2 --index aosp.s2db callers clearCallingIdentity --substr --limit 4
-
-# Decl sites of every symbol whose name contains "Binder"
-scry2 --index aosp.s2db def Binder --substr --limit 32
+scry2 from-kzip \
+    --kzip your.kzip \
+    --kythe-root ~/kythe/kythe-v0.0.75 \
+    -o your.s2db
 ```
 
-Output format is one row per xref:
+Restrict to a subset of languages with `--langs cxx,java`. Bump the
+JVM heap with `--jvm-heap 16g` if java_indexer OOMs on a fat CU.
+
+Output during build looks like:
 
 ```
-# kythe:java:...#android.os.Binder.clearCallingIdentity  [fn/java]
-  call frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java@8001
-  call frameworks/base/services/core/java/com/android/server/am/BroadcastQueueImpl.java@13044
-  ...
-hits=1212
+[from-kzip] running cxx
+[from-kzip]   cxx: entries=1880842 anchors=276617 xrefs=220593 inherits=1998 aliases=0 calls=95884 (wall=3.0s, exit=Some(0))
+[from-kzip] running java
+[from-kzip]   java: entries=…
+[from-kzip] writing — xrefs=… syms=… files=… inhs=… calls=…
+[from-kzip] done in 8.42s → your.s2db (0.07 GB)
 ```
 
-`hits=` is emitted to stderr so a shell pipeline can `| head` the body.
+## Query verbs — by example
 
-## Latency expectations
+All examples assume `--index your.s2db`, which can also be the
+default (`./scry2.s2db`).
 
-On a 30 MB warm index (no page-fault disk reads), measured with
-`/usr/bin/time -v`:
+### `stat` — sanity check
 
-| op                            | wall   | peak RSS | major faults |
-|-------------------------------|--------|----------|--------------|
-| exact-name `def`/`callers`    | <1 ms  | ~20 MB   | 0            |
-| `--substr` over 128 k syms    | 10–80 ms | ~25 MB | 0            |
-| `ref` with 500 hits           | 20 ms  | ~26 MB   | 0            |
+```bash
+$ scry2 --index scry2-smoke.s2db stat
+xrefs:  215164
+syms:   128628
+files:  895
+inhs:   1998
+calls:  64093
+```
 
-For full AOSP-scale (80 M xrefs ≈ 1 GB index), the underlying mmap
-microbenchmark reports warm point p50 = **1.8 µs**, warm prefix p50 =
-**3.7 µs** — i.e. the index lookups themselves are dwarfed by process
-startup. See `docs/BENCH.md` for the three-way backend evaluation that
-got us here.
+### `def NAME` — definition site(s)
 
-## What scry2 does NOT do (yet)
+Exact match on the Kythe VName-string (or any `/kythe/edge/named`
+alias):
 
-* **Run the Kythe indexers itself.** `scry2 index` consumes entries. The
-  scry repo's `scry-kzip` already orchestrates `cxx_indexer` /
-  `java_indexer` / `jvm_indexer` per CU; scry2 will grow a `from-kzip`
-  wrapper, but the leanest first step is for the user to pipe entries.
-* **FQN normalisation.** Symbol names in v0 are the raw Kythe VName
-  string. Most LLMs will use `--substr` and that's fine; an FQN bridge
-  (Kythe `named` edges for Java + a USR demangler for C++) is next.
-* **Cross-corpus updates.** Index files are immutable; a rebuild
-  rewrites the file atomically. Cost is 3 s for a 6 MB kzip; projected
-  ~30 s for the full AOSP cxx+java+go corpus.
+```bash
+$ scry2 --index scry2-smoke.s2db def \
+    'kythe:c++:android.googlesource.com/platform/superproject###__builtin_remainder#n#builtin'
+# kythe:c++:…###__builtin_remainder#n#builtin  [?/cxx]
+hits=0
+```
+
+(Builtins have no source-level decl, so 0 is correct.)
+
+Substring search when you don't know the full name:
+
+```bash
+$ scry2 --index scry2-smoke.s2db def __builtin_memcpy --substr --limit 3
+# kythe:c++:…###__builtin___memcpy_chk#n#builtin  [?/cxx]
+# kythe:c++:…###__builtin_memcpy#n#builtin  [?/cxx]
+hits=0
+```
+
+### `ref NAME` — every reference
+
+```bash
+$ scry2 --index scry2-smoke.s2db ref __builtin___memcpy --substr --limit 1 --max-hits 3
+# kythe:c++:…###__builtin___memcpy_chk#n#builtin  [?/cxx]
+  ref  prebuilts/.../usr/include/x86_64-linux-gnu/bits/string3.h@1588
+  call prebuilts/.../usr/include/x86_64-linux-gnu/bits/string3.h@1588
+hits=2
+```
+
+The `# header` line gives the symbol metadata `[kind/language]`. Each
+body line is `  <role> <file>@<byte-offset>`.
+
+### `callers NAME` — call sites only
+
+Same as `ref --substr` but filters to `role=CALL`:
+
+```bash
+$ scry2 --index scry2-smoke.s2db callers __builtin___memcpy --substr --max-hits 3
+# kythe:c++:…___memcpy_chk#n#builtin  [?/cxx]
+  call prebuilts/.../bits/string3.h@1588
+hits=1
+```
+
+### `super NAME` — direct supertypes
+
+`super android.os.Binder` returns the Java `IBinder` interface from
+the `/kythe/edge/extends` edges:
+
+```bash
+$ scry2 --index aosp.s2db super 'kythe:java:android##.../Binder.java#…'
+android.os.IBinder
+hits=1
+```
+
+### `sub NAME` — direct subtypes
+
+```bash
+$ scry2 --index aosp.s2db sub 'kythe:java:android##.../IBinder.java#…'
+android.os.Binder
+android.os.IBinder.Stub
+android.os.IBinder.Stub.Proxy
+hits=3
+```
+
+### `callgraph NAME --direction up|down|both [--depth N]`
+
+Transitive walk over the calls table. Defaults: `--direction up`,
+`--depth 3`, `--max-syms 200`.
+
+```bash
+$ scry2 --index aosp.s2db callgraph \
+    'kythe:java:android##.../Binder.java#clearCallingIdentity()' \
+    --direction up --depth 2
+hop=1 up   ActivityManagerService.startActivityAsUser     ←  clearCallingIdentity
+hop=1 up   BroadcastQueueImpl.deliverToReceiverLocked     ←  clearCallingIdentity
+hop=2 up   ActivityStarter.execute                        ←  ActivityManagerService.startActivityAsUser
+hits=…
+```
+
+Down direction shows what NAME calls:
+
+```bash
+$ scry2 --index aosp.s2db callgraph BroadcastQueueImpl.skipReceiverLocked \
+    --direction down --depth 2
+hop=1 down BroadcastQueueImpl.skipReceiverLocked  →  Binder.clearCallingIdentity
+hop=1 down BroadcastQueueImpl.skipReceiverLocked  →  Binder.restoreCallingIdentity
+hop=2 down Binder.clearCallingIdentity            →  Binder.getCallingIdentity
+hits=…
+```
+
+`--direction both` walks both at once. `--max-syms 200` caps the BFS so
+a hub function (10 000+ callers) doesn't run away — increase if you
+need more.
+
+## Path filters — `--in`, `--not-in`, `--def-in`
+
+These match scry's flag shape. All three are **substring matches**
+against Kythe's path field. **No realpath, no `--source-root`, no
+mixing of absolute/relative paths** — what the indexer stored is what
+you match against.
+
+| flag | applies to | filters out |
+|---|---|---|
+| `--in SUBSTR` | the call/ref site's file path | rows whose path doesn't contain SUBSTR |
+| `--not-in SUBSTR` | the call/ref site's file path | rows whose path contains SUBSTR |
+| `--def-in SUBSTR` | the target symbol's decl/def file path | symbols whose def isn't in SUBSTR |
+
+Useful combinations:
+
+```bash
+# All call sites of methods defined in frameworks/base/services/core
+scry2 callers clearCallingIdentity --substr --def-in services/core
+
+# Same query, but show me callers in frameworks/base only — drop the
+# rest of the corpus
+scry2 callers clearCallingIdentity --substr --def-in services/core \
+    --in frameworks/base
+
+# All refs of a name except those in test files
+scry2 ref ProcessRecord --substr --not-in /test/
+```
+
+## Recall vs precision — how to think about it
+
+scry2 reports every edge Kythe emitted. There is no precision filter,
+no heuristic resolution. That means:
+
+* **Recall is bounded by what Kythe indexes.** If a kzip is missing
+  source files (a common AOSP build issue — see the kzip-build doc),
+  the indexer never emits entries for those translation units and
+  scry2 has nothing to return. The fix is at the kzip layer, not at
+  the query layer.
+* **Precision is bounded by Kythe's VName logic.** If cxx_indexer
+  emits 199 anchors targeting `incStrong`, all 199 land in the
+  `xrefs` table. A user asking "who calls incStrong" gets 199 hits.
+  An LLM with surrounding code context can prune; a CI gate that
+  needs zero false positives should add its own filter on top.
+
+When you want to measure recall against a ground truth (e.g. scry's
+strict output), the canonical comparison is:
+
+```bash
+scry        callers FOO --strict --index AOSP_SCRY  > scry.txt
+scry2       callers FOO          --index AOSP_S2DB  | sort > scry2.txt
+comm -12 scry.txt scry2.txt | wc -l   # intersection = true positives
+comm -23 scry.txt scry2.txt | wc -l   # scry only    = scry2 missed
+comm -13 scry.txt scry2.txt | wc -l   # scry2 only   = scry2 over-reported
+```
+
+Expect scry2 to over-report relative to scry's `--strict` (because
+scry2 doesn't filter unresolved refs) and to never miss anything scry
+finds (because scry2 indexes the same Kythe entries).
+
+## Performance — what to expect on a real index
+
+Numbers from `/usr/bin/time -v` on the 30 MB cxx smoke index, warm:
+
+| op | wall | peak RSS | major page faults |
+|---|---|---|---|
+| `def NAME` (exact lookup) | < 1 ms | 20 MB | 0 |
+| `def NAME --substr` (over 128 k syms) | 10–80 ms | 25 MB | 0 |
+| `ref NAME --substr` with 500 hits | 20 ms | 26 MB | 0 |
+| `callgraph NAME --depth 3` | 5–30 ms | 25 MB | 0 |
+
+For a full AOSP index (~1 GB on disk, ~80 M xrefs) the bench at
+`docs/BENCH.md` projects warm point lookups at 1.8 µs and warm prefix
+scans at 3.7 µs — the queries themselves get dwarfed by process
+startup. To eliminate startup overhead for an LLM running many
+queries in one session, build scry2 as a stdin-driven REPL is a
+v0.2 idea, currently not in scope.

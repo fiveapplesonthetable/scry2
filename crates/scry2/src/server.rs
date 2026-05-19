@@ -63,6 +63,20 @@ fn default_direction() -> String { "up".into() }
 fn default_depth() -> usize { 3 }
 fn default_max_syms() -> usize { 200 }
 
+/// Path-substring filter shared by `def`, `ref`, and `callers`.
+/// All three matches are on Kythe's stored `path` field with no
+/// normalization (see docs/USAGE.md for path semantics).
+#[derive(Debug, Default, Clone, Copy)]
+struct PathFilter<'a> {
+    /// File path of the ref/call site must contain this.
+    pub in_: Option<&'a str>,
+    /// File path of the ref/call site must NOT contain this.
+    pub not_in: Option<&'a str>,
+    /// Target symbol's decl/def path must contain this — used to
+    /// drop matches whose definitions live outside a subtree of interest.
+    pub def_in: Option<&'a str>,
+}
+
 /// Run a single request against a borrowed Index and return its Reply.
 /// The pure-function shape means the daemon and the in-process CLI
 /// share one code path.
@@ -77,15 +91,15 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
         },
         Request::Def { name, substr, limit, in_, not_in } => do_xrefs(
             ix, name, *substr, *limit, role::DECL, role::DEF, usize::MAX,
-            in_.as_deref(), not_in.as_deref(), None,
+            PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: None },
         ),
         Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
             ix, name, *substr, *limit, 0, u8::MAX, *max_hits,
-            in_.as_deref(), not_in.as_deref(), def_in.as_deref(),
+            PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
         ),
         Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
             ix, name, *substr, *limit, role::CALL, role::CALL, *max_hits,
-            in_.as_deref(), not_in.as_deref(), def_in.as_deref(),
+            PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
         ),
         Request::Super { name } => do_inh(ix, name, /*sub=*/false),
         Request::Sub   { name } => do_inh(ix, name, /*sub=*/true),
@@ -94,10 +108,14 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
     }
 }
 
+// The shape (sym-resolution + role-window + path-filter) is genuinely
+// the contract this verb implements; splitting it further would just
+// rename groups, not reduce surface.
+#[allow(clippy::too_many_arguments)]
 fn do_xrefs(
     ix: &Index, name: &str, substr: bool, name_limit: usize,
     role_lo: u8, role_hi: u8, max_hits: usize,
-    in_: Option<&str>, not_in: Option<&str>, def_in: Option<&str>,
+    filt: PathFilter<'_>,
 ) -> Reply {
     let syms: Vec<u64> = if substr {
         ix.syms_matching_substring(name, name_limit)
@@ -106,7 +124,7 @@ fn do_xrefs(
     let mut total = 0usize;
     let mut truncated = false;
     'outer: for sym in &syms {
-        if let Some(p) = def_in {
+        if let Some(p) = filt.def_in {
             let mut def_ok = false;
             for (_, _, file, _) in ix.xrefs(*sym, role::DECL, role::DEF) {
                 if let Some(path) = ix.file_path(file) {
@@ -119,8 +137,8 @@ fn do_xrefs(
         let mut rows: Vec<XrefHit> = Vec::new();
         for (_, r, file, off) in ix.xrefs(*sym, role_lo, role_hi) {
             let path = ix.file_path(file).unwrap_or("?");
-            if let Some(p) = not_in { if path.contains(p) { continue; } }
-            if let Some(p) = in_    { if !path.contains(p) { continue; } }
+            if let Some(p) = filt.not_in { if path.contains(p) { continue; } }
+            if let Some(p) = filt.in_    { if !path.contains(p) { continue; } }
             rows.push(XrefHit { role: role_str(r).to_string(), file: path.to_string(), off });
             total += 1;
             if total >= max_hits {

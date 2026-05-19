@@ -72,7 +72,8 @@ Kythe convention for repeated edges.
 * `/kythe/edge/childof/context` — same family, scope-only.
 * `/kythe/edge/ref/expands`, `ref/expands/transitive`, `ref/implicit`
   — macro-expansion noise. Useful for some pipelines, not for the
-  five LLM-shaped queries scry2 cares about.
+  six LLM-shaped queries scry2 cares about
+  (def / ref / callers / super / sub / callgraph).
 * `/kythe/edge/typed`, `param`, `tparam`, `documents`, `aliases` —
   type-shape edges. Not needed for def/ref/callers/super/sub/callgraph.
 

@@ -1,7 +1,7 @@
 # scry2
 
 Super-lean Kythe wrapper for AOSP-scale code walks. One Rust binary,
-one mmap'd `.s2db` file, five LLM-shaped query verbs in single-digit
+one mmap'd `.s2db` file, six LLM-shaped query verbs in single-digit
 microseconds.
 
 ## What it does

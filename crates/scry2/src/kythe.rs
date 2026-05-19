@@ -127,8 +127,6 @@ pub fn ingest_tolerant<R: Read>(
     tolerate_trunc: bool,
 ) -> Result<IngestStats> {
     let mut r = std::io::BufReader::with_capacity(64 * 1024, reader);
-    let mut anchors: HashMap<String, AnchorAccum> = HashMap::new();
-    let mut completes_bridges: HashMap<String, String> = HashMap::new();
     // Callgraph emission: we cannot rely on `/kythe/edge/childof` —
     // in cxx_indexer's output that edge connects sym scopes
     // (namespace nesting, class membership), not anchors to their
@@ -144,8 +142,7 @@ pub fn ingest_tolerant<R: Read>(
     // Layout:
     //   body_anchors: (file_id, start, end, def_sym), sorted by (file_id, start)
     //   call_sites:   (file_id, start, target_sym, role)
-    let mut body_anchors: Vec<(u32, u32, u32, u64)> = Vec::new();
-    let mut call_sites:   Vec<(u32, u32, u64, u8)>  = Vec::new();
+    let mut state = IngestState::default();
     let mut stats = IngestStats::default();
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     loop {
@@ -178,11 +175,7 @@ pub fn ingest_tolerant<R: Read>(
             Err(e) => return Err(e.context(format!("decode Entry #{}", stats.entries))),
         };
         stats.entries += 1;
-        process_entry(
-            &entry, &mut anchors, &mut completes_bridges,
-            &mut body_anchors, &mut call_sites,
-            builder, file_ids, &mut stats,
-        );
+        process_entry(&entry, &mut state, builder, file_ids, &mut stats);
     }
     // -- Callgraph emission: resolve call_sites against body_anchors.
     //
@@ -194,12 +187,12 @@ pub fn ingest_tolerant<R: Read>(
     // We pick the innermost (= shortest span) containing range so
     // an `inner_lambda → calls → foo` edge is attributed to the
     // lambda, not the outer function.
-    body_anchors.sort_unstable_by_key(|(f, s, _, _)| (*f, *s));
-    stats.diag_defines_seen = body_anchors.len() as u64;
-    stats.diag_pending      = call_sites.len() as u64;
-    for (file, off, target_sym, role_byte) in call_sites {
-        if let Some(enc) = innermost_containing(&body_anchors, file, off) {
-            builder.add_call(enc, target_sym, role_byte);
+    state.body_anchors.sort_unstable_by_key(|(f, s, _, _)| (*f, *s));
+    stats.diag_defines_seen = state.body_anchors.len() as u64;
+    stats.diag_pending      = state.call_sites.len() as u64;
+    for (file, off, target_sym, role_byte) in &state.call_sites {
+        if let Some(enc) = innermost_containing(&state.body_anchors, *file, *off) {
+            builder.add_call(enc, *target_sym, *role_byte);
             stats.calls_emitted += 1;
         } else {
             stats.diag_unresolved += 1;
@@ -210,7 +203,7 @@ pub fn ingest_tolerant<R: Read>(
     // bridge exists. The IndexBuilder doesn't currently expose that
     // affordance; we defer it to a follow-up. The bridge count is
     // surfaced via stats so callers can log it.
-    stats.completes_bridges = completes_bridges.len();
+    stats.completes_bridges = state.completes_bridges.len();
     Ok(stats)
 }
 
@@ -253,6 +246,27 @@ impl FileIdAllocator {
     }
 }
 
+/// In-flight ingestion state. Lives for one `ingest_tolerant` call.
+///
+/// Grouping these four fields into a struct keeps `process_entry`'s
+/// signature short and makes "what mutable state does the decoder
+/// own?" answerable in one place. Each field is documented at its
+/// use site.
+#[derive(Default)]
+struct IngestState {
+    /// Anchor VName-string → in-flight per-anchor accumulator.
+    anchors: HashMap<String, AnchorAccum>,
+    /// cxx DEFN-VName → DECL-VName (captured per stream — see
+    /// completes-edge handling below).
+    completes_bridges: HashMap<String, String>,
+    /// `(file_id, start, end, def_sym)` — function-body anchors used
+    /// to attribute call sites to their enclosing function.
+    body_anchors: Vec<(u32, u32, u32, u64)>,
+    /// `(file_id, start, target_sym, role)` — call/ref sites waiting
+    /// to be resolved against body_anchors after the stream ends.
+    call_sites: Vec<(u32, u32, u64, u8)>,
+}
+
 #[derive(Default)]
 struct AnchorAccum {
     is_anchor: bool,
@@ -270,14 +284,17 @@ struct AnchorAccum {
 
 fn process_entry(
     e: &Entry,
-    anchors: &mut HashMap<String, AnchorAccum>,
-    completes_bridges: &mut HashMap<String, String>,
-    body_anchors: &mut Vec<(u32, u32, u32, u64)>,
-    call_sites:   &mut Vec<(u32, u32, u64, u8)>,
+    state: &mut IngestState,
     builder: &mut IndexBuilder,
     file_ids: &mut FileIdAllocator,
     stats: &mut IngestStats,
 ) {
+    // Local aliases so the body code stays terse; the compiler elides
+    // these on release builds.
+    let anchors           = &mut state.anchors;
+    let completes_bridges = &mut state.completes_bridges;
+    let body_anchors      = &mut state.body_anchors;
+    let call_sites        = &mut state.call_sites;
     if e.source.is_empty() { return; }
     let source_key = e.source.to_symbol_string();
 
@@ -321,17 +338,17 @@ fn process_entry(
             if role_byte == role::DEF {
                 a.body_def_sym = Some(target_sym);
             }
-            if a.is_anchor && a.start.is_some() {
+            if let (true, Some(start)) = (a.is_anchor, a.start) {
                 let file_id = file_ids.intern(&a.path);
-                emit_xref_resolved(target_sym, &e.target, role_byte, file_id, a.start.unwrap(),
+                emit_xref_resolved(target_sym, &e.target, role_byte, file_id, start,
                                    builder, stats);
                 if role_byte == role::REF || role_byte == role::CALL {
-                    call_sites.push((file_id, a.start.unwrap(), target_sym, role_byte));
+                    call_sites.push((file_id, start, target_sym, role_byte));
                 }
                 // If this is a body-defining anchor and end is known,
                 // record the body range now.
                 if role_byte == role::DEF {
-                    if let (Some(start), Some(end)) = (a.start, a.end) {
+                    if let Some(end) = a.end {
                         body_anchors.push((file_id, start, end, target_sym));
                     }
                 }
@@ -455,7 +472,7 @@ fn innermost_containing(
         if start > off { break; }                  // sorted; rest start later
         if end > off {
             let span = end - start;
-            if best.map_or(true, |(b_span, _)| span < b_span) {
+            if best.is_none_or(|(b_span, _)| span < b_span) {
                 best = Some((span, sym));
             }
         }

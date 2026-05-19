@@ -159,9 +159,9 @@ pub fn read_units(path: &Path) -> Result<Vec<Unit>> {
 
 fn strip_prefix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
     let after = name.strip_prefix(prefix)?;
-    // Only accept entries directly under `<prefix>` — drop deeper
-    // paths (which a malformed kzip might contain).
-    if after.contains('/') { return None; }
+    // Reject the directory entry itself (`root/units/` → after="") and
+    // any deeper paths (a malformed kzip might contain them).
+    if after.is_empty() || after.contains('/') { return None; }
     Some(after)
 }
 
@@ -451,6 +451,18 @@ mod tests {
         assert_eq!(parsed.unit.output_key, "foo.o");
         assert_eq!(parsed.unit.working_directory, "/build");
         assert_eq!(parsed.unit.entry_context, "ctx");
+    }
+
+    #[test]
+    fn strip_prefix_rejects_directory_entries() {
+        // The kzip spec mandates directory entries `root/units/` and
+        // `root/pbunits/`. They must not be parsed as units.
+        assert_eq!(strip_prefix("root/units/", "root/units/"), None);
+        assert_eq!(strip_prefix("root/pbunits/", "root/pbunits/"), None);
+        // Real entries still pass.
+        assert_eq!(strip_prefix("root/units/abc123", "root/units/"), Some("abc123"));
+        // Nested paths still rejected.
+        assert_eq!(strip_prefix("root/units/sub/abc", "root/units/"), None);
     }
 
     #[test]

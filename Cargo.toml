@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scry2-bench",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+
+[workspace.dependencies]
+redb = "2.2"
+rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
+memmap2 = "0.9"
+anyhow = "1"
+rand = "0.8"
+libc = "0.2"
+
+# Release profile — every ns must be accounted, so optimize aggressively
+# but keep debug symbols for perf / flamegraph.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1

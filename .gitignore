@@ -1,0 +1,6 @@
+target/
+*.kdb
+*.rocksdb/
+*.mmap
+*.bin
+Cargo.lock.bak

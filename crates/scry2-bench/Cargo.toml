@@ -1,0 +1,21 @@
+[package]
+name = "scry2-bench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "scry2-bench"
+path = "src/main.rs"
+
+[features]
+default = []
+# RocksDB requires a C++ compiler + ~5min build the first time. Opt-in.
+rocksdb-backend = ["rocksdb"]
+
+[dependencies]
+redb = { workspace = true }
+memmap2 = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+libc = { workspace = true }
+rocksdb = { workspace = true, optional = true }

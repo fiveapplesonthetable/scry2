@@ -144,6 +144,29 @@ contribute to the `calls` table that `callgraph` walks.
   flags respectively. Quirk of two different flag-parser libraries
   used inside the Kythe codebase.
 
+## Kythe patches — when stock v0.0.75 isn't enough
+
+For pure cxx / Go / proto corpora the stock Kythe v0.0.75 indexers
+work as-is. **For AOSP Java + JVM cross-CU coverage** there are four
+patches scry / scry2 expect against the Kythe codebase — without them,
+`services.core → Binder.clearCallingIdentity` returns 0 hits because
+the `/kythe/edge/named` bridge never fires.
+
+| # | file | what changes |
+|---|---|---|
+| 1 | `external.bzl` | `org.ow2.asm:asm:9.1 → 9.7.1` (Java 21 class major version 65 support — stock ASM 9.1 maxes at Java 17). |
+| 2 | `KytheClassVisitor.java` | `ASM_API_LEVEL = Opcodes.ASM9` (was ASM7). Records, sealed classes, pattern-matching for switch all rely on ASM ≥ 8. |
+| 3 | `ClassFileIndexer.java` | new `--default_corpus` flag on `jvm_indexer`. Stock VName corpus on raw `.jar`/`.class` inputs is `""` while `java_indexer`'s `named`-edge targets carry the build's actual corpus — same signature, different corpus → different VName → `write_tables` can't merge them. |
+| 4 | `CompilationUnitPathFileManager.java` | derive `StandardLocation.CLASS_PATH` from `!CLASS_PATH_JAR!`-prefixed `required_input` entries when `JavaDetails` is absent on the CU. **Load-bearing.** Empirically: 0 → 1209 `named` edges to `android.os.Binder.*` JVM FQNs after the patch. |
+
+The complete repro (Bazel + bazel-bin output paths + the order to
+apply the patches) is in
+[`docs/DEVELOPMENT.md`](DEVELOPMENT.md#kythe-patches-required-for-aosp-java-jvm-cross-cu-coverage).
+
+scry's own write-up (with every diff inline) lives at
+`scry/docs/KYTHE_JVM_INDEXER_REBUILD.md` — that's the canonical source
+of truth for the patches themselves.
+
 ## Known limitations (honest)
 
 * **completes bridge not applied yet.** scry2 captures cxx's

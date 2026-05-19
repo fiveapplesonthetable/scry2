@@ -1,83 +1,117 @@
 # scry2 — install
 
-scry2 is one Rust binary plus an external Kythe v0.0.75 release for the
-indexers. No daemons, no databases, no system packages.
+scry2 is **one Rust binary** plus the Kythe v0.0.75 release tarball
+that hosts the indexer binaries. No daemons, no databases, no system
+packages, no scripts to source. The shortest viable install is two
+`curl` commands.
 
-## Requirements
+## Quickest path — prebuilt binary (recommended)
 
-| | version |
-|---|---|
-| Rust toolchain | 1.75+ (stable). `rustup install stable` |
-| OS | Linux (only Linux is tested) |
-| Kernel | any 5.x or later — uses `posix_fadvise(POSIX_FADV_DONTNEED)` for cold-cache eviction |
-| Filesystem | anything that supports `mmap` (ext4, xfs, btrfs, tmpfs) |
-| Kythe release | v0.0.75 — only for `from-kzip` / ingest |
-| Java (optional) | JDK 21+ if you'll feed it Java/JVM kzips |
-
-scry2 itself depends on five crates: `anyhow`, `clap`, `memmap2`,
-`twox-hash`, `libc`. No protobuf codegen, no C/C++ build steps.
-
-## Build
+> Pinned release builds for x86_64-linux land on GitHub Releases when
+> we cut tags. Until v0.1.0 ships there, build from source — see the
+> next section.
 
 ```bash
-git clone <repo>
-cd scry2
-cargo build --release -p scry2
-# binary:   target/release/scry2     (~6 MB)
-# strip if you care: strip --strip-debug target/release/scry2
+# 1. Get scry2 itself (one binary, ~6 MB)
+curl -fL https://github.com/fiveapplesonthetable/scry2/releases/latest/download/scry2-linux-x86_64 \
+    -o /usr/local/bin/scry2
+chmod +x /usr/local/bin/scry2
+
+# 2. Get the Kythe v0.0.75 indexers (~200 MB)
+mkdir -p ~/kythe && cd ~/kythe
+curl -fL https://github.com/kythe/kythe/releases/download/v0.0.75/kythe-v0.0.75.tar.gz \
+    | tar -xz
+
+# 3. Done. Smoke test:
+scry2 --version
+scry2 from-kzip --kzip your.kzip \
+    --kythe-root ~/kythe/kythe-v0.0.75 \
+    -o your.s2db
+scry2 --index your.s2db stat
 ```
 
-The bench crate is optional and only useful if you want to repro the
-backend tradeoff numbers — see `docs/BENCH.md`.
+That's the install. There is no `scry2 init`, no config file, no
+state outside the `.s2db` you create.
 
-## Install Kythe v0.0.75
+## Build from source
 
-scry2 doesn't ship indexers — it shells out to the per-language
-binaries Google publishes in the Kythe release. Download once and
-point scry2 at the unpacked directory:
+If you're on an unsupported platform, want to track `main`, or are
+contributing:
+
+### Requirements
+
+| | min version | install |
+|---|---|---|
+| Rust toolchain | 1.75 stable | `curl https://sh.rustup.rs -sSf \| sh` |
+| Linux | any 5.x kernel | scry2 uses `posix_fadvise` + `mmap` only |
+| git | any | standard |
+
+### Build
+
+```bash
+git clone https://github.com/fiveapplesonthetable/scry2
+cd scry2
+cargo build --release -p scry2          # → target/release/scry2 (~6 MB)
+sudo cp target/release/scry2 /usr/local/bin/  # optional
+```
+
+The release build takes ~30 s clean. Five tiny deps (`anyhow`, `clap`,
+`memmap2`, `twox-hash`, `libc`), no build.rs, no codegen, no C/C++.
+
+## Get the Kythe indexers
 
 ```bash
 mkdir -p ~/kythe && cd ~/kythe
-curl -fLO https://github.com/kythe/kythe/releases/download/v0.0.75/kythe-v0.0.75.tar.gz
-tar -xzf kythe-v0.0.75.tar.gz
-# Now ~/kythe/kythe-v0.0.75/indexers/ holds:
-#   cxx_indexer  go_indexer  proto_indexer  textproto_indexer
-#   java_indexer.jar  jvm_indexer.jar
+curl -fL https://github.com/kythe/kythe/releases/download/v0.0.75/kythe-v0.0.75.tar.gz \
+    | tar -xz
+# → ~/kythe/kythe-v0.0.75/indexers/{cxx,go,proto,textproto}_indexer
+#   ~/kythe/kythe-v0.0.75/indexers/{java,jvm}_indexer.jar
 ```
 
-scry2 only needs `indexers/` to exist; the `tools/`, `web/`, etc.
-directories are unused.
+scry2 only needs `kythe-v0.0.75/indexers/`. The `tools/`, `web/`,
+etc. directories are unused.
 
-## A 5-line smoke test
+### Optional: patched Kythe for AOSP Java + JVM cross-CU
+
+Public v0.0.75 indexers fall short for AOSP Java 21 bytecode in
+`framework.jar` and for services.core → Binder cross-CU edges.
+If those scenarios matter for your corpus, you'll need to rebuild
+Kythe with the four scry-developed patches. Full repro lives in
+[`docs/DEVELOPMENT.md`](DEVELOPMENT.md#kythe-patches-required-for-aosp-java-jvm-cross-cu-coverage).
+
+For pure cxx / Go / proto corpora the stock binaries work as-is.
+
+## 30-second smoke test
 
 ```bash
-# 1. Capture entries from a small C++ kzip
-~/kythe/kythe-v0.0.75/indexers/cxx_indexer \
-    your_corpus.kzip > /tmp/scry2.entries
-
-# 2. Build the index
-./target/release/scry2 index --entries /tmp/scry2.entries -o /tmp/scry2.s2db
-
-# 3. Query
-./target/release/scry2 --index /tmp/scry2.s2db stat
-./target/release/scry2 --index /tmp/scry2.s2db def main --substr
+# Pick any small C++ kzip — Kythe's own tests ship one, or AOSP's
+# per-module kzips work.
+~/kythe/kythe-v0.0.75/indexers/cxx_indexer some.kzip \
+    | scry2 index --entries - -o /tmp/smoke.s2db
+scry2 --index /tmp/smoke.s2db stat
+# xrefs:  …
+# syms:   …
+# files:  …
+# calls:  …
+scry2 --index /tmp/smoke.s2db def main --substr --limit 5
 ```
 
-For a multi-language kzip, use `from-kzip` instead — see `docs/USAGE.md`.
+If you see row counts > 0 and at least one match, you're set. Reach
+for [USAGE.md](USAGE.md) for the full verb catalog.
 
 ## Uninstall
 
 ```
-rm target/release/scry2 your_corpus.s2db
+rm /usr/local/bin/scry2
+rm -rf ~/kythe/kythe-v0.0.75
+rm path/to/your.s2db
 ```
 
-There is no persistent state outside the `.s2db` file you build.
-scry2 reads `.s2db` with mmap, writes it once, and that's the entire
-on-disk footprint.
+No package manager state, no config dirs, no daemons to stop.
 
 ## Cargo features
 
 | feature | default | enables |
 |---|---|---|
 | (none) | yes | the `scry2` binary + library, mmap-only |
-| `rocksdb-backend` (on the **bench** crate only) | no | the redb vs rocksdb vs mmap shoot-out at `docs/BENCH.md`. Drags `librocksdb-sys` (5-min C++ build first time). Not needed to use scry2. |
+| `rocksdb-backend` (on the **bench** crate only) | no | the redb vs rocksdb vs mmap shoot-out documented in [BENCH.md](BENCH.md). Drags `librocksdb-sys` and a ~5-min C++ build the first time. Not needed to use scry2. |

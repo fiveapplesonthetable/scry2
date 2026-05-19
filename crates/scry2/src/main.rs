@@ -611,34 +611,22 @@ struct Accumulator {
     committed_shas: std::collections::HashSet<String>,
 }
 
-/// Write a fresh `<partial>.s2db` and `<partial>.shas` pair atomically
-/// (via `.tmp` + rename). Crash safety: the rename order is s2db
-/// first, then shas — so a crash between the two leaves the partial
-/// s2db newer than the shas. On resume we require both files to be
-/// present; the bounded ~µs gap is documented as the only window
-/// where partial state can mismatch, in which case the user is
-/// instructed to discard the partial and restart.
-fn write_snapshot(
-    builder: IndexBuilder,
-    shas:    &[String],
-    s2db_path: &std::path::Path,
-    shas_path: &std::path::Path,
-) -> Result<()> {
-    let s2db_tmp = s2db_path.with_extension("s2db.tmp");
-    builder.finish(&s2db_tmp)
-        .with_context(|| format!("write snapshot {}", s2db_tmp.display()))?;
-    std::fs::rename(&s2db_tmp, s2db_path)
-        .with_context(|| format!("rename {} → {}", s2db_tmp.display(), s2db_path.display()))?;
+/// Write the `<partial>.shas` checkpoint atomically (via `.tmp` +
+/// rename + fsync). One sha per line. Paired with a streaming-merge
+/// `.s2db` write — the s2db is renamed first, then the shas, so on
+/// resume we require both files; a crash between the two leaves the
+/// s2db newer than the shas (the bounded µs window where they can
+/// mismatch is documented as the only recovery requirement).
+fn write_partial_shas(shas: &[String], shas_path: &std::path::Path) -> Result<()> {
+    use std::io::Write;
     let shas_tmp = shas_path.with_extension("shas.tmp");
-    {
-        use std::io::Write;
-        let f = std::fs::File::create(&shas_tmp)
-            .with_context(|| format!("create {}", shas_tmp.display()))?;
-        let mut w = std::io::BufWriter::new(f);
-        for s in shas { writeln!(w, "{s}")?; }
-        w.flush()?;
-        w.get_mut().sync_all().context("fsync shas")?;
-    }
+    let f = std::fs::File::create(&shas_tmp)
+        .with_context(|| format!("create {}", shas_tmp.display()))?;
+    let mut w = std::io::BufWriter::new(f);
+    for s in shas { writeln!(w, "{s}")?; }
+    w.flush()?;
+    w.get_mut().sync_all().context("fsync shas")?;
+    drop(w);
     std::fs::rename(&shas_tmp, shas_path)
         .with_context(|| format!("rename {} → {}", shas_tmp.display(), shas_path.display()))?;
     Ok(())
@@ -747,24 +735,24 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // skip already-folded CUs.
     let partial_s2db_path = partial_s2db_for(args.out);
     let partial_shas_path = partial_shas_for(args.out);
-    let mut starting_builder = IndexBuilder::new();
     let mut done_shas: std::collections::HashSet<String> = std::collections::HashSet::new();
     if args.resume {
         match (partial_s2db_path.exists(), partial_shas_path.exists()) {
             (true, true) => {
-                eprintln!("[from-kzip] --resume: loading {} + {}",
-                    partial_s2db_path.display(), partial_shas_path.display());
-                let ix = scry2::reader::Index::open(&partial_s2db_path)
-                    .with_context(|| format!("open partial {}", partial_s2db_path.display()))?;
-                starting_builder.populate_from_index(&ix)
-                    .with_context(|| "replay partial snapshot")?;
+                // Streaming-merge model: don't replay the partial into
+                // an in-memory builder. The partial stays on disk and
+                // each snap merges (delta + prior mmap) → new partial.
+                // Just enumerate the durable shas so we can skip
+                // already-folded CUs from the plan.
+                eprintln!("[from-kzip] --resume: using {} as merge prior",
+                    partial_s2db_path.display());
                 let shas = std::fs::read_to_string(&partial_shas_path)
                     .with_context(|| format!("read {}", partial_shas_path.display()))?;
                 for line in shas.lines() {
                     let s = line.trim();
                     if !s.is_empty() { done_shas.insert(s.to_string()); }
                 }
-                eprintln!("[from-kzip] --resume: loaded {} prior CUs",
+                eprintln!("[from-kzip] --resume: {} prior CUs already snapshotted",
                     done_shas.len());
             }
             (false, false) => {
@@ -805,12 +793,16 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     let worker_sinks: Vec<std::sync::Mutex<WorkerSink>> = (0..workers_n)
         .map(|_| std::sync::Mutex::new(WorkerSink::default()))
         .collect();
-    // The accumulator carries the snapshot history. On `--resume` it's
-    // seeded with the partial replay plus its sha set; otherwise it
-    // starts empty. Workers never touch this mutex — only the active
-    // snapshotter does, so contention is rare.
+    // The accumulator is the per-snap delta-collector. Workers drain
+    // their sinks into `builder`; at snap time we merge `builder` with
+    // the prior `.partial.s2db` (mmap'd, not loaded into RAM) via
+    // [`IndexBuilder::write_merged_snapshot`] and write a new partial.
+    // After a successful snap, `builder` is reset to empty — the prior
+    // partial on disk is now the durable record, and the next snap
+    // collects a fresh delta. Workers never touch this mutex; only the
+    // active snapshotter does, so contention is rare.
     let accumulator_mu = std::sync::Mutex::new(Accumulator {
-        builder:        starting_builder,
+        builder:        IndexBuilder::new(),
         committed_shas: done_shas,
     });
     // `FileIdAllocator` is shared by-reference (interior mutex inside
@@ -1152,32 +1144,68 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                     }
                                 }
                                 // Fold drained state into the
-                                // accumulator + capture a clone for
-                                // the snapshot write. The accumulator
+                                // accumulator's delta, then snapshot
+                                // via streaming-merge against the
+                                // prior partial. The accumulator
                                 // lock is only contended by snapshot
-                                // writers (and we hold snap_writer_mu
-                                // so there's at most one of us at a
-                                // time), so it's effectively
-                                // uncontended.
-                                let (cloned, shas) = {
-                                    let mut acc = accumulator_mu.lock().unwrap();
-                                    acc.builder.merge_from(drained_data);
-                                    for s in drained_shas { acc.committed_shas.insert(s); }
-                                    file_ids.push_to(&mut acc.builder);
-                                    let cloned = acc.builder.clone();
-                                    let mut shas: Vec<String> = acc.committed_shas
-                                        .iter().cloned().collect();
-                                    shas.sort();
-                                    (cloned, shas)
-                                };
-                                if let Err(e) = write_snapshot(cloned, &shas,
-                                    partial_s2db_path, partial_shas_path)
-                                {
-                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed (sinks drained={drained_n}/{}, busy={skipped_n}): {e:#}",
-                                        drained_n + skipped_n);
-                                } else {
-                                    eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable (sinks drained={drained_n}/{}, busy={skipped_n})",
-                                        shas.len(), drained_n + skipped_n);
+                                // writers (snap_writer_mu serialises
+                                // them) so holding it across the
+                                // write does not block workers.
+                                //
+                                // Memory: `delta` is the only data we
+                                // carry through the snap. Prior state
+                                // stays on disk (mmap'd); we never
+                                // double-allocate it in RAM.
+                                let mut acc = accumulator_mu.lock().unwrap();
+                                acc.builder.merge_from(drained_data);
+                                file_ids.push_to(&mut acc.builder);
+                                let staged_shas: Vec<String> = drained_shas;
+                                for s in &staged_shas { acc.committed_shas.insert(s.clone()); }
+                                let mut shas: Vec<String> = acc.committed_shas
+                                    .iter().cloned().collect();
+                                shas.sort();
+
+                                let delta = std::mem::take(&mut acc.builder);
+                                let prior = if partial_s2db_path.exists() {
+                                    Some(scry2::reader::Index::open(partial_s2db_path)
+                                        .with_context(|| format!("open prior {}",
+                                            partial_s2db_path.display()))?)
+                                } else { None };
+
+                                let merge_res = delta.write_merged_snapshot(
+                                    prior.as_ref(), partial_s2db_path);
+                                drop(prior);
+
+                                match merge_res {
+                                    Ok(_) => {
+                                        // Sidecar the shas file. We write it
+                                        // AFTER the partial.s2db rename so a
+                                        // crash between the two leaves the
+                                        // s2db newer than the shas — on resume
+                                        // we require both files; the bounded
+                                        // µs gap is documented as the only
+                                        // mismatch window.
+                                        if let Err(e) = write_partial_shas(&shas, partial_shas_path) {
+                                            eprintln!("[from-kzip] snapshot @ {n}/{plan_len} shas write failed: {e:#}");
+                                        }
+                                        eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable (sinks drained={drained_n}/{}, busy={skipped_n})",
+                                            shas.len(), drained_n + skipped_n);
+                                    }
+                                    Err(e) => {
+                                        // The delta was consumed by the
+                                        // merge attempt; the prior partial
+                                        // on disk is unchanged (atomic
+                                        // rename only happens on success).
+                                        // Roll back the in-memory shas so
+                                        // they don't get double-credited.
+                                        // Subsequent snaps will retry with
+                                        // a fresh delta from the workers.
+                                        for s in &staged_shas {
+                                            acc.committed_shas.remove(s);
+                                        }
+                                        eprintln!("[from-kzip] snapshot @ {n}/{plan_len} failed (sinks drained={drained_n}/{}, busy={skipped_n}): {e:#}",
+                                            drained_n + skipped_n);
+                                    }
                                 }
                             }
                             // _writer_guard releases here.
@@ -1199,15 +1227,16 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     })?;
 
     // Drain any rows the workers ingested since the last snapshot
-    // into the accumulator, then take ownership of the accumulator's
-    // builder for the final write. After std::thread::scope exits
-    // every worker thread is joined, so the per-worker mutexes have
-    // no other reference — into_inner() is the right primitive.
+    // into a final delta, then streaming-merge against the last
+    // partial.s2db to produce the authoritative output. After
+    // std::thread::scope exits every worker thread is joined, so the
+    // per-worker mutexes have no other reference — into_inner() is
+    // the right primitive.
     let acc = accumulator_mu.into_inner().unwrap();
-    let mut builder = acc.builder;
+    let mut final_delta = acc.builder;
     for ws in worker_sinks {
         let sink = ws.into_inner().unwrap();
-        builder.merge_from(sink.builder);
+        final_delta.merge_from(sink.builder);
         // We don't write a final .shas (the final s2db at args.out
         // is the authoritative deliverable; the partial files get
         // removed below), so dropped pending_shas are harmless.
@@ -1227,11 +1256,19 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
         }
     }
 
-    file_ids.drain_into(&mut builder);
-    eprintln!("[from-kzip] writing — xrefs={} syms={} files={} inhs={} calls={}",
-        builder.n_xrefs(), builder.n_syms(), builder.n_files(),
-        builder.n_inh(), builder.n_calls());
-    let bytes = builder.finish(args.out)?;
+    file_ids.drain_into(&mut final_delta);
+    let prior = if partial_s2db_path.exists() {
+        Some(scry2::reader::Index::open(&partial_s2db_path)
+            .with_context(|| format!("open prior {} for final merge",
+                partial_s2db_path.display()))?)
+    } else { None };
+    eprintln!("[from-kzip] writing — final delta: xrefs={} syms={} files={} inhs={} calls={} (prior on disk: {})",
+        final_delta.n_xrefs(), final_delta.n_syms(), final_delta.n_files(),
+        final_delta.n_inh(), final_delta.n_calls(),
+        prior.as_ref().map(|p| format!("{} xrefs", p.n_xrefs()))
+            .unwrap_or_else(|| "none".to_string()));
+    let bytes = final_delta.write_merged_snapshot(prior.as_ref(), args.out)?;
+    drop(prior);
     // Final write succeeded — discard the rolling partial files so
     // the next from-kzip invocation against this `--out` doesn't
     // pick up a stale snapshot.

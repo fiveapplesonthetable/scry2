@@ -1,9 +1,10 @@
 //! `scry2` CLI — minimal verbs for LLM-driven code walks.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use scry2::{format::{kind, lang, role}, Index};
+use scry2::{format::{kind, lang, role}, kythe, Index, IndexBuilder};
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(name = "scry2", version, about = "lean Kythe wrapper for AOSP")]
@@ -20,6 +21,21 @@ struct Cli {
 enum Cmd {
     /// Stats about an index file: row counts, size, sanity check.
     Stat,
+
+    /// Build an .s2db from one or more delimited Kythe `Entry` proto
+    /// streams. Use `-` to read from stdin.
+    ///
+    /// Example: `~/kythe/cxx_indexer some.kzip | scry2 index --entries -`
+    Index {
+        /// Files containing the delimited Entry proto streams. Use `-`
+        /// for stdin. Multiple files may be given; they're concatenated
+        /// into one ingestion run with a shared file-id allocator.
+        #[arg(long = "entries", required = true)]
+        entries: Vec<PathBuf>,
+        /// Output `.s2db` path. Defaults to `./scry2.s2db`.
+        #[arg(short, long, default_value = "scry2.s2db")]
+        out: PathBuf,
+    },
 
     /// `def NAME` — print the definition site (file:offset) of a symbol.
     /// NAME is a fully-qualified Kythe name, or a substring (use --substr).
@@ -57,18 +73,52 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let ix = Index::open(&cli.index)?;
     match cli.cmd {
-        Cmd::Stat => cmd_stat(&ix),
+        Cmd::Index { entries, out } => cmd_index(&entries, &out),
+        Cmd::Stat => cmd_stat(&Index::open(&cli.index)?),
         Cmd::Def { name, substr, limit }
-            => cmd_xrefs(&ix, &name, substr, limit, role::DECL, role::DEF, usize::MAX, "def"),
+            => cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, role::DECL, role::DEF, usize::MAX, "def"),
         Cmd::Ref { name, substr, limit, max_hits }
-            => cmd_xrefs(&ix, &name, substr, limit, 0, u8::MAX, max_hits, "ref"),
+            => cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, 0, u8::MAX, max_hits, "ref"),
         Cmd::Callers { name, substr, limit, max_hits }
-            => cmd_xrefs(&ix, &name, substr, limit, role::CALL, role::CALL, max_hits, "callers"),
-        Cmd::Super { name } => cmd_inherits(&ix, &name, /*sub=*/false),
-        Cmd::Sub   { name } => cmd_inherits(&ix, &name, /*sub=*/true),
+            => cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, role::CALL, role::CALL, max_hits, "callers"),
+        Cmd::Super { name } => cmd_inherits(&Index::open(&cli.index)?, &name, /*sub=*/false),
+        Cmd::Sub   { name } => cmd_inherits(&Index::open(&cli.index)?, &name, /*sub=*/true),
     }
+}
+
+fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
+    let mut builder = IndexBuilder::new();
+    let mut file_ids = kythe::FileIdAllocator::default();
+    let t0 = Instant::now();
+    for path in entries {
+        let label = path.display();
+        let stats = if path.as_os_str() == "-" {
+            eprintln!("[index] reading from stdin");
+            kythe::ingest(std::io::stdin().lock(), &mut builder, &mut file_ids)?
+        } else {
+            eprintln!("[index] reading {label}");
+            let f = std::fs::File::open(path)
+                .with_context(|| format!("open {label}"))?;
+            kythe::ingest(f, &mut builder, &mut file_ids)?
+        };
+        eprintln!(
+            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} completes={}",
+            stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
+            stats.inherits_emitted, stats.completes_bridges,
+        );
+    }
+    file_ids.drain_into(&mut builder);
+    eprintln!(
+        "[index] writing — xrefs={} syms={} files={} inhs={}",
+        builder.n_xrefs(), builder.n_syms(), builder.n_files(), builder.n_inh(),
+    );
+    let bytes = builder.finish(out)?;
+    eprintln!(
+        "[index] done in {:.2}s → {} ({:.2} GB)",
+        t0.elapsed().as_secs_f64(), out.display(), bytes as f64 / 1e9,
+    );
+    Ok(())
 }
 
 fn cmd_stat(ix: &Index) -> Result<()> {

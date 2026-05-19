@@ -3,6 +3,7 @@
 //! `def`, `ref`, `callers`, `super`, `sub`.
 
 pub mod format;
+pub mod kythe;
 pub mod reader;
 pub mod writer;
 

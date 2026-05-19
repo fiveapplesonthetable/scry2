@@ -5,6 +5,8 @@
 pub mod format;
 pub mod kythe;
 pub mod reader;
+pub mod reply;
+pub mod server;
 pub mod writer;
 
 pub use format::{kind, lang, role, sym_of};

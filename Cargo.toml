@@ -18,6 +18,8 @@ rand = "0.8"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 twox-hash = "1.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Release profile — every ns must be accounted, so optimize aggressively
 # but keep debug symbols for perf / flamegraph.

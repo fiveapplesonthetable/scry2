@@ -1,53 +1,38 @@
 //! `scry2` CLI — minimal verbs for LLM-driven code walks.
+//!
+//! Every query verb builds a `Reply` shape (see `reply.rs`) and emits
+//! it via the same code path the `serve` daemon uses. The CLI either
+//! opens the index in-process (fast for one-shot) or forwards the
+//! request over a Unix socket to a long-lived daemon (zero startup
+//! overhead for batch queries). `--json` toggles machine-readable
+//! output in both modes.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use scry2::{format::{kind, lang, role}, kythe, Index, IndexBuilder};
+use scry2::{Index, IndexBuilder, kythe, reply::{Reply, emit}, server::{self, Request}};
 use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(name = "scry2", version, about = "lean Kythe wrapper for AOSP")]
 struct Cli {
-    /// Path to the .s2db index file. Defaults to ./scry2.s2db.
+    /// Path to the .s2db index file. Defaults to ./scry2.s2db. Ignored
+    /// when --socket is set — the daemon owns the index.
     #[arg(long, global = true, default_value = "scry2.s2db")]
     index: PathBuf,
 
+    /// If set, send the query to the `scry2 serve` daemon listening
+    /// on this Unix socket instead of opening the index in-process.
+    /// Eliminates the ~10 ms process-startup + mmap cost per query.
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
+
+    /// Emit machine-readable JSON. Same wire shape the daemon returns.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
-}
-
-/// Path filter applied to xref rows + target symbols. Matches `scry`'s
-/// `--in` / `--not-in` / `--def-in` semantics so muscle memory carries
-/// over.
-///
-/// **What path is matched?** scry2 stores Kythe's `path` field on every
-/// xref — that's the corpus-relative path the indexer emitted (e.g.
-/// `frameworks/base/core/java/android/os/Binder.java`). Substring match
-/// is done against that string. No normalization, no realpath, no
-/// resolving against a `--source-root`. If the corpus uses different
-/// roots for different CUs, those distinctions stay visible.
-#[derive(Debug, Clone, Default)]
-struct PathFilter<'a> {
-    in_:    Option<&'a str>,
-    not_in: Option<&'a str>,
-    def_in: Option<&'a str>,
-}
-
-impl<'a> PathFilter<'a> {
-    fn row_passes(&self, ref_path: &str) -> bool {
-        if let Some(p) = self.not_in { if ref_path.contains(p) { return false; } }
-        if let Some(p) = self.in_    { if !ref_path.contains(p) { return false; } }
-        true
-    }
-    fn sym_passes(&self, ix: &Index, sym: u64) -> bool {
-        let p = match self.def_in { Some(p) => p, None => return true };
-        for (_, _, file, _) in ix.xrefs(sym, role::DECL, role::DEF) {
-            let path = ix.file_path(file).unwrap_or("");
-            if path.contains(p) { return true; }
-        }
-        false
-    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -55,34 +40,19 @@ enum Cmd {
     /// Stats about an index file: row counts, size, sanity check.
     Stat,
 
-    /// Build an .s2db from one or more delimited Kythe `Entry` proto
+    /// Build an .s2db from one or more delimited Kythe Entry proto
     /// streams. Use `-` to read from stdin.
-    ///
-    /// Example: `~/kythe/cxx_indexer some.kzip | scry2 index --entries -`
     Index {
-        /// Files containing the delimited Entry proto streams. Use `-`
-        /// for stdin. Multiple files may be given; they're concatenated
-        /// into one ingestion run with a shared file-id allocator.
-        #[arg(long = "entries", required = true)]
-        entries: Vec<PathBuf>,
-        /// Output `.s2db` path. Defaults to `./scry2.s2db`.
-        #[arg(short, long, default_value = "scry2.s2db")]
-        out: PathBuf,
+        #[arg(long = "entries", required = true)] entries: Vec<PathBuf>,
+        #[arg(short, long, default_value = "scry2.s2db")] out: PathBuf,
     },
 
-    /// `def NAME` — print the definition site (file:offset) of a symbol.
-    /// NAME is a fully-qualified Kythe name (or an alias learned from a
-    /// `/kythe/edge/named` edge), or a substring (use --substr).
+    /// `def NAME` — print the definition site(s) of a symbol.
     Def {
         name: String,
-        /// Match `name` as a substring against any symbol's name.
         #[arg(long)] substr: bool,
-        /// Cap matches when --substr is on.
         #[arg(long, default_value = "16")] limit: usize,
-        /// Restrict results to file paths containing SUBSTR (corpus-
-        /// relative). Substring match against the Kythe path field.
         #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
-        /// Drop results whose file path contains SUBSTR.
         #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
     },
 
@@ -94,8 +64,6 @@ enum Cmd {
         #[arg(long, default_value = "200")] max_hits: usize,
         #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
         #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
-        /// Restrict to symbols whose decl/def file path contains SUBSTR.
-        /// Useful for `ref ClearCallingIdentity --def-in /Binder.java`.
         #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
@@ -110,126 +78,123 @@ enum Cmd {
         #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
-    /// `super NAME` — print direct supertype(s) of a type.
+    /// `super NAME` — direct supertypes (extends / overrides / satisfies).
     Super { name: String },
 
-    /// `sub NAME` — print direct subtype(s) of a type.
+    /// `sub NAME` — direct subtypes.
     Sub { name: String },
 
     /// `callgraph NAME` — transitive walk of the call graph.
-    ///
-    /// `--direction up`   = who-calls-who chains *into* NAME (default)
-    /// `--direction down` = what-does-NAME-call chains *out of* NAME
-    /// `--direction both` = both at once
-    /// `--depth N`        = max hops (default 3)
     Callgraph {
         name: String,
         #[arg(long, value_parser = ["up", "down", "both"], default_value = "up")]
         direction: String,
-        #[arg(long, default_value = "3")]
-        depth: usize,
-        /// Cap distinct syms reported. Stops BFS early if exceeded.
-        #[arg(long, default_value = "200")]
-        max_syms: usize,
+        #[arg(long, default_value = "3")] depth: usize,
+        #[arg(long, default_value = "200")] max_syms: usize,
     },
+
+    /// `serve --socket PATH` — long-lived daemon over a Unix socket.
+    /// For when N unrelated processes share one warm index. Most
+    /// callers want `repl` instead.
+    Serve {
+        /// Socket path. Defaults to a stable per-index path under
+        /// $XDG_RUNTIME_DIR (or /tmp).
+        #[arg(long)] socket: Option<PathBuf>,
+    },
+
+    /// `repl` — stdin/stdout JSON loop. One request per line in, one
+    /// reply per line out. The leanest way for an LLM (or a script)
+    /// to amortize startup across many queries.
+    Repl,
 
     /// `from-kzip` — build an .s2db by running each Kythe indexer
     /// against KZIP and ingesting all entries.
-    ///
-    /// Spawns cxx_indexer, java_indexer.jar, jvm_indexer.jar, go_indexer,
-    /// proto_indexer, textproto_indexer in sequence; each indexer's
-    /// stdout is streamed straight into ingest. Indexers silently skip
-    /// CUs they don't understand; missing indexer binaries are skipped
-    /// with a warning, not an error.
     FromKzip {
-        /// Path to the .kzip to ingest.
         #[arg(long)] kzip: PathBuf,
-        /// Path to a Kythe v0.0.75 release dir — `indexers/<binary>`
-        /// must exist underneath.
         #[arg(long = "kythe-root")] kythe_root: PathBuf,
-        /// Output .s2db.
         #[arg(short, long, default_value = "scry2.s2db")] out: PathBuf,
-        /// Which indexers to run. Default: all. Comma-separated subset
-        /// of: cxx,java,jvm,go,proto,textproto.
         #[arg(long, default_value = "cxx,java,jvm,go,proto,textproto")]
         langs: String,
-        /// JVM heap for java/jvm indexers (e.g. 8g). Default 8g.
         #[arg(long, default_value = "8g")] jvm_heap: String,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Build-side verbs don't go through Reply.
     match cli.cmd {
-        Cmd::Index { entries, out } => cmd_index(&entries, &out),
-        Cmd::Stat => cmd_stat(&Index::open(&cli.index)?),
-        Cmd::Def { name, substr, limit, in_, not_in } => {
-            let f = PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: None };
-            cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, role::DECL, role::DEF, usize::MAX, "def", &f)
-        }
-        Cmd::Ref { name, substr, limit, max_hits, in_, not_in, def_in } => {
-            let f = PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() };
-            cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, 0, u8::MAX, max_hits, "ref", &f)
-        }
-        Cmd::Callers { name, substr, limit, max_hits, in_, not_in, def_in } => {
-            let f = PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() };
-            cmd_xrefs(&Index::open(&cli.index)?, &name, substr, limit, role::CALL, role::CALL, max_hits, "callers", &f)
-        }
-        Cmd::Super { name } => cmd_inherits(&Index::open(&cli.index)?, &name, /*sub=*/false),
-        Cmd::Sub   { name } => cmd_inherits(&Index::open(&cli.index)?, &name, /*sub=*/true),
-        Cmd::Callgraph { name, direction, depth, max_syms } =>
-            cmd_callgraph(&Index::open(&cli.index)?, &name, &direction, depth, max_syms),
+        Cmd::Index { entries, out }  => return cmd_index(&entries, &out),
         Cmd::FromKzip { kzip, kythe_root, out, langs, jvm_heap } =>
-            cmd_from_kzip(&kzip, &kythe_root, &out, &langs, &jvm_heap),
+            return cmd_from_kzip(&kzip, &kythe_root, &out, &langs, &jvm_heap),
+        Cmd::Serve { socket } => {
+            let sock = socket.unwrap_or_else(|| server::default_socket_for(&cli.index));
+            return server::serve(&cli.index, &sock);
+        }
+        Cmd::Repl => return server::repl(&cli.index),
+        _ => {}
     }
+    // Query-side: build a Request, dispatch in-process or via socket.
+    let req = match cli.cmd {
+        Cmd::Stat => Request::Stat,
+        Cmd::Def { name, substr, limit, in_, not_in }
+            => Request::Def { name, substr, limit, in_, not_in },
+        Cmd::Ref { name, substr, limit, max_hits, in_, not_in, def_in }
+            => Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in },
+        Cmd::Callers { name, substr, limit, max_hits, in_, not_in, def_in }
+            => Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in },
+        Cmd::Super { name } => Request::Super { name },
+        Cmd::Sub   { name } => Request::Sub   { name },
+        Cmd::Callgraph { name, direction, depth, max_syms }
+            => Request::Callgraph { name, direction, depth, max_syms },
+        _ => unreachable!(),
+    };
+    let reply: Reply = if let Some(sock) = cli.socket {
+        server::client_call(&sock, &req)?
+    } else {
+        let ix = Index::open(&cli.index)?;
+        server::dispatch(&ix, &req)
+    };
+    emit(&reply, cli.json);
+    Ok(())
 }
 
-fn cmd_callgraph(ix: &Index, name: &str, direction: &str, depth: usize, max_syms: usize) -> Result<()> {
-    let root = match ix.sym_for_name(name) {
-        Some(s) => s,
-        None => { eprintln!("callgraph: no such symbol '{name}'"); return Ok(()); }
-    };
-    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    seen.insert(root);
-    let mut frontier: Vec<u64> = vec![root];
-    let mut total = 0usize;
-    let print_sym = |s: u64| -> String {
-        match ix.sym_meta(s) {
-            Some((n, _, _)) => n.to_string(),
-            None            => format!("<sym {:016x}>", s),
-        }
-    };
-    let go_up   = direction == "up"   || direction == "both";
-    let go_down = direction == "down" || direction == "both";
-
-    for hop in 1..=depth {
-        let mut next: Vec<u64> = Vec::new();
-        for &cur in &frontier {
-            if go_up {
-                for (caller, _) in ix.called_by(cur) {
-                    if seen.insert(caller) {
-                        println!("hop={hop} up   {}  ←  {}", print_sym(caller), print_sym(cur));
-                        next.push(caller);
-                        total += 1;
-                        if total >= max_syms { eprintln!("(callgraph truncated at {max_syms} syms)"); return Ok(()); }
-                    }
-                }
-            }
-            if go_down {
-                for (callee, _) in ix.calls_from(cur) {
-                    if seen.insert(callee) {
-                        println!("hop={hop} down {}  →  {}", print_sym(cur), print_sym(callee));
-                        next.push(callee);
-                        total += 1;
-                        if total >= max_syms { eprintln!("(callgraph truncated at {max_syms} syms)"); return Ok(()); }
-                    }
-                }
-            }
-        }
-        if next.is_empty() { break; }
-        frontier = next;
+fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
+    let mut builder = IndexBuilder::new();
+    let mut file_ids = kythe::FileIdAllocator::default();
+    let t0 = Instant::now();
+    for path in entries {
+        let label = path.display();
+        let stats = if path.as_os_str() == "-" {
+            eprintln!("[index] reading from stdin");
+            kythe::ingest(std::io::stdin().lock(), &mut builder, &mut file_ids)?
+        } else {
+            eprintln!("[index] reading {label}");
+            let f = std::fs::File::open(path)
+                .with_context(|| format!("open {label}"))?;
+            kythe::ingest(f, &mut builder, &mut file_ids)?
+        };
+        eprintln!(
+            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} completes={}",
+            stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
+            stats.inherits_emitted, stats.aliases_emitted, stats.calls_emitted,
+            stats.completes_bridges,
+        );
+        eprintln!(
+            "[index]   {label}: diag bodies={} pending={} unresolved={}",
+            stats.diag_defines_seen, stats.diag_pending, stats.diag_unresolved,
+        );
     }
-    eprintln!("hits={total}");
+    file_ids.drain_into(&mut builder);
+    eprintln!(
+        "[index] writing — xrefs={} syms={} files={} inhs={} calls={}",
+        builder.n_xrefs(), builder.n_syms(), builder.n_files(),
+        builder.n_inh(), builder.n_calls(),
+    );
+    let bytes = builder.finish(out)?;
+    eprintln!(
+        "[index] done in {:.2}s → {} ({:.2} GB)",
+        t0.elapsed().as_secs_f64(), out.display(), bytes as f64 / 1e9,
+    );
     Ok(())
 }
 
@@ -242,8 +207,8 @@ fn cmd_from_kzip(
 ) -> Result<()> {
     use std::process::{Command, Stdio};
     let want: std::collections::HashSet<&str> = langs.split(',').map(|s| s.trim()).collect();
-    let mut builder = scry2::IndexBuilder::new();
-    let mut file_ids = scry2::kythe::FileIdAllocator::default();
+    let mut builder = IndexBuilder::new();
+    let mut file_ids = kythe::FileIdAllocator::default();
     let t0 = Instant::now();
 
     let cxx        = kythe_root.join("indexers/cxx_indexer");
@@ -276,7 +241,6 @@ fn cmd_from_kzip(
     if want.contains("textproto") && textproto.exists() {
         to_run.push(("textproto", make_proto(&textproto, "--")));
     }
-
     if to_run.is_empty() {
         anyhow::bail!("from-kzip: no indexer binaries found under {} for langs={langs}",
             kythe_root.display());
@@ -287,8 +251,6 @@ fn cmd_from_kzip(
         let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
             .with_context(|| format!("spawn {label} indexer"))?;
         let stdout = child.stdout.take().unwrap();
-        // Tolerate truncation: a crashing cxx_indexer must not sink
-        // the multi-language ingest.
         let stats = scry2::kythe::ingest_tolerant(stdout, &mut builder, &mut file_ids, true)?;
         let exit = child.wait()?;
         eprintln!(
@@ -301,7 +263,8 @@ fn cmd_from_kzip(
     file_ids.drain_into(&mut builder);
     eprintln!(
         "[from-kzip] writing — xrefs={} syms={} files={} inhs={} calls={}",
-        builder.n_xrefs(), builder.n_syms(), builder.n_files(), builder.n_inh(), builder.n_calls(),
+        builder.n_xrefs(), builder.n_syms(), builder.n_files(),
+        builder.n_inh(), builder.n_calls(),
     );
     let bytes = builder.finish(out)?;
     eprintln!(
@@ -309,148 +272,4 @@ fn cmd_from_kzip(
         t0.elapsed().as_secs_f64(), out.display(), bytes as f64 / 1e9,
     );
     Ok(())
-}
-
-fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
-    let mut builder = IndexBuilder::new();
-    let mut file_ids = kythe::FileIdAllocator::default();
-    let t0 = Instant::now();
-    for path in entries {
-        let label = path.display();
-        let stats = if path.as_os_str() == "-" {
-            eprintln!("[index] reading from stdin");
-            kythe::ingest(std::io::stdin().lock(), &mut builder, &mut file_ids)?
-        } else {
-            eprintln!("[index] reading {label}");
-            let f = std::fs::File::open(path)
-                .with_context(|| format!("open {label}"))?;
-            kythe::ingest(f, &mut builder, &mut file_ids)?
-        };
-        eprintln!(
-            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} completes={}",
-            stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
-            stats.inherits_emitted, stats.aliases_emitted, stats.calls_emitted,
-            stats.completes_bridges,
-        );
-        eprintln!(
-            "[index]   {label}: diag defines_seen={} childof_seen={} pending={} unresolved={}",
-            stats.diag_defines_seen, stats.diag_childof_seen,
-            stats.diag_pending, stats.diag_unresolved,
-        );
-    }
-    file_ids.drain_into(&mut builder);
-    eprintln!(
-        "[index] writing — xrefs={} syms={} files={} inhs={}",
-        builder.n_xrefs(), builder.n_syms(), builder.n_files(), builder.n_inh(),
-    );
-    let bytes = builder.finish(out)?;
-    eprintln!(
-        "[index] done in {:.2}s → {} ({:.2} GB)",
-        t0.elapsed().as_secs_f64(), out.display(), bytes as f64 / 1e9,
-    );
-    Ok(())
-}
-
-fn cmd_stat(ix: &Index) -> Result<()> {
-    println!("xrefs:  {}", ix.n_xrefs());
-    println!("syms:   {}", ix.n_syms());
-    println!("files:  {}", ix.n_files());
-    println!("inhs:   {}", ix.n_inh());
-    println!("calls:  {}", ix.n_calls());
-    Ok(())
-}
-
-fn cmd_xrefs(
-    ix: &Index, name: &str, substr: bool, name_limit: usize,
-    role_lo: u8, role_hi: u8, max_hits: usize, label: &str,
-    filt: &PathFilter,
-) -> Result<()> {
-    let syms = resolve_syms(ix, name, substr, name_limit);
-    if syms.is_empty() {
-        eprintln!("{label}: no matches for '{name}'");
-        return Ok(());
-    }
-    let mut total = 0usize;
-    for sym in &syms {
-        if !filt.sym_passes(ix, *sym) { continue; }
-        let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", kind::UNK, lang::UNK));
-        let mut header_printed = false;
-        for (_, role, file, off) in ix.xrefs(*sym, role_lo, role_hi) {
-            let path = ix.file_path(file).unwrap_or("?");
-            if !filt.row_passes(path) { continue; }
-            if !header_printed {
-                println!("# {sname}  [{}/{}]", kind_str(knd), lang_str(lng));
-                header_printed = true;
-            }
-            println!("  {} {}@{}", role_str(role), path, off);
-            total += 1;
-            if total >= max_hits {
-                eprintln!("({label} truncated at {max_hits} hits)");
-                return Ok(());
-            }
-        }
-    }
-    eprintln!("hits={}", total);
-    Ok(())
-}
-
-fn cmd_inherits(ix: &Index, name: &str, sub: bool) -> Result<()> {
-    let sym = match ix.sym_for_name(name) {
-        Some(s) => s,
-        None => {
-            eprintln!("no such symbol: '{name}'");
-            return Ok(());
-        }
-    };
-    let related = if sub { ix.inherited_by(sym) } else { ix.inherits_of(sym) };
-    for s in &related {
-        match ix.sym_meta(*s) {
-            Some((n, _, _)) => println!("{n}"),
-            None            => println!("<sym {:016x}>", s),
-        }
-    }
-    eprintln!("hits={}", related.len());
-    Ok(())
-}
-
-fn resolve_syms(ix: &Index, name: &str, substr: bool, limit: usize) -> Vec<u64> {
-    if substr {
-        ix.syms_matching_substring(name, limit)
-    } else if let Some(s) = ix.sym_for_name(name) {
-        vec![s]
-    } else {
-        Vec::new()
-    }
-}
-
-fn role_str(r: u8) -> &'static str {
-    match r {
-        role::DECL => "decl",
-        role::DEF  => "def",
-        role::REF  => "ref",
-        role::CALL => "call",
-        _ => "?",
-    }
-}
-fn kind_str(k: u8) -> &'static str {
-    match k {
-        kind::FUNCTION => "fn",
-        kind::TYPE     => "type",
-        kind::VARIABLE => "var",
-        kind::FIELD    => "field",
-        kind::PACKAGE  => "pkg",
-        _              => "?",
-    }
-}
-fn lang_str(l: u8) -> &'static str {
-    match l {
-        lang::CXX    => "cxx",
-        lang::JAVA   => "java",
-        lang::JVM    => "jvm",
-        lang::GO     => "go",
-        lang::PROTO  => "proto",
-        lang::RUST   => "rust",
-        lang::KOTLIN => "kt",
-        _            => "?",
-    }
 }

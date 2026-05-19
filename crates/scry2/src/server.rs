@@ -1,0 +1,290 @@
+//! Long-lived daemon: opens the .s2db mmap once, listens on a Unix
+//! domain socket, serves line-delimited JSON requests. Clients eat
+//! ~10 ms process-startup once; subsequent queries land in
+//! microseconds.
+//!
+//! ## Protocol
+//!
+//! Both directions are **one JSON object per line** terminated by `\n`.
+//!
+//! Request:
+//! ```json
+//! {"cmd":"def","name":"foo","substr":true,"limit":16,"in":"src/","not_in":"test/","def_in":null}
+//! {"cmd":"ref","name":"foo","substr":false,"limit":16,"max_hits":200, ...}
+//! {"cmd":"callers","name":"foo", ...}
+//! {"cmd":"super","name":"foo"}
+//! {"cmd":"sub","name":"foo"}
+//! {"cmd":"callgraph","name":"foo","direction":"up","depth":3,"max_syms":200}
+//! {"cmd":"stat"}
+//! ```
+//!
+//! Response is one of the `Reply` shapes from `reply.rs`. The wire
+//! shape is exactly what `--json` emits — call sites do not branch.
+
+use crate::format::role;
+use crate::reader::Index;
+use crate::reply::{CallEdge, InhHit, Reply, SymbolGroup, XrefHit,
+                   kind_str, lang_str, role_str};
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+
+/// Wire-format request envelope. One JSON object per request line.
+/// Same shape for the socket daemon and the stdin/stdout REPL.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum Request {
+    Stat,
+    Def { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
+          #[serde(default, rename = "in")]  in_:    Option<String>,
+          #[serde(default)] not_in: Option<String> },
+    Ref { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
+          #[serde(default = "lim_max_hits")] max_hits: usize,
+          #[serde(default, rename = "in")] in_: Option<String>,
+          #[serde(default)] not_in: Option<String>,
+          #[serde(default)] def_in: Option<String> },
+    Callers { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
+              #[serde(default = "lim_max_hits")] max_hits: usize,
+              #[serde(default, rename = "in")] in_: Option<String>,
+              #[serde(default)] not_in: Option<String>,
+              #[serde(default)] def_in: Option<String> },
+    Super { name: String },
+    Sub   { name: String },
+    Callgraph { name: String,
+                #[serde(default = "default_direction")] direction: String,
+                #[serde(default = "default_depth")] depth: usize,
+                #[serde(default = "default_max_syms")] max_syms: usize },
+}
+fn lim16() -> usize { 16 }
+fn lim_max_hits() -> usize { 200 }
+fn default_direction() -> String { "up".into() }
+fn default_depth() -> usize { 3 }
+fn default_max_syms() -> usize { 200 }
+
+/// Run a single request against a borrowed Index and return its Reply.
+/// The pure-function shape means the daemon and the in-process CLI
+/// share one code path.
+pub fn dispatch(ix: &Index, req: &Request) -> Reply {
+    match req {
+        Request::Stat => Reply::Stat {
+            xrefs: ix.n_xrefs(),
+            syms:  ix.n_syms(),
+            files: ix.n_files(),
+            inhs:  ix.n_inh(),
+            calls: ix.n_calls(),
+        },
+        Request::Def { name, substr, limit, in_, not_in } => do_xrefs(
+            ix, name, *substr, *limit, role::DECL, role::DEF, usize::MAX,
+            in_.as_deref(), not_in.as_deref(), None,
+        ),
+        Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
+            ix, name, *substr, *limit, 0, u8::MAX, *max_hits,
+            in_.as_deref(), not_in.as_deref(), def_in.as_deref(),
+        ),
+        Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
+            ix, name, *substr, *limit, role::CALL, role::CALL, *max_hits,
+            in_.as_deref(), not_in.as_deref(), def_in.as_deref(),
+        ),
+        Request::Super { name } => do_inh(ix, name, /*sub=*/false),
+        Request::Sub   { name } => do_inh(ix, name, /*sub=*/true),
+        Request::Callgraph { name, direction, depth, max_syms } =>
+            do_callgraph(ix, name, direction, *depth, *max_syms),
+    }
+}
+
+fn do_xrefs(
+    ix: &Index, name: &str, substr: bool, name_limit: usize,
+    role_lo: u8, role_hi: u8, max_hits: usize,
+    in_: Option<&str>, not_in: Option<&str>, def_in: Option<&str>,
+) -> Reply {
+    let syms: Vec<u64> = if substr {
+        ix.syms_matching_substring(name, name_limit)
+    } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
+    let mut groups: Vec<SymbolGroup> = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    'outer: for sym in &syms {
+        if let Some(p) = def_in {
+            let mut def_ok = false;
+            for (_, _, file, _) in ix.xrefs(*sym, role::DECL, role::DEF) {
+                if let Some(path) = ix.file_path(file) {
+                    if path.contains(p) { def_ok = true; break; }
+                }
+            }
+            if !def_ok { continue; }
+        }
+        let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", 0, 0));
+        let mut rows: Vec<XrefHit> = Vec::new();
+        for (_, r, file, off) in ix.xrefs(*sym, role_lo, role_hi) {
+            let path = ix.file_path(file).unwrap_or("?");
+            if let Some(p) = not_in { if path.contains(p) { continue; } }
+            if let Some(p) = in_    { if !path.contains(p) { continue; } }
+            rows.push(XrefHit { role: role_str(r).to_string(), file: path.to_string(), off });
+            total += 1;
+            if total >= max_hits {
+                truncated = true;
+                groups.push(SymbolGroup {
+                    name: sname.to_string(),
+                    kind: kind_str(knd).to_string(),
+                    lang: lang_str(lng).to_string(),
+                    rows,
+                });
+                break 'outer;
+            }
+        }
+        if !rows.is_empty() {
+            groups.push(SymbolGroup {
+                name: sname.to_string(),
+                kind: kind_str(knd).to_string(),
+                lang: lang_str(lng).to_string(),
+                rows,
+            });
+        }
+    }
+    Reply::Xrefs { groups, total, truncated }
+}
+
+fn do_inh(ix: &Index, name: &str, sub: bool) -> Reply {
+    let Some(sym) = ix.sym_for_name(name) else {
+        return Reply::Inh { hits: Vec::new(), total: 0 };
+    };
+    let related = if sub { ix.inherited_by(sym) } else { ix.inherits_of(sym) };
+    let hits: Vec<InhHit> = related.iter().map(|s| {
+        let name = ix.sym_meta(*s).map(|(n, _, _)| n.to_string())
+            .unwrap_or_else(|| format!("<sym {:016x}>", s));
+        InhHit { name }
+    }).collect();
+    let total = hits.len();
+    Reply::Inh { hits, total }
+}
+
+fn do_callgraph(ix: &Index, name: &str, direction: &str, depth: usize, max_syms: usize) -> Reply {
+    let Some(root) = ix.sym_for_name(name) else {
+        return Reply::Callgraph { edges: Vec::new(), total: 0, truncated: false };
+    };
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    seen.insert(root);
+    let mut frontier: Vec<u64> = vec![root];
+    let mut edges: Vec<CallEdge> = Vec::new();
+    let go_up   = direction == "up"   || direction == "both";
+    let go_down = direction == "down" || direction == "both";
+    let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
+        .unwrap_or_else(|| format!("<sym {:016x}>", s));
+    let mut truncated = false;
+    'depth: for hop in 1..=depth {
+        let mut next: Vec<u64> = Vec::new();
+        for &cur in &frontier {
+            if go_up {
+                for (caller, _) in ix.called_by(cur) {
+                    if seen.insert(caller) {
+                        edges.push(CallEdge { hop, dir: "up".into(),
+                            from: name_of(caller), to: name_of(cur) });
+                        next.push(caller);
+                        if edges.len() >= max_syms { truncated = true; break 'depth; }
+                    }
+                }
+            }
+            if go_down {
+                for (callee, _) in ix.calls_from(cur) {
+                    if seen.insert(callee) {
+                        edges.push(CallEdge { hop, dir: "down".into(),
+                            from: name_of(cur), to: name_of(callee) });
+                        next.push(callee);
+                        if edges.len() >= max_syms { truncated = true; break 'depth; }
+                    }
+                }
+            }
+        }
+        if next.is_empty() { break; }
+        frontier = next;
+    }
+    let total = edges.len();
+    Reply::Callgraph { edges, total, truncated }
+}
+
+/// One request → one reply over a `BufRead` + `Write` pair. Shared by
+/// the Unix-socket daemon and the stdin/stdout REPL.
+fn handle_lines<R: BufRead, W: Write>(mut r: R, mut w: W, ix: &Index) -> Result<()> {
+    let mut line = String::new();
+    while r.read_line(&mut line)? > 0 {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let reply = match serde_json::from_str::<Request>(trimmed) {
+                Ok(req) => dispatch(ix, &req),
+                Err(e)  => Reply::Error { error: format!("bad request: {e}") },
+            };
+            writeln!(w, "{}", serde_json::to_string(&reply)?)?;
+            w.flush()?;
+        }
+        line.clear();
+    }
+    Ok(())
+}
+
+/// Long-lived daemon. Listens on a Unix domain socket, services each
+/// connection's line-delimited JSON requests against one in-process
+/// Index. Sequential (not multi-threaded) on purpose — queries are
+/// microseconds and concurrency would only add complexity.
+pub fn serve(index_path: &Path, socket_path: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(socket_path);
+    let ix = Index::open(index_path)
+        .with_context(|| format!("open index {}", index_path.display()))?;
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("bind {}", socket_path.display()))?;
+    eprintln!("[serve] listening at {} (PID {})",
+              socket_path.display(), std::process::id());
+    for incoming in listener.incoming() {
+        match incoming {
+            Ok(stream) => {
+                let read_side = match stream.try_clone() {
+                    Ok(s) => s, Err(e) => { eprintln!("[serve] clone: {e}"); continue; }
+                };
+                if let Err(e) = handle_lines(BufReader::new(read_side), stream, &ix) {
+                    eprintln!("[serve] connection error: {e}");
+                }
+            }
+            Err(e) => eprintln!("[serve] accept error: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// REPL on stdin/stdout. Same wire shape as `serve` but no socket, no
+/// system-wide state — dies when the parent closes stdin. The most
+/// common scry2 use case (one LLM, many queries) wants this.
+pub fn repl(index_path: &Path) -> Result<()> {
+    let ix = Index::open(index_path)
+        .with_context(|| format!("open index {}", index_path.display()))?;
+    let stdin  = std::io::stdin().lock();
+    let stdout = std::io::stdout().lock();
+    handle_lines(BufReader::new(stdin), stdout, &ix)
+}
+
+/// Client side: send one request, read one reply. Used by the CLI
+/// when `--socket PATH` is set.
+pub fn client_call(socket_path: &Path, req: &Request) -> Result<Reply> {
+    let mut s = UnixStream::connect(socket_path)
+        .with_context(|| format!("connect {}", socket_path.display()))?;
+    let line = serde_json::to_string(req)? + "\n";
+    s.write_all(line.as_bytes())?;
+    s.flush()?;
+    let mut reader = BufReader::new(s);
+    let mut reply = String::new();
+    reader.read_line(&mut reply)?;
+    if reply.trim().is_empty() { return Err(anyhow!("daemon closed connection")); }
+    Ok(serde_json::from_str(reply.trim())?)
+}
+
+/// Resolve the default socket path for `--index FOO.s2db`: a stable
+/// per-index path under `$XDG_RUNTIME_DIR` (or `/tmp`) so two scry2
+/// processes pointing at the same index talk to the same daemon.
+pub fn default_socket_for(index: &Path) -> PathBuf {
+    use std::hash::Hasher;
+    let mut h = twox_hash::XxHash64::with_seed(0xCAFE);
+    h.write(index.as_os_str().as_encoded_bytes());
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(format!("{runtime}/scry2-{:016x}.sock", h.finish()))
+}

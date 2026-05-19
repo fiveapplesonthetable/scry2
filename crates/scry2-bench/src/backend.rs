@@ -1,7 +1,8 @@
 //! Backend trait + drop-cache helper.
 
 use crate::workload::XKey;
-use std::path::PathBuf;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 pub trait Backend {
@@ -31,15 +32,45 @@ pub trait Backend {
     fn point_first(&self, start: &XKey, end: &XKey) -> Result<Option<XKey>>;
 }
 
-/// Drop the kernel page cache. Requires root; otherwise no-op (and the
-/// "cold" phase will be misleadingly fast — we print a warning).
-pub fn drop_caches() {
+/// Evict this backend's on-disk pages from the OS page cache, without
+/// needing root. Walks every regular file under each path and issues
+/// `posix_fadvise(POSIX_FADV_DONTNEED)`. After this returns, subsequent
+/// reads will fault from disk.
+///
+/// We fall back to `/proc/sys/vm/drop_caches` only if root is available;
+/// fadvise is more surgical and doesn't trash unrelated workload state.
+pub fn drop_caches_for(paths: &[PathBuf]) {
     let _ = std::process::Command::new("sync").status();
-    match std::fs::write("/proc/sys/vm/drop_caches", "3") {
-        Ok(_)  => eprintln!("[cache] dropped page cache (root)"),
-        Err(e) => eprintln!("[cache] WARN: could not drop page cache ({}); cold phase is approximate", e),
+    let mut total = 0usize;
+    for p in paths {
+        total += fadvise_dontneed_recursive(p);
     }
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    eprintln!("[cache] posix_fadvise(DONTNEED) on {} files", total);
+    // Tiny pause to let the kernel actually release the pages.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+fn fadvise_dontneed_recursive(p: &Path) -> usize {
+    let md = match std::fs::metadata(p) { Ok(m) => m, Err(_) => return 0 };
+    if md.is_file() {
+        if let Ok(f) = std::fs::File::open(p) {
+            unsafe {
+                let _ = libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+            return 1;
+        }
+        return 0;
+    }
+    if md.is_dir() {
+        let mut n = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for ent in rd.flatten() {
+                n += fadvise_dontneed_recursive(&ent.path());
+            }
+        }
+        return n;
+    }
+    0
 }
 
 pub fn du(paths: &[PathBuf]) -> u64 {

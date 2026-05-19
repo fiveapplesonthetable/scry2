@@ -3,7 +3,7 @@
 use crate::backend::Backend;
 use crate::workload::XKey;
 use anyhow::{Context, Result};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, TableDefinition};
 use std::path::PathBuf;
 
 const XREFS: TableDefinition<&[u8], ()> = TableDefinition::new("xrefs");

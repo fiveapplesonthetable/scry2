@@ -22,7 +22,7 @@ mod stats;
 mod workload;
 
 use anyhow::Result;
-use backend::{Backend, drop_caches, du};
+use backend::{Backend, drop_caches_for, du};
 use stats::{IoSnapshot, LatencyReport, fmt_bytes, print_io_delta};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -87,7 +87,7 @@ fn run_backend(mut be: Box<dyn Backend>, rows: &[XKey], plan: &QueryPlan) -> Res
 
     // -- Reopen + drop caches: cold phase needs the OS page cache empty --
     be.reopen_readonly()?;
-    drop_caches();
+    drop_caches_for(&be.paths());
 
     // -- COLD prefix (role=Call) --
     let mut lats = Vec::with_capacity(plan.prefix_role_call.len());

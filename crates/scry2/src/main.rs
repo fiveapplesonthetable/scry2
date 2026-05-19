@@ -229,6 +229,21 @@ enum Cmd {
         /// (JVM-based indexers carry a 200-300 MB working set, so we
         /// cap to avoid OOM on big runs).
         #[arg(long, default_value = "0")] workers: usize,
+        /// Prepend an extra javac/clang arg to any CU whose primary
+        /// path starts with PREFIX. Repeatable. Format: `PREFIX::ARG`.
+        /// The `::` is the separator (path prefixes don't contain it;
+        /// indexer args may contain single `:` so we use a doubled
+        /// form).
+        ///
+        /// Example (AOSP libcore needs --patch-module=java.base to
+        /// index ojluni files — the base of java.base):
+        ///   --inject-cu-arg 'libcore/ojluni/src/main/java/::--patch-module=java.base=libcore/ojluni/src/main/java'
+        ///
+        /// Skip if the rule's ARG already appears in the CU's argv.
+        /// See `scripts/aosp-from-kzip.sh` for an AOSP-shaped wrapper
+        /// that emits the right rule set for a Soong out/ tree.
+        #[arg(long = "inject-cu-arg", value_name = "PREFIX::ARG")]
+        inject_cu_args: Vec<String>,
     },
 }
 
@@ -239,13 +254,16 @@ fn main() -> Result<()> {
         Cmd::Index { entries, out }  => return cmd_index(&entries, &out),
         Cmd::NormalizeKzip { in_, out } => return cmd_normalize_kzip(&in_, &out),
         Cmd::FromKzip { kzip, kythe_root, out, langs, jvm_heap,
-                        in_, not_in, staging, workers } =>
+                        in_, not_in, staging, workers, inject_cu_args } => {
+            let rules = parse_inject_rules(&inject_cu_args)?;
             return cmd_from_kzip(FromKzipArgs {
                 kzip: &kzip, kythe_root: &kythe_root, out: &out,
                 langs: &langs, jvm_heap: &jvm_heap,
                 in_: &in_, not_in: &not_in,
                 staging: staging.as_deref(), workers,
-            }),
+                inject_rules: &rules,
+            });
+        }
         Cmd::Serve { socket } => {
             let sock = socket.unwrap_or_else(|| server::default_socket_for(&cli.index));
             return server::serve(&cli.index, &sock);
@@ -429,15 +447,48 @@ fn lang_label(k: IndexerKind) -> &'static str {
 /// Bundled args — keeps `cmd_from_kzip` under the clippy threshold
 /// for arg count without losing call-site clarity.
 struct FromKzipArgs<'a> {
-    kzip:       &'a std::path::Path,
-    kythe_root: &'a std::path::Path,
-    out:        &'a std::path::Path,
-    langs:      &'a str,
-    jvm_heap:   &'a str,
-    in_:        &'a [String],
-    not_in:     &'a [String],
-    staging:    Option<&'a std::path::Path>,
-    workers:    usize,
+    kzip:         &'a std::path::Path,
+    kythe_root:   &'a std::path::Path,
+    out:          &'a std::path::Path,
+    langs:        &'a str,
+    jvm_heap:     &'a str,
+    in_:          &'a [String],
+    not_in:       &'a [String],
+    staging:      Option<&'a std::path::Path>,
+    workers:      usize,
+    inject_rules: &'a [InjectRule],
+}
+
+/// One `--inject-cu-arg` rule: when a CU's primary path starts with
+/// `path_prefix`, prepend `arg` to its compiler argv. Multiple rules
+/// stack; each rule fires independently. `arg` is matched against
+/// existing argv strings byte-for-byte and skipped if already present
+/// (so the wrapper script can be safely re-run on already-augmented
+/// kzips).
+#[derive(Debug, Clone)]
+struct InjectRule {
+    path_prefix: String,
+    arg:         String,
+}
+
+/// Parse `--inject-cu-arg PREFIX::ARG` flags into structured rules.
+/// Splits on the FIRST `::`. PREFIX and ARG are both required and
+/// non-empty; malformed input is rejected with a clear error so the
+/// user finds the typo instead of having the rule silently no-op.
+fn parse_inject_rules(raw: &[String]) -> Result<Vec<InjectRule>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for r in raw {
+        let (p, a) = r.split_once("::").ok_or_else(|| anyhow::anyhow!(
+            "--inject-cu-arg: missing `::` separator in {r:?}; expected PREFIX::ARG"))?;
+        if p.is_empty() {
+            anyhow::bail!("--inject-cu-arg: empty PREFIX in {r:?}");
+        }
+        if a.is_empty() {
+            anyhow::bail!("--inject-cu-arg: empty ARG in {r:?}");
+        }
+        out.push(InjectRule { path_prefix: p.into(), arg: a.into() });
+    }
+    Ok(out)
 }
 
 fn build_indexer_command(
@@ -568,89 +619,157 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     } else { args.workers };
     eprintln!("[from-kzip] workers: {workers}");
 
-    let mut builder = IndexBuilder::new();
-    let mut file_ids = kythe::FileIdAllocator::default();
-    let mut by_lang: std::collections::HashMap<&'static str, LangStats> =
-        std::collections::HashMap::new();
+    // Shared state for parallel workers. The IndexBuilder is the
+    // single sink for ingested entries — workers serialize on it for
+    // the ~50-100 ms it takes to fold one CU's stream, while the
+    // expensive bit (the indexer subprocess) runs concurrently.
+    let builder_mu  = std::sync::Mutex::new(IndexBuilder::new());
+    let file_ids_mu = std::sync::Mutex::new(kythe::FileIdAllocator::default());
+    let by_lang_mu: std::sync::Mutex<std::collections::HashMap<&'static str, LangStats>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
+    // Atomic progress counter so workers can report a coherent
+    // completed-CU count.
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let progress_mu = std::sync::Mutex::new(CliProgress::new("from-kzip"));
 
-    // Sequential per-CU dispatch with one reusable SubKzipWriter
-    // (opens the source kzip once and reads each CU's blobs on demand).
-    // Parallelism is deferred — sequential at ~1-3s/CU is already
-    // bounded by the indexer subprocess; the gain from N workers
-    // shows up after we add a thread pool that shares one
-    // SubKzipWriter and one IndexBuilder behind a Mutex (v0.2).
-    let _ = workers; // reserved for v0.2 parallelism
-    let mut extractor = kzip::SubKzipWriter::open(args.kzip)?;
-    let mut progress = CliProgress::new("from-kzip");
-    for (i, (kind, unit)) in plan.iter().enumerate() {
-        let label = lang_label(*kind);
-        let stats = by_lang.entry(label).or_default();
-        let sub_path = staging.join(format!("{}.kzip", unit.sha));
-        // Reusable JVM temp dir per CU — java_indexer needs writable
-        // dir to unpack JDK system modules from --system <jdk_image>.
-        let jvm_tmp = staging.join(format!("{}.jvmtmp", unit.sha));
-        if matches!(kind, IndexerKind::JavaSource | IndexerKind::JvmBytecode) {
-            std::fs::create_dir_all(&jvm_tmp)?;
-        }
-        // Build sub-kzip.
-        if let Err(e) = extractor.extract(unit, &sub_path) {
-            stats.failed += 1;
-            stats.fail_tails.push(format!("sha={} extract: {e:#}", unit.sha));
-            continue;
-        }
-        // Spawn indexer.
-        let mut cmd = build_indexer_command(*kind, args.kythe_root, &sub_path,
-                                            args.jvm_heap, &jvm_tmp)?;
-        let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                stats.failed += 1;
-                stats.fail_tails.push(format!("sha={} spawn: {e:#}", unit.sha));
-                let _ = std::fs::remove_file(&sub_path);
-                let _ = std::fs::remove_dir_all(&jvm_tmp);
-                continue;
-            }
-        };
-        // Drain stderr in a thread to avoid blocking the indexer on
-        // its stderr pipe when we're sinking stdout into ingest.
-        let stderr_h = child.stderr.take().unwrap();
-        let stderr_thread = std::thread::spawn(move || drain_tail(stderr_h, STDERR_TAIL_BYTES));
-        let stdout_h = child.stdout.take().unwrap();
+    // Split the plan into N work shards by index. Static partition
+    // is simpler than a work-stealing queue and load-balances well
+    // because CU runtime is fairly uniform within a language family.
+    let n_workers = workers;
+    let plan_ref = &plan;
+    std::thread::scope(|s| -> Result<()> {
+        let mut handles = Vec::with_capacity(n_workers);
+        for w_id in 0..n_workers {
+            let staging = staging.clone();
+            let inject_rules = args.inject_rules;
+            let kythe_root = args.kythe_root;
+            let jvm_heap = args.jvm_heap.to_string();
+            let builder_mu  = &builder_mu;
+            let file_ids_mu = &file_ids_mu;
+            let by_lang_mu  = &by_lang_mu;
+            let done = &done;
+            let progress_mu = &progress_mu;
+            let plan_len = plan_ref.len();
+            let kzip_path = args.kzip;
+            handles.push(s.spawn(move || -> Result<()> {
+                let mut extractor = kzip::SubKzipWriter::open(kzip_path)?;
+                let mut i = w_id;
+                while i < plan_len {
+                    let (kind, unit) = plan_ref[i];
+                    let label = lang_label(kind);
+                    let sub_path = staging.join(format!("{}.kzip", unit.sha));
+                    let jvm_tmp = staging.join(format!("{}.jvmtmp", unit.sha));
+                    if matches!(kind, IndexerKind::JavaSource | IndexerKind::JvmBytecode) {
+                        std::fs::create_dir_all(&jvm_tmp)?;
+                    }
+                    let primary = unit.primary_path().unwrap_or("");
+                    let matching: Vec<&str> = inject_rules.iter()
+                        .filter(|r| primary.starts_with(&r.path_prefix))
+                        .map(|r| r.arg.as_str())
+                        .collect();
+                    let extract_res = if matching.is_empty() {
+                        extractor.extract(unit, &sub_path)
+                    } else {
+                        extractor.extract_with(unit, &sub_path, |cu| {
+                            for &a in matching.iter().rev() {
+                                if !cu.argument.iter().any(|existing| existing == a) {
+                                    cu.argument.insert(0, a.to_string());
+                                }
+                            }
+                        })
+                    };
+                    if let Err(e) = extract_res {
+                        let mut by_lang = by_lang_mu.lock().unwrap();
+                        let stats = by_lang.entry(label).or_default();
+                        stats.failed += 1;
+                        if stats.fail_tails.len() < MAX_FAIL_TAILS {
+                            stats.fail_tails.push(format!("sha={} extract: {e:#}", unit.sha));
+                        }
+                        i += n_workers;
+                        continue;
+                    }
+                    let mut cmd = build_indexer_command(kind, kythe_root, &sub_path,
+                                                       &jvm_heap, &jvm_tmp)?;
+                    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let mut by_lang = by_lang_mu.lock().unwrap();
+                            let stats = by_lang.entry(label).or_default();
+                            stats.failed += 1;
+                            if stats.fail_tails.len() < MAX_FAIL_TAILS {
+                                stats.fail_tails.push(format!("sha={} spawn: {e:#}", unit.sha));
+                            }
+                            let _ = std::fs::remove_file(&sub_path);
+                            let _ = std::fs::remove_dir_all(&jvm_tmp);
+                            i += n_workers;
+                            continue;
+                        }
+                    };
+                    let stderr_h = child.stderr.take().unwrap();
+                    let stderr_thread = std::thread::spawn(move || drain_tail(stderr_h, STDERR_TAIL_BYTES));
+                    let stdout_h = child.stdout.take().unwrap();
+                    let cu_t0 = Instant::now();
+                    // Lock the shared builder for the duration of
+                    // this CU's stream. The indexer subprocess writes
+                    // a few hundred MB max for a typical CU; ingesting
+                    // it is bounded by stream parse speed (~hundreds
+                    // of MB/s), not the indexer subprocess. Other
+                    // workers' subprocesses keep running while we hold
+                    // the lock.
+                    let cu_stats = {
+                        let mut builder  = builder_mu.lock().unwrap();
+                        let mut file_ids = file_ids_mu.lock().unwrap();
+                        scry2::kythe::ingest_tolerant(stdout_h, &mut builder, &mut file_ids, true)?
+                    };
+                    let status = child.wait()?;
+                    let stderr_tail = stderr_thread.join().unwrap_or_default();
+                    let _ = std::fs::remove_file(&sub_path);
+                    let _ = std::fs::remove_dir_all(&jvm_tmp);
 
-        let cu_t0 = Instant::now();
-        let cu_stats = scry2::kythe::ingest_tolerant(stdout_h, &mut builder, &mut file_ids, true)?;
-        let status = child.wait()?;
-        let stderr_tail = stderr_thread.join().unwrap_or_default();
-        let _ = std::fs::remove_file(&sub_path);
-        let _ = std::fs::remove_dir_all(&jvm_tmp);
-
-        stats.cus += 1;
-        stats.entries  += cu_stats.entries;
-        stats.anchors  += cu_stats.anchors_flushed;
-        stats.xrefs    += cu_stats.xrefs_emitted;
-        stats.inherits += cu_stats.inherits_emitted;
-        stats.aliases  += cu_stats.aliases_emitted;
-        stats.calls    += cu_stats.calls_emitted;
-        let ok = status.success();
-        let any = cu_stats.entries > 0;
-        match (ok, any) {
-            (true,  true)  => stats.succeeded += 1,
-            (true,  false) => stats.empty     += 1,
-            (false, _)     => {
-                stats.failed += 1;
-                if stats.fail_tails.len() < MAX_FAIL_TAILS {
-                    let tail = String::from_utf8_lossy(&stderr_tail).into_owned();
-                    stats.fail_tails.push(format!(
-                        "sha={} exit={:?} wall={:.1}s\n{}",
-                        unit.sha, status.code(),
-                        cu_t0.elapsed().as_secs_f64(),
-                        tail.trim(),
-                    ));
+                    {
+                        let mut by_lang = by_lang_mu.lock().unwrap();
+                        let stats = by_lang.entry(label).or_default();
+                        stats.cus += 1;
+                        stats.entries  += cu_stats.entries;
+                        stats.anchors  += cu_stats.anchors_flushed;
+                        stats.xrefs    += cu_stats.xrefs_emitted;
+                        stats.inherits += cu_stats.inherits_emitted;
+                        stats.aliases  += cu_stats.aliases_emitted;
+                        stats.calls    += cu_stats.calls_emitted;
+                        let ok = status.success();
+                        let any = cu_stats.entries > 0;
+                        match (ok, any) {
+                            (true,  true)  => stats.succeeded += 1,
+                            (true,  false) => stats.empty     += 1,
+                            (false, _)     => {
+                                stats.failed += 1;
+                                if stats.fail_tails.len() < MAX_FAIL_TAILS {
+                                    let tail = String::from_utf8_lossy(&stderr_tail).into_owned();
+                                    stats.fail_tails.push(format!(
+                                        "sha={} exit={:?} wall={:.1}s\n{}",
+                                        unit.sha, status.code(),
+                                        cu_t0.elapsed().as_secs_f64(), tail.trim(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    progress_mu.lock().unwrap().report("index", n, plan_len);
+                    i += n_workers;
                 }
-            }
+                Ok(())
+            }));
         }
-        progress.report("index", i + 1, plan.len());
-    }
+        for h in handles {
+            h.join().map_err(|_| anyhow::anyhow!("worker thread panicked"))??;
+        }
+        Ok(())
+    })?;
+
+    let mut builder = builder_mu.into_inner().unwrap();
+    let file_ids    = file_ids_mu.into_inner().unwrap();
+    let by_lang     = by_lang_mu.into_inner().unwrap();
 
     // Report per-language summary + first failure tails.
     for (label, s) in &by_lang {
@@ -716,6 +835,37 @@ mod tests {
     use std::path::PathBuf;
 
     fn h(s: &str) -> Option<&OsStr> { Some(OsStr::new(s)) }
+
+    use super::parse_inject_rules;
+
+    #[test]
+    fn inject_rules_basic() {
+        let rules = parse_inject_rules(&[
+            "libcore/ojluni/src/main/java/::--patch-module=java.base=libcore/ojluni/src/main/java".into(),
+        ]).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].path_prefix, "libcore/ojluni/src/main/java/");
+        assert_eq!(rules[0].arg, "--patch-module=java.base=libcore/ojluni/src/main/java");
+    }
+
+    #[test]
+    fn inject_rules_first_double_colon_splits() {
+        // ARG may contain single `:` (e.g. `-J:option`); only the
+        // FIRST `::` is the separator.
+        let rules = parse_inject_rules(&["foo/::-Djava.opts=key:value".into()]).unwrap();
+        assert_eq!(rules[0].path_prefix, "foo/");
+        assert_eq!(rules[0].arg, "-Djava.opts=key:value");
+    }
+
+    #[test]
+    fn inject_rules_reject_malformed() {
+        // Missing separator.
+        assert!(parse_inject_rules(&["nope".into()]).is_err());
+        // Empty PREFIX.
+        assert!(parse_inject_rules(&["::-something".into()]).is_err());
+        // Empty ARG.
+        assert!(parse_inject_rules(&["prefix/::".into()]).is_err());
+    }
 
     #[test]
     fn no_tilde_is_passthrough() {

@@ -318,6 +318,19 @@ impl SubKzipWriter {
     /// reference compiler-builtin paths that aren't in the kzip; those
     /// are skipped silently, matching `write_normalized`).
     pub fn extract(&mut self, unit: &Unit, dst: &Path) -> Result<usize> {
+        self.extract_with(unit, dst, |_| {})
+    }
+
+    /// Same as [`extract`] but applies `transform` to the
+    /// `IndexedCompilation` before emitting the pbunit, letting the
+    /// caller mutate per-CU args / source_file / etc. (e.g. inject a
+    /// `--patch-module=java.base=…` for libcore CUs). When the
+    /// transform mutates the unit, we re-encode from the decoded
+    /// struct so changes actually land in the sub-kzip; otherwise we
+    /// preserve the raw bytes verbatim.
+    pub fn extract_with<F: FnOnce(&mut CompilationUnit)>(
+        &mut self, unit: &Unit, dst: &Path, transform: F,
+    ) -> Result<usize> {
         let out_f = File::create(dst).with_context(|| format!("create {}", dst.display()))?;
         let mut zout = zip::ZipWriter::new(BufWriter::with_capacity(1 << 20, out_f));
         let opts = zip::write::FileOptions::default()
@@ -326,7 +339,17 @@ impl SubKzipWriter {
         zout.add_directory("root/pbunits/", opts)?;
         zout.add_directory("root/files/", opts)?;
         zout.start_file(format!("root/pbunits/{}", unit.sha), opts)?;
-        zout.write_all(&unit.to_proto_bytes())?;
+        // Snapshot args BEFORE/AFTER transform to detect actual mutation
+        // — if the transform was a no-op we can keep raw_proto.
+        let mut cu = unit.cu.unit.clone();
+        let before = cu.argument.clone();
+        transform(&mut cu);
+        if let (true, Some(raw)) = (cu.argument == before, unit.raw_proto.as_ref()) {
+            zout.write_all(raw)?;
+        } else {
+            let ic = IndexedCompilation { unit: cu };
+            zout.write_all(&encode_indexed_compilation(&ic))?;
+        }
         let mut copied = 0;
         let mut seen: HashSet<&str> = HashSet::new();
         for fi in &unit.cu.unit.required_input {

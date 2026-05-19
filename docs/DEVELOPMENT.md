@@ -231,6 +231,121 @@ scry2 from-kzip ... --langs java,jvm -o aosp-jvm.s2db
 written first, fsynced, then renamed. A crash mid-build leaves the
 old index untouched.
 
+### Per-CU dispatch and CU-arg rewriting
+
+`from-kzip` does NOT run each indexer once against the whole kzip.
+Stock `cxx_indexer` segfaults mid-iteration on the first CU whose
+argv contains a flag Clang's frontend rejects (e.g. AOSP's
+soong-generated `-compiler ...`), and that crash takes the entire
+batch down. Java/JVM indexers behave better but still drop coverage
+when one CU fails — they emit zero entries for everything after the
+failure and exit 0 silently.
+
+Instead the orchestrator:
+
+1. Decodes every unit out of the source kzip.
+2. Filters by `--in` / `--not-in` against the unit's primary path
+   (`source_file[0]` or `required_input[0].path`).
+3. Routes each surviving CU by `v_name.language`:
+   `c++→cxx_indexer`, `java→java_indexer.jar`,
+   `jvm→jvm_indexer.jar`, `go→go_indexer`,
+   `protobuf→proto_indexer`, `textproto→textproto_indexer`.
+4. For each CU, calls `kzip::SubKzipWriter::extract` to build a
+   tiny single-CU sub-kzip under `--staging` (`$SCRY_TMP_DIR` or
+   `/mnt/agent/tmp` by default), then spawns the right indexer
+   against it. One bad CU no longer kills the run; its failure
+   stderr tail is captured in the per-language summary.
+5. The driver streams the indexer's stdout through `ingest_tolerant`
+   into a shared `IndexBuilder`, drains the child's stderr tail in
+   a thread (avoiding pipe-fill blocks on chatty CUs), then deletes
+   the sub-kzip + per-CU JVM temp dir.
+
+### Indexer-specific argv requirements
+
+The Kythe v0.0.75 indexers each have an idiosyncratic invocation
+shape. Mismatched argv produces silent zero-entry runs more often
+than hard errors, so the orchestrator handles each shape explicitly
+(see `build_indexer_command` in `crates/scry2/src/main.rs`):
+
+* **`cxx_indexer <kzip>`** — positional kzip; emits Entry protos
+  to stdout. No flags needed when the kzip's `argument` is well-
+  formed Clang. Stock AOSP kzips occasionally carry Soong-side
+  flags Clang rejects; per-CU dispatch isolates those failures.
+* **`java -Xmx<heap> -jar java_indexer.jar --ignore_empty_kzip
+  --temp_directory <dir> <kzip>`** — the `--temp_directory` flag is
+  mandatory whenever the CU's javac args carry
+  `--system <jdk_image>` (every modern AOSP build does). Without it
+  `CompilationUnitPathFileManager.setSystemOption` raises
+  `IllegalArgumentException` and the indexer silently emits zero
+  entries (exit 0). We allocate one temp dir per CU under
+  `--staging` so cleanup is bounded.
+* **`java -Xmx<heap> -jar jvm_indexer.jar --ignore_empty_kzip
+  --temp_directory <dir> <kzip>`** — same argv shape as
+  java_indexer; reads class-file CUs instead of source.
+* **`go_indexer <kzip>`** — positional kzip.
+* **`proto_indexer -index_file=<kzip>`** — single-dash gflags.
+* **`textproto_indexer --index_file=<kzip>`** — double-dash flags.
+
+`--jvm-heap` sizes the `-Xmx` for both java and jvm indexers. AOSP's
+services.core / framework batches blow past 2g building javac line
+maps; 8g handles every observed AOSP CU; 12-16g for pathological
+template-heavy units.
+
+### CU-arg injection (`--inject-cu-arg`)
+
+Some kzip CUs need a compiler flag the extractor didn't capture —
+the indexer otherwise silently emits zero entries or fails with a
+javac error. Rather than hard-code corpus-specific knowledge in the
+scry2 binary, `from-kzip` accepts a repeatable
+`--inject-cu-arg PREFIX::ARG` flag: any CU whose primary source path
+starts with `PREFIX` gets `ARG` prepended to its compiler argv. The
+flag is generic; corpus-specific rules live in wrapper scripts.
+
+The most common AOSP-specific need is the **libcore quirk**: files
+under `libcore/ojluni/src/main/java/java/` are Android's
+implementation of the JDK's `java.base` module. Soong builds these
+with `--patch-module=java.base=libcore/ojluni/src/main/java` when
+emitting real java.base targets, but the `core-all-system-modules`
+build variant whose CUs ship in AOSP's `aosp.kzip` omits the flag.
+Without `--patch-module` javac sees the `--system <jdk_image>` JDK
+already declaring `java.lang.String` and friends and rejects each
+AOSP source file as a redefinition (`CompletionFailure: class file
+for java.lang.String not found`).
+
+`scripts/aosp-from-kzip.sh` is the AOSP-shaped wrapper. It reads
+`$ANDROID_BUILD_TOP` (the AOSP checkout root) from the environment
+and emits the right `--inject-cu-arg` rules before forwarding the
+rest of the argv to `scry2 from-kzip`:
+
+```bash
+export ANDROID_BUILD_TOP=/aosp
+./scripts/aosp-from-kzip.sh /aosp/out/dist/aosp.kzip \
+    --in frameworks/base,frameworks/native,system/,art/,libcore/ \
+    -o /var/scry2/aosp-core.s2db
+```
+
+Equivalently, with explicit `--inject-cu-arg`:
+
+```bash
+scry2 from-kzip \
+    --kzip /aosp/out/dist/aosp.kzip \
+    --kythe-root ~/scry2-setup/kythe-v0.0.75 \
+    --inject-cu-arg 'libcore/ojluni/src/main/java/::--patch-module=java.base=libcore/ojluni/src/main/java' \
+    --in frameworks/base,frameworks/native,system/,art/,libcore/ \
+    -o /var/scry2/aosp-core.s2db
+```
+
+Implementation note: when a rule matches, the orchestrator clones
+the `CompilationUnit`, prepends the missing flags via
+`SubKzipWriter::extract_with`, drops the raw-proto cache so changes
+actually land, and re-encodes the pbunit. CUs with no matching rule
+take the fast path — raw proto bytes pass through verbatim.
+
+If you find another patched-module / extra-flag quirk (e.g.
+`art/runtime/openjdkjvmti/` needing `--patch-module=jdk.internal.vm.compiler=…`),
+add another `--inject-cu-arg` line to `scripts/aosp-from-kzip.sh` —
+no scry2 code change required.
+
 ## Code style — what the reviewer will flag
 
 * Default to **no comments**. Add only when WHY isn't obvious — never

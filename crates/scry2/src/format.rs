@@ -1,7 +1,7 @@
 //! Wire format for an `.s2db` index file. The whole thing is one mmap.
 //!
-//! Layout — every section is page-aligned (4 KB) so the kernel can map
-//! it with `MADV_RANDOM` independently:
+//! Layout — every section is page-aligned (4 KB) so each can be faulted
+//! in independently:
 //!
 //! ```text
 //!   +-- offset 0 --------------------------+
@@ -9,21 +9,28 @@
 //!   +-- align 4 KB ------------------------+
 //!   | xrefs[n_xrefs]    (17 B each)        |  sorted by (sym, role, file, offset)
 //!   +-- align 4 KB ------------------------+
-//!   | syms[n_syms]      (16 B each)        |  sorted by sym
+//!   | syms[n_syms]      (20 B each)        |  sorted by sym
 //!   +-- align 4 KB ------------------------+
-//!   | names_by_sort[n_syms] (16 B each)    |  sorted by name (alpha)
+//!   | names[n_names]    (18 B each)        |  sorted by name bytes (alpha), then sym
 //!   +-- align 4 KB ------------------------+
-//!   | files[n_files]    (10 B each)        |  sorted by file_id
+//!   | files[n_files]    (14 B each)        |  sorted by file_id
 //!   +-- align 4 KB ------------------------+
 //!   | inherits[n_inh]   (16 B each)        |  sorted by (child, parent)
 //!   +-- align 4 KB ------------------------+
-//!   | blob (UTF-8 strings, no separators)  |  referenced by (off, len)
+//!   | calls[n_calls]    (17 B each)        |  sorted by (caller, callee, role)
+//!   +-- align 4 KB ------------------------+
+//!   | crev[n_calls]     (17 B each)        |  same rows sorted by callee
+//!   +-- align 4 KB ------------------------+
+//!   | blob (UTF-8 strings, no separators)  |  referenced by (u64 off, u16 len)
 //!   +--------------------------------------+
 //! ```
 //!
-//! All multi-byte integers are stored LE (host order). The mmap reader
-//! does zero parsing — it casts byte slices to fixed-width record structs
-//! and bsearches by raw byte compare on the BE-packed primary key.
+//! Row KEYS are stored big-endian-packed, so a raw byte compare (`memcmp`)
+//! equals the logical sort order — that's what makes every lookup a plain
+//! binary search over a cast byte slice with zero parsing. The only
+//! host-endian structure is the 256-byte Header (so the file is not
+//! portable across BE/LE hosts, which is fine in practice). Blob offsets
+//! are u64: the names+paths blob exceeds 4 GiB on a full corpus.
 
 use std::mem::size_of;
 

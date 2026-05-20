@@ -173,6 +173,61 @@ mod tests {
     }
 
     #[test]
+    fn merge_refines_unk_kind_regardless_of_order() {
+        // A sym referenced (kind::UNK) in one CU and defined (FUNCTION)
+        // in another must end up FUNCTION no matter which sink drains
+        // first — otherwise `def`/stat shows kind "?" and `index` vs
+        // `from-kzip` diverge.
+        let s = sym_of("kythe:c++:test###refine");
+        for unk_first in [true, false] {
+            let path = tmp(if unk_first { "refine-unk-first" } else { "refine-def-first" });
+            let mut referenced = IndexBuilder::new();
+            referenced.upsert_sym(s, kind::UNK, lang::UNK, "");
+            let mut defined = IndexBuilder::new();
+            defined.upsert_sym(s, kind::FUNCTION, lang::CXX, "ns::fn");
+            let mut acc = IndexBuilder::new();
+            if unk_first {
+                acc.merge_from(referenced);
+                acc.merge_from(defined);
+            } else {
+                acc.merge_from(defined);
+                acc.merge_from(referenced);
+            }
+            acc.finish(&path).unwrap();
+            let ix = Index::open(&path).unwrap();
+            let (name, k, l) = ix.sym_meta(s).unwrap();
+            assert_eq!(k, kind::FUNCTION, "unk_first={unk_first}");
+            assert_eq!(l, lang::CXX, "unk_first={unk_first}");
+            assert_eq!(name, "ns::fn", "unk_first={unk_first}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn name_index_tie_breaks_equal_names_by_sym() {
+        // Two distinct syms with an identical qualified name must land in
+        // the alphabetical index in a deterministic order (ascending sym),
+        // not whatever the sort happened to leave — otherwise the same
+        // name query can resolve differently across builds.
+        let path = tmp("name-tiebreak");
+        let lo = sym_of("kythe:c++:test###aaa");
+        let hi = sym_of("kythe:c++:test###zzz");
+        let (lo, hi) = (lo.min(hi), lo.max(hi));
+        let mut b = IndexBuilder::new();
+        // Insert high-id first so insertion order can't accidentally pass.
+        b.upsert_sym(hi, kind::FUNCTION, lang::CXX, "dup::name");
+        b.upsert_sym(lo, kind::FUNCTION, lang::CXX, "dup::name");
+        b.add_xref(lo, role::DECL, 1, 1);
+        b.add_xref(hi, role::DECL, 1, 2);
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+        let syms: Vec<u64> = ix.names_with_prefix("dup::name", 10)
+            .into_iter().map(|(_, s)| s).collect();
+        assert_eq!(syms, vec![lo, hi]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn snapshot_then_resume_round_trips_all_rows() {
         // Populate a builder, snapshot to disk, open the snapshot as
         // an Index, replay it into a FRESH builder, then finish and

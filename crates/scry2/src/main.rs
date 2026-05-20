@@ -999,22 +999,29 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                 let mut extractor = kzip::SubKzipWriter::open(kzip_path)?;
                 let mut i = w_id;
                 while i < plan_len {
-                    // Park while a snapshot merge is running. Finishing
-                    // the current CU and then idling here (rather than
-                    // spawning the next indexer) lets the in-flight
-                    // subprocesses drain and frees their RSS, so the
-                    // snapshotter merges in a near-empty machine. 100 ms
-                    // granularity is irrelevant against minutes-long
-                    // merges.
-                    while snap_active_ref.load(std::sync::atomic::Ordering::Acquire) {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    // Register this CU as in-flight, then re-check the
+                    // snapshot gate — order matters. If we checked first
+                    // and incremented second, a snapshot starting in the
+                    // gap would miss us in `active_cus`, finish its quiesce
+                    // wait, and merge while we spawn a fresh indexer
+                    // (RAM-bound overshoot). Incrementing first means a
+                    // racing snapshot always sees us and waits; if the gate
+                    // is already up we back out and park. Finishing the
+                    // current CU then idling here (rather than spawning the
+                    // next indexer) lets the in-flight subprocesses drain
+                    // and frees their RSS, so the snapshotter merges in a
+                    // near-empty machine. The ActiveGuard then decrements
+                    // on every exit path (the `continue`s below, normal
+                    // end, or panic).
+                    use std::sync::atomic::Ordering;
+                    loop {
+                        active_cus_ref.fetch_add(1, Ordering::AcqRel);
+                        if !snap_active_ref.load(Ordering::Acquire) { break; }
+                        active_cus_ref.fetch_sub(1, Ordering::AcqRel);
+                        while snap_active_ref.load(Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
                     }
-                    // Count this CU as in-flight for the whole body. The
-                    // guard decrements on every exit path (the `continue`s
-                    // below, normal end, or panic), so the snapshotter can
-                    // wait on `active_cus` reaching 0 to know the workers
-                    // have quiesced — deterministic, no fixed sleep.
-                    active_cus_ref.fetch_add(1, std::sync::atomic::Ordering::Release);
                     let _active = ActiveGuard(active_cus_ref);
                     let (kind, unit) = plan_ref[i];
                     let label = lang_label(kind);
@@ -1036,17 +1043,23 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                         .filter(|r| primary.starts_with(&r.path_prefix))
                         .map(|r| r.arg.as_str())
                         .collect();
-                    let extract_res = if matching.is_empty() {
-                        extractor.extract(unit, &sub_path)
-                    } else {
-                        extractor.extract_with(unit, &sub_path, |cu| {
-                            for &a in matching.iter().rev() {
-                                if !cu.argument.iter().any(|existing| existing == a) {
-                                    cu.argument.insert(0, a.to_string());
-                                }
+                    // Always run a transform: it strips sampling-PGO
+                    // profile flags (and applies any inject rules). When
+                    // it changes nothing, extract_with keeps the raw
+                    // proto, so this is free for the common case.
+                    let extract_res = extractor.extract_with(unit, &sub_path, |cu| {
+                        // A `-fprofile-sample-use=<x>.afdo` flag points at
+                        // a codegen optimization profile that is not in
+                        // the kzip and is irrelevant to semantic indexing.
+                        // Left in, cxx_indexer hard-fails the CU with
+                        // "no such file or directory: ...afdo". Drop it.
+                        cu.argument.retain(|a| !a.starts_with("-fprofile-sample-use"));
+                        for &a in matching.iter().rev() {
+                            if !cu.argument.iter().any(|existing| existing == a) {
+                                cu.argument.insert(0, a.to_string());
                             }
-                        })
-                    };
+                        }
+                    });
                     if let Err(e) = extract_res {
                         let mut by_lang = by_lang_mu.lock().unwrap();
                         let stats = by_lang.entry(label).or_default();
@@ -1057,8 +1070,26 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                         i += n_workers;
                         continue;
                     }
-                    let mut cmd = build_indexer_command(kind, kythe_root, &sub_path,
-                                                       &jvm_heap, &jvm_tmp)?;
+                    // A missing indexer binary is a per-CU failure, not a
+                    // whole-run abort: record it for that language and move
+                    // on, the same as extract/spawn failures. Otherwise the
+                    // first CU routed to an absent indexer (e.g. --langs
+                    // names one whose binary isn't present) would sink the
+                    // entire batch.
+                    let mut cmd = match build_indexer_command(kind, kythe_root, &sub_path,
+                                                              &jvm_heap, &jvm_tmp) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let mut by_lang = by_lang_mu.lock().unwrap();
+                            let stats = by_lang.entry(label).or_default();
+                            stats.failed += 1;
+                            if stats.fail_tails.len() < MAX_FAIL_TAILS {
+                                stats.fail_tails.push(format!("sha={} indexer: {e:#}", unit.sha));
+                            }
+                            i += n_workers;
+                            continue;
+                        }
+                    };
                     let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
                         Ok(c) => c,
                         Err(e) => {
@@ -1188,8 +1219,14 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                         let mut sink = my_sink.lock().unwrap();
                         sink.builder.merge_from(cu_builder);
                         sink.pending_shas.push(unit.sha.clone());
-                        drop(sink);
+                        // Bump the gauge under the sink lock: a snapshot
+                        // drain takes the same lock, so it can never observe
+                        // these merged rows without the matching add, which
+                        // would underflow the u64 gauge (galactic delta_rows
+                        // in the heartbeat). Settles correct either way; this
+                        // just removes the transient.
                         delta_rows_ref.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+                        drop(sink);
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     progress_mu.lock().unwrap().report("index", n, plan_len);
@@ -1201,7 +1238,6 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     // when *they* are also trying to write a snapshot,
                     // and `try_lock` makes a losing candidate fall
                     // through immediately.
-                    use std::sync::atomic::Ordering;
                     // Two independent triggers. The row budget bounds
                     // peak memory deterministically (it fires the
                     // instant the in-RAM delta is large, regardless of
@@ -1236,6 +1272,14 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                 // lands in the next snap), so a single
                                 // slow CU never stalls the snapshot.
                                 snap_active_ref.store(true, Ordering::Release);
+                                // RAII reset: clears snap_active on *every*
+                                // exit of this block, including a panic
+                                // unwind (e.g. an OOM in merge_from). Without
+                                // it a panic here would leave the flag stuck
+                                // true, parking every other worker forever in
+                                // their `while snap_active { sleep }` gate and
+                                // hanging the whole run instead of aborting.
+                                let _snap_guard = SnapActiveGuard(snap_active_ref);
                                 // Wait for in-flight CUs to quiesce so the
                                 // merge runs with worker subprocess RSS
                                 // freed. Workers finishing their current CU
@@ -1347,20 +1391,20 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                         // gone from memory. committed_shas
                                         // is untouched, so `--resume` re-
                                         // indexes them. Abort rather than
-                                        // silently drop them. Unpark workers
-                                        // first so the scope can collapse.
+                                        // silently drop them. `_snap_guard`
+                                        // unparks workers on the way out.
                                         drop(acc);
-                                        snap_active_ref.store(false, Ordering::Release);
                                         return Err(e).with_context(|| format!(
                                             "write shard {} for snapshot @ {n}/{plan_len}",
                                             shard_path.display()));
                                     }
                                 }
-                                // Shard written — unpark the workers. Drop
-                                // the accumulator lock first so a resuming
-                                // worker that snapshots next doesn't contend.
+                                // Shard written — drop the accumulator lock
+                                // so a resuming worker that snapshots next
+                                // doesn't contend. `_snap_guard` clears
+                                // snap_active as the block exits, unparking
+                                // the workers.
                                 drop(acc);
-                                snap_active_ref.store(false, Ordering::Release);
                             }
                             // _writer_guard releases here.
                         }
@@ -1481,6 +1525,19 @@ struct ActiveGuard<'a>(&'a std::sync::atomic::AtomicUsize);
 impl Drop for ActiveGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// RAII reset for the `snap_active` worker-park flag. Clears it on every
+/// exit of the snapshot block — normal end, the shard-write `return Err`,
+/// and a panic unwind. Without it a panic mid-snapshot would leave the
+/// flag set, parking every worker forever in `while snap_active { sleep }`
+/// and wedging the run instead of aborting cleanly.
+struct SnapActiveGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for SnapActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 

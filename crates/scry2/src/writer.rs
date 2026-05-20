@@ -102,8 +102,22 @@ impl IndexBuilder {
     ///   in-builder.
     pub fn merge_from(&mut self, mut other: Self) {
         self.xrefs.append(&mut other.xrefs);
-        for (k, v) in other.syms {
-            self.syms.entry(k).or_insert(v);
+        // Refine, don't blind first-wins: a sym referenced in one CU
+        // (kind::UNK) and defined in another (known kind) must end up
+        // with the known kind regardless of drain order — matching
+        // `upsert_sym`'s in-builder semantics, so `index` and
+        // `from-kzip` agree and the result is order-independent.
+        for (k, (kind, lang, name)) in other.syms {
+            use std::collections::hash_map::Entry;
+            match self.syms.entry(k) {
+                Entry::Occupied(mut o) => {
+                    let e = o.get_mut();
+                    if e.0 == kind::UNK { e.0 = kind; }
+                    if e.1 == lang::UNK { e.1 = lang; }
+                    if e.2.is_empty()   { e.2 = name; }
+                }
+                Entry::Vacant(v) => { v.insert((kind, lang, name)); }
+            }
         }
         for (k, v) in other.files {
             self.files.entry(k).or_insert(v);
@@ -280,15 +294,16 @@ impl IndexBuilder {
         seek_to(&mut w, syms_off)?;
         let mut n_syms: u64 = 0;
         let mut blob: Vec<u8> = Vec::new();
-        let mut by_name: Vec<(u32, u16, u64)> = Vec::new();
+        let mut by_name: Vec<(u64, u16, u64)> = Vec::new();
         {
             let pri: Box<dyn Iterator<Item = (u64, u8, u8, &str)>> = match prior {
                 Some(p) => Box::new(p.iter_syms()),
                 None    => Box::new(std::iter::empty()),
             };
             let del = delta_syms.iter().map(|(s, k, l, n)| (*s, *k, *l, n.as_str()));
-            for (sym, kind, lang, name) in merge_syms_first_wins(pri, del) {
-                let off = blob.len() as u32;
+            for (sym, kind, lang, name) in merge_syms_refine(pri, del) {
+                let name = clamp_blob_str(name);
+                let off = blob.len() as u64;
                 let len = name.len() as u16;
                 blob.extend_from_slice(name.as_bytes());
                 w.write_all(&sym.to_be_bytes())?;
@@ -310,7 +325,8 @@ impl IndexBuilder {
             let del = self.aliases.iter().map(|(s, a)| (*s, a.as_str()));
             for (sym, alias) in merge_aliases_dedup(pri, del) {
                 if var_syms.contains(&sym) { continue; }
-                let off = blob.len() as u32;
+                let alias = clamp_blob_str(alias);
+                let off = blob.len() as u64;
                 let len = alias.len() as u16;
                 blob.extend_from_slice(alias.as_bytes());
                 by_name.push((off, len, sym));
@@ -324,13 +340,16 @@ impl IndexBuilder {
         by_name.sort_by(|a, b| {
             let an = &blob[a.0 as usize..a.0 as usize + a.1 as usize];
             let bn = &blob[b.0 as usize..b.0 as usize + b.1 as usize];
-            an.cmp(bn)
+            // Tie-break by sym id so two distinct syms sharing one name get
+            // a deterministic order; otherwise HashMap iteration order leaks
+            // in and the same name query can resolve to a different sym
+            // across builds of identical input.
+            an.cmp(bn).then(a.2.cmp(&b.2))
         });
         seek_to(&mut w, names_off)?;
         for (off, len, sym) in &by_name {
             w.write_all(&off.to_be_bytes())?;
             w.write_all(&len.to_be_bytes())?;
-            w.write_all(&[0u8, 0u8])?;     // _pad
             w.write_all(&sym.to_be_bytes())?;
         }
         drop(by_name);
@@ -346,7 +365,8 @@ impl IndexBuilder {
             };
             let del = delta_files.iter().map(|(f, p)| (*f, p.as_str()));
             for (file, path) in merge_files_first_wins(pri, del) {
-                let off = blob.len() as u32;
+                let path = clamp_blob_str(path);
+                let off = blob.len() as u64;
                 let len = path.len() as u16;
                 blob.extend_from_slice(path.as_bytes());
                 w.write_all(&file.to_be_bytes())?;
@@ -455,10 +475,10 @@ impl IndexBuilder {
         // Build the strings blob. Names first (so binary search ranges
         // hit a hot region), then paths. Track (offset, length) per name.
         let mut blob: Vec<u8> = Vec::new();
-        let mut name_pos: Vec<(u32, u16)> = Vec::with_capacity(syms_vec.len());
+        let mut name_pos: Vec<(u64, u16)> = Vec::with_capacity(syms_vec.len());
         for (_, _, _, name) in &syms_vec {
-            assert!(name.len() <= u16::MAX as usize, "name longer than 64KB");
-            name_pos.push((blob.len() as u32, name.len() as u16));
+            let name = clamp_blob_str(name);
+            name_pos.push((blob.len() as u64, name.len() as u16));
             blob.extend_from_slice(name.as_bytes());
         }
         // Also lay out aliases in the blob. We collect `(sym, off, len)`
@@ -489,19 +509,19 @@ impl IndexBuilder {
         self.aliases.retain(|(s, _)| !var_syms.contains(s));
         self.aliases.sort_unstable();
         self.aliases.dedup();
-        let mut alias_pos: Vec<(u64, u32, u16)> = Vec::with_capacity(self.aliases.len());
+        let mut alias_pos: Vec<(u64, u64, u16)> = Vec::with_capacity(self.aliases.len());
         for (sym, alias) in &self.aliases {
-            assert!(alias.len() <= u16::MAX as usize, "alias longer than 64KB");
-            alias_pos.push((*sym, blob.len() as u32, alias.len() as u16));
+            let alias = clamp_blob_str(alias);
+            alias_pos.push((*sym, blob.len() as u64, alias.len() as u16));
             blob.extend_from_slice(alias.as_bytes());
         }
         let mut files_vec: Vec<(u32, String)> = self.files.into_iter().collect();
         files_vec.sort_unstable_by_key(|r| r.0);
         let n_files = files_vec.len() as u64;
-        let mut path_pos: Vec<(u32, u16)> = Vec::with_capacity(files_vec.len());
+        let mut path_pos: Vec<(u64, u16)> = Vec::with_capacity(files_vec.len());
         for (_, p) in &files_vec {
-            assert!(p.len() <= u16::MAX as usize, "path longer than 64KB");
-            path_pos.push((blob.len() as u32, p.len() as u16));
+            let p = clamp_blob_str(p);
+            path_pos.push((blob.len() as u64, p.len() as u16));
             blob.extend_from_slice(p.as_bytes());
         }
 
@@ -511,7 +531,7 @@ impl IndexBuilder {
         // entries come from `syms_vec` (one per sym); alias entries
         // come from `alias_pos` (zero or more per sym). We merge both
         // sources into one Vec and sort by the name bytes in `blob`.
-        let mut by_name: Vec<(u32, u16, u64)> =
+        let mut by_name: Vec<(u64, u16, u64)> =
             Vec::with_capacity(syms_vec.len() + alias_pos.len());
         for (i, (sym, _, _, _)) in syms_vec.iter().enumerate() {
             let (off, len) = name_pos[i];
@@ -523,7 +543,11 @@ impl IndexBuilder {
         by_name.sort_by(|a, b| {
             let an = &blob[a.0 as usize..a.0 as usize + a.1 as usize];
             let bn = &blob[b.0 as usize..b.0 as usize + b.1 as usize];
-            an.cmp(bn)
+            // Tie-break by sym id so two distinct syms sharing one name get
+            // a deterministic order; otherwise HashMap iteration order leaks
+            // in and the same name query can resolve to a different sym
+            // across builds of identical input.
+            an.cmp(bn).then(a.2.cmp(&b.2))
         });
         let n_names = by_name.len() as u64;
 
@@ -593,7 +617,6 @@ impl IndexBuilder {
         for (off, len, sym) in &by_name {
             w.write_all(&off.to_be_bytes())?;
             w.write_all(&len.to_be_bytes())?;
-            w.write_all(&[0u8, 0u8])?;     // _pad
             w.write_all(&sym.to_be_bytes())?;
         }
 
@@ -699,8 +722,25 @@ where
     Iter { a: a.peekable(), b: b.peekable(), last: None }
 }
 
-/// First-wins on tied sym ids. Yields `(sym, kind, lang, name)`.
-fn merge_syms_first_wins<'a, A, B>(a: A, b: B) -> impl Iterator<Item = (u64, u8, u8, &'a str)>
+/// Clamp a blob string to at most `u16::MAX` bytes on a char boundary.
+/// `name_len`/`path_len` are u16, so a longer string would either panic
+/// (finish's old `assert!`) or silently truncate the length (merge's
+/// `as u16`) and mis-slice the blob. Names this long are deeply nested
+/// C++ template USRs and vanishingly rare; a truncated-but-consistent
+/// name is strictly better than a crash or a corrupt one.
+fn clamp_blob_str(s: &str) -> &str {
+    if s.len() <= u16::MAX as usize { return s; }
+    let mut end = u16::MAX as usize;
+    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    &s[..end]
+}
+
+/// Merge two sym streams (each sorted by sym id), refining on tied ids.
+/// Yields `(sym, kind, lang, name)`. On a tie, a known kind/lang/name
+/// from either side wins over the other's UNK/empty — mirroring
+/// `upsert_sym`/`merge_from`, so a sym referenced as UNK in one shard
+/// and defined in another ends up defined regardless of merge order.
+fn merge_syms_refine<'a, A, B>(a: A, b: B) -> impl Iterator<Item = (u64, u8, u8, &'a str)>
 where
     A: Iterator<Item = (u64, u8, u8, &'a str)>,
     B: Iterator<Item = (u64, u8, u8, &'a str)>,
@@ -727,8 +767,12 @@ where
                         std::cmp::Ordering::Less    => self.a.next(),
                         std::cmp::Ordering::Greater => self.b.next(),
                         std::cmp::Ordering::Equal   => {
-                            self.b.next();
-                            self.a.next()
+                            let (sym, ak, al, an) = self.a.next().unwrap();
+                            let (_,  bk, bl, bn) = self.b.next().unwrap();
+                            let kind = if ak != kind::UNK { ak } else { bk };
+                            let lang = if al != lang::UNK { al } else { bl };
+                            let name = if !an.is_empty()  { an } else { bn };
+                            Some((sym, kind, lang, name))
                         }
                     }
                 }
@@ -834,8 +878,9 @@ where
 }
 
 /// Build the `var_syms` set from the merged sym stream — the final
-/// kind for a sym is whichever source wins (prior on ties), and the
-/// set is used to suppress alias entries for VARIABLE-kind syms.
+/// kind for a sym is the refined merge (a known kind from either source
+/// beats UNK), and the set is used to suppress alias entries for
+/// VARIABLE-kind syms.
 fn merge_var_syms(
     prior: Option<&crate::reader::Index>,
     delta_syms: &[(u64, u8, u8, String)],
@@ -845,7 +890,7 @@ fn merge_var_syms(
         None    => Box::new(std::iter::empty()),
     };
     let del = delta_syms.iter().map(|(s, k, l, n)| (*s, *k, *l, n.as_str()));
-    merge_syms_first_wins(pri, del)
+    merge_syms_refine(pri, del)
         .filter(|(_, k, _, _)| *k == kind::VARIABLE)
         .map(|(s, _, _, _)| s)
         .collect()

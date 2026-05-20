@@ -32,6 +32,30 @@ impl Index {
         if hdr.version != VERSION {
             bail!("bad version: file={} reader={}", hdr.version, VERSION);
         }
+        // Validate every section fits within the mapped file. A truncated
+        // or zero-length .s2db (e.g. a shard whose write was killed) would
+        // otherwise panic with an out-of-range slice index deep inside a
+        // query or the final merge's shard re-read. Checked arithmetic so
+        // a corrupt header can't overflow into a spurious in-range end.
+        let map_len = map.len() as u64;
+        let sections: [(&str, u64, u64, u64); 8] = [
+            ("xrefs", hdr.xrefs_off, hdr.xrefs_n,  XREF_LEN as u64),
+            ("syms",  hdr.syms_off,  hdr.syms_n,   SYM_LEN  as u64),
+            ("names", hdr.names_off, hdr.names_n,  NAME_LEN as u64),
+            ("files", hdr.files_off, hdr.files_n,  FILE_LEN as u64),
+            ("inh",   hdr.inh_off,   hdr.inh_n,    INH_LEN  as u64),
+            ("calls", hdr.calls_off, hdr.calls_n,  CALL_LEN as u64),
+            ("crev",  hdr.crev_off,  hdr.crev_n,   CALL_LEN as u64),
+            ("blob",  hdr.blob_off,  hdr.blob_len, 1),
+        ];
+        for (name, off, n, stride) in sections {
+            let end = n.checked_mul(stride)
+                .and_then(|bytes| off.checked_add(bytes))
+                .with_context(|| format!("{name} section size overflow in header"))?;
+            if end > map_len {
+                bail!("{name} section [{off}, {end}) exceeds file ({map_len} bytes) — truncated or corrupt index");
+            }
+        }
         Ok(Self { _file: file, map, hdr })
     }
 
@@ -85,7 +109,7 @@ impl Index {
         &self.map[off..off + len]
     }
 
-    fn blob_str(&self, off: u32, len: u16) -> &str {
+    fn blob_str(&self, off: u64, len: u16) -> &str {
         let s = &self.blob()[off as usize..off as usize + len as usize];
         std::str::from_utf8(s).unwrap_or("<bad utf8>")
     }
@@ -101,14 +125,14 @@ impl Index {
         while lo < hi {
             let mid = (lo + hi) / 2;
             let row_off = mid * NAME_LEN;
-            let name_off = u32::from_be_bytes(names[row_off..row_off + 4].try_into().unwrap());
-            let name_len = u16::from_be_bytes(names[row_off + 4..row_off + 6].try_into().unwrap());
+            let name_off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap());
+            let name_len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap());
             let row_name = self.blob_str(name_off, name_len);
             match row_name.as_bytes().cmp(qb) {
                 std::cmp::Ordering::Less    => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal   => {
-                    let sym = u64::from_be_bytes(names[row_off + 8..row_off + 16].try_into().unwrap());
+                    let sym = u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap());
                     return Some(sym);
                 }
             }
@@ -132,8 +156,8 @@ impl Index {
         while lo < hi {
             let mid = (lo + hi) / 2;
             let row_off = mid * NAME_LEN;
-            let off = u32::from_be_bytes(names[row_off..row_off + 4].try_into().unwrap());
-            let len = u16::from_be_bytes(names[row_off + 4..row_off + 6].try_into().unwrap());
+            let off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap());
+            let len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap());
             let row = self.blob_str(off, len);
             if row.as_bytes() < pb { lo = mid + 1; } else { hi = mid; }
         }
@@ -141,11 +165,11 @@ impl Index {
         let mut i = lo;
         while i < n && out.len() < limit {
             let row_off = i * NAME_LEN;
-            let off = u32::from_be_bytes(names[row_off..row_off + 4].try_into().unwrap());
-            let len = u16::from_be_bytes(names[row_off + 4..row_off + 6].try_into().unwrap());
+            let off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap());
+            let len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap());
             let row = self.blob_str(off, len);
             if !row.as_bytes().starts_with(pb) { break; }
-            let sym = u64::from_be_bytes(names[row_off + 8..row_off + 16].try_into().unwrap());
+            let sym = u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap());
             out.push((row.to_string(), sym));
             i += 1;
         }
@@ -171,11 +195,11 @@ impl Index {
         let blob = self.blob();
         for i in 0..n {
             let row_off = i * NAME_LEN;
-            let name_off = u32::from_be_bytes(names[row_off..row_off + 4].try_into().unwrap());
-            let name_len = u16::from_be_bytes(names[row_off + 4..row_off + 6].try_into().unwrap());
+            let name_off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap());
+            let name_len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap());
             let row_name = &blob[name_off as usize..name_off as usize + name_len as usize];
             if finder.find(row_name).is_some() {
-                let sym = u64::from_be_bytes(names[row_off + 8..row_off + 16].try_into().unwrap());
+                let sym = u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap());
                 out.push(sym);
                 if out.len() >= limit { break; }
             }
@@ -200,8 +224,8 @@ impl Index {
                 std::cmp::Ordering::Equal   => {
                     let kind = syms[row_off + 8];
                     let lang = syms[row_off + 9];
-                    let name_off = u32::from_be_bytes(syms[row_off + 10..row_off + 14].try_into().unwrap());
-                    let name_len = u16::from_be_bytes(syms[row_off + 14..row_off + 16].try_into().unwrap());
+                    let name_off = u64::from_be_bytes(syms[row_off + 10..row_off + 18].try_into().unwrap());
+                    let name_len = u16::from_be_bytes(syms[row_off + 18..row_off + 20].try_into().unwrap());
                     return Some((self.blob_str(name_off, name_len), kind, lang));
                 }
             }
@@ -351,8 +375,8 @@ impl Index {
                 std::cmp::Ordering::Less    => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal   => {
-                    let off = u32::from_be_bytes(files[row_off + 4..row_off + 8].try_into().unwrap());
-                    let len = u16::from_be_bytes(files[row_off + 8..row_off + 10].try_into().unwrap());
+                    let off = u64::from_be_bytes(files[row_off + 4..row_off + 12].try_into().unwrap());
+                    let len = u16::from_be_bytes(files[row_off + 12..row_off + 14].try_into().unwrap());
                     return Some(self.blob_str(off, len));
                 }
             }
@@ -389,8 +413,8 @@ impl Index {
             let sym  = u64::from_be_bytes(syms[off..off + 8].try_into().unwrap());
             let kind = syms[off + 8];
             let lang = syms[off + 9];
-            let no = u32::from_be_bytes(syms[off + 10..off + 14].try_into().unwrap()) as usize;
-            let nl = u16::from_be_bytes(syms[off + 14..off + 16].try_into().unwrap()) as usize;
+            let no = u64::from_be_bytes(syms[off + 10..off + 18].try_into().unwrap()) as usize;
+            let nl = u16::from_be_bytes(syms[off + 18..off + 20].try_into().unwrap()) as usize;
             let name = std::str::from_utf8(&blob[no..no + nl]).unwrap_or("");
             (sym, kind, lang, name)
         })
@@ -403,8 +427,8 @@ impl Index {
         (0..n).map(move |i| {
             let off = i * FILE_LEN;
             let f = u32::from_be_bytes(files[off..off + 4].try_into().unwrap());
-            let po = u32::from_be_bytes(files[off + 4..off + 8].try_into().unwrap()) as usize;
-            let pl = u16::from_be_bytes(files[off + 8..off + 10].try_into().unwrap()) as usize;
+            let po = u64::from_be_bytes(files[off + 4..off + 12].try_into().unwrap()) as usize;
+            let pl = u16::from_be_bytes(files[off + 12..off + 14].try_into().unwrap()) as usize;
             let p = std::str::from_utf8(&blob[po..po + pl]).unwrap_or("");
             (f, p)
         })
@@ -441,13 +465,13 @@ impl Index {
         // Build a per-sym canonical (off,len) lookup once.
         let syms = self.syms_slice();
         let n_syms = self.hdr.syms_n as usize;
-        let mut canon: std::collections::HashMap<u64, (u32, u16)> =
+        let mut canon: std::collections::HashMap<u64, (u64, u16)> =
             std::collections::HashMap::with_capacity(n_syms);
         for i in 0..n_syms {
             let off = i * SYM_LEN;
             let s  = u64::from_be_bytes(syms[off..off + 8].try_into().unwrap());
-            let no = u32::from_be_bytes(syms[off + 10..off + 14].try_into().unwrap());
-            let nl = u16::from_be_bytes(syms[off + 14..off + 16].try_into().unwrap());
+            let no = u64::from_be_bytes(syms[off + 10..off + 18].try_into().unwrap());
+            let nl = u16::from_be_bytes(syms[off + 18..off + 20].try_into().unwrap());
             canon.insert(s, (no, nl));
         }
         let names = self.names_slice();
@@ -455,9 +479,9 @@ impl Index {
         let blob = self.blob();
         (0..n_names).filter_map(move |i| {
             let off = i * NAME_LEN;
-            let no = u32::from_be_bytes(names[off..off + 4].try_into().unwrap());
-            let nl = u16::from_be_bytes(names[off + 4..off + 6].try_into().unwrap());
-            let sym = u64::from_be_bytes(names[off + 8..off + 16].try_into().unwrap());
+            let no = u64::from_be_bytes(names[off..off + 8].try_into().unwrap());
+            let nl = u16::from_be_bytes(names[off + 8..off + 10].try_into().unwrap());
+            let sym = u64::from_be_bytes(names[off + 10..off + 18].try_into().unwrap());
             if canon.get(&sym) == Some(&(no, nl)) { return None; }
             let s = std::str::from_utf8(&blob[no as usize..no as usize + nl as usize]).ok()?;
             Some((sym, s))

@@ -28,7 +28,7 @@
 use std::mem::size_of;
 
 pub const MAGIC: [u8; 8]   = *b"S2DBv2\0\0";
-pub const VERSION: u32     = 2;
+pub const VERSION: u32     = 3;
 pub const PAGE: usize      = 4096;
 
 /// File header — first 256 bytes. Numbers count rows, *not* bytes.
@@ -111,17 +111,17 @@ pub mod role {
     pub const CALL: u8 = 3;
 }
 
-/// One sym row. Sorted by `sym`. Total 16 bytes.
+/// One sym row. Sorted by `sym`. Total 20 bytes.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SymRow {
     pub sym:       [u8; 8],   // BE
     pub kind:      u8,        // function/type/var/...
     pub lang:      u8,        // 0=cxx 1=java 2=jvm 3=go 4=proto 5=rs ...
-    pub name_off:  [u8; 4],   // BE offset into blob
+    pub name_off:  [u8; 8],   // BE offset into blob (u64: blob exceeds 4 GiB)
     pub name_len:  [u8; 2],   // BE length in blob
 }
-pub const SYM_LEN: usize = 16;
+pub const SYM_LEN: usize = 20;
 const _: () = assert!(size_of::<SymRow>() == SYM_LEN);
 
 /// Symbol kinds. Kept compact; only what query verbs branch on.
@@ -149,16 +149,15 @@ pub mod lang {
 /// table is sorted by **the bytes of that name** so binary search on
 /// "android.os.Binder.clearCallingIdentity" lands on the right row.
 ///
-/// Total 16 bytes per entry.
+/// Total 18 bytes per entry.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NameRow {
-    pub name_off:  [u8; 4],   // BE
+    pub name_off:  [u8; 8],   // BE offset into blob (u64: blob exceeds 4 GiB)
     pub name_len:  [u8; 2],   // BE
-    pub _pad:      [u8; 2],
     pub sym:       [u8; 8],   // BE
 }
-pub const NAME_LEN: usize = 16;
+pub const NAME_LEN: usize = 18;
 const _: () = assert!(size_of::<NameRow>() == NAME_LEN);
 
 /// One file row. 10 bytes — sorted by `file`.
@@ -166,10 +165,10 @@ const _: () = assert!(size_of::<NameRow>() == NAME_LEN);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FileRow {
     pub file:      [u8; 4],   // BE
-    pub path_off:  [u8; 4],   // BE
+    pub path_off:  [u8; 8],   // BE offset into blob (u64: blob exceeds 4 GiB)
     pub path_len:  [u8; 2],   // BE
 }
-pub const FILE_LEN: usize = 10;
+pub const FILE_LEN: usize = 14;
 const _: () = assert!(size_of::<FileRow>() == FILE_LEN);
 
 /// One inheritance edge: (child, parent). Sorted by (child, parent).

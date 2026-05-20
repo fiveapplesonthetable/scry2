@@ -806,13 +806,36 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                 eprintln!("[from-kzip] --resume: no partial state found at {}; starting fresh",
                     partial_s2db_path.display());
             }
-            // Either-or means an aborted snapshot. Refuse to silently
-            // half-resume — the user almost certainly wants to know.
-            _ => anyhow::bail!(
-                "--resume: partial state is incomplete ({} present={}, {} present={})",
-                partial_s2db_path.display(), partial_s2db_path.exists(),
-                partial_shas_path.display(), partial_shas_path.exists(),
-            ),
+            (false, true) => {
+                // A fresh (non-`--resume`) run that was interrupted: it
+                // wrote delta shards plus the durable shas, but never a
+                // legacy base partial. The shas is authoritative for which
+                // CUs are durable, and the final merge already handles an
+                // absent base, so resume from the shards with no base.
+                let n_shards = list_partial_shards(args.out).len();
+                if n_shards == 0 {
+                    anyhow::bail!(
+                        "--resume: {} present but no base partial and no delta \
+                         shards — no durable CU data to resume from",
+                        partial_shas_path.display());
+                }
+                eprintln!("[from-kzip] --resume: no base + {n_shards} delta shard(s)");
+                let shas = std::fs::read_to_string(&partial_shas_path)
+                    .with_context(|| format!("read {}", partial_shas_path.display()))?;
+                for line in shas.lines() {
+                    let s = line.trim();
+                    if !s.is_empty() { done_shas.insert(s.to_string()); }
+                }
+                eprintln!("[from-kzip] --resume: {} prior CUs already snapshotted",
+                    done_shas.len());
+            }
+            // Base present but no shas: an aborted snapshot whose CU set is
+            // unknown, so we can't skip safely. Refuse rather than re-run
+            // everything and risk a confusing partial.
+            (true, false) => anyhow::bail!(
+                "--resume: base partial {} present but {} absent — aborted \
+                 snapshot; discard the partial and restart",
+                partial_s2db_path.display(), partial_shas_path.display()),
         }
     }
     let before_filter = plan.len();

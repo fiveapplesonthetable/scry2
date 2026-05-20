@@ -251,12 +251,18 @@ enum Cmd {
         /// we load the partial as the starting builder state and skip
         /// any plan entry whose sha is listed.
         #[arg(long, default_value_t = false)] resume: bool,
-        /// Take a builder snapshot every N successful CUs. Lower =
-        /// more durable but more wall time spent on the clone-and-
-        /// write cycle. Default 2000 — at AOSP scale each snapshot is
-        /// ~6 GB and ~10 s, so 2000 CUs ≈ one snapshot per 5 minutes
-        /// of indexer wall time.
+        /// Snapshot the in-RAM delta to a shard after this many
+        /// successful CUs. A coarse durability fallback; the row
+        /// budget below is the primary trigger. Default 2000. 0
+        /// disables the count trigger.
         #[arg(long = "snapshot-every", default_value_t = 2000)] snapshot_every: usize,
+        /// Snapshot whenever the in-RAM delta reaches this many rows
+        /// (xrefs+inherits+calls+aliases), independent of CU count.
+        /// This is what bounds peak memory: large CUs cross the
+        /// budget sooner and trigger an earlier snapshot, so the peak
+        /// is deterministic regardless of how rows are distributed
+        /// across CUs. Default 250M ≈ a ~25 GB delta. 0 disables.
+        #[arg(long = "snapshot-rows", default_value_t = 250_000_000)] snapshot_rows: u64,
     },
 }
 
@@ -268,7 +274,7 @@ fn main() -> Result<()> {
         Cmd::NormalizeKzip { in_, out } => return cmd_normalize_kzip(&in_, &out),
         Cmd::FromKzip { kzip, kythe_root, out, langs, jvm_heap,
                         in_, not_in, staging, workers, inject_cu_args,
-                        resume, snapshot_every } => {
+                        resume, snapshot_every, snapshot_rows } => {
             let rules = parse_inject_rules(&inject_cu_args)?;
             return cmd_from_kzip(FromKzipArgs {
                 kzip: &kzip, kythe_root: &kythe_root, out: &out,
@@ -276,7 +282,7 @@ fn main() -> Result<()> {
                 in_: &in_, not_in: &not_in,
                 staging: staging.as_deref(), workers,
                 inject_rules: &rules,
-                resume, snapshot_every,
+                resume, snapshot_every, snapshot_rows,
             });
         }
         Cmd::Serve { socket } => {
@@ -476,9 +482,12 @@ struct FromKzipArgs<'a> {
     /// matching shas file. See `Cmd::FromKzip::resume` for the wire
     /// definition.
     resume:         bool,
-    /// CU interval between rolling builder snapshots. See
-    /// `Cmd::FromKzip::snapshot_every`.
+    /// CU-count fallback interval between rolling delta snapshots.
+    /// See `Cmd::FromKzip::snapshot_every`.
     snapshot_every: usize,
+    /// Row budget that bounds the in-RAM delta. See
+    /// `Cmd::FromKzip::snapshot_rows`.
+    snapshot_rows: u64,
 }
 
 /// One `--inject-cu-arg` rule: when a CU's primary path starts with
@@ -899,6 +908,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     let snap_writer_mu_ref    = &snap_writer_mu;
     let last_snap_done_ref    = &last_snap_done;
     let snapshot_every        = args.snapshot_every;
+    let snapshot_rows         = args.snapshot_rows;
     // Heartbeat — a side thread that logs the run's vitals every
     // ~30 s so any aspect of the indexing (throughput, snapshots,
     // RSS, worker subprocess count) is visible without attaching a
@@ -1192,12 +1202,26 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     // and `try_lock` makes a losing candidate fall
                     // through immediately.
                     use std::sync::atomic::Ordering;
-                    if snapshot_every > 0 && n >= last_snap_done.load(Ordering::Relaxed) + snapshot_every {
+                    // Two independent triggers. The row budget bounds
+                    // peak memory deterministically (it fires the
+                    // instant the in-RAM delta is large, regardless of
+                    // how many CUs produced it); the CU count is a
+                    // coarse durability fallback for low-row corpora.
+                    let snap_due = |n: usize| {
+                        (snapshot_every > 0
+                            && n >= last_snap_done.load(Ordering::Relaxed) + snapshot_every)
+                        || (snapshot_rows > 0
+                            && delta_rows_ref.load(Ordering::Relaxed) >= snapshot_rows)
+                    };
+                    if snap_due(n) {
                         if let Ok(_writer_guard) = snap_writer_mu.try_lock() {
                             // Re-check under the writer lock so a
                             // racing worker that snuck in first
-                            // doesn't double-snapshot.
-                            if n >= last_snap_done.load(Ordering::Relaxed) + snapshot_every {
+                            // doesn't double-snapshot. The winner drains
+                            // the sinks (dropping delta_rows) and bumps
+                            // last_snap_done, so the loser sees both
+                            // triggers fall false here.
+                            if snap_due(n) {
                                 last_snap_done.store(n, Ordering::Relaxed);
                                 // Signal workers to park before their
                                 // next CU, then settle briefly so the
@@ -1254,8 +1278,21 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                 // mid-CU worker's CUs aren't in the
                                 // shas file, so they get re-run.
                                 // Idempotent.
-                                let mut drained_data = IndexBuilder::new();
+                                //
+                                // Memory: each sink is moved straight
+                                // into the accumulator and dropped before
+                                // the next is taken, so the peak transient
+                                // is the accumulator (≈ one snapshot's
+                                // delta, bounded by the row budget) plus a
+                                // single sink — never a second full copy.
+                                // The accumulator lock is only contended by
+                                // snapshot writers (snap_writer_mu
+                                // serialises them) and the post-join final
+                                // merge, so holding it across the drain
+                                // doesn't block workers.
+                                let mut acc = accumulator_mu.lock().unwrap();
                                 let mut drained_shas: Vec<String> = Vec::new();
+                                let mut drained_rows = 0u64;
                                 let mut drained_n = 0usize;
                                 let mut skipped_n = 0usize;
                                 for ws in all_sinks {
@@ -1264,31 +1301,22 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                             let taken_builder = std::mem::take(&mut sink.builder);
                                             let taken_shas    = std::mem::take(&mut sink.pending_shas);
                                             drop(sink);
-                                            drained_data.merge_from(taken_builder);
+                                            drained_rows += (taken_builder.n_xrefs()
+                                                + taken_builder.n_inh()
+                                                + taken_builder.n_calls()
+                                                + taken_builder.n_aliases()) as u64;
+                                            acc.builder.merge_from(taken_builder);
                                             drained_shas.extend(taken_shas);
                                             drained_n += 1;
                                         }
                                         Err(_) => { skipped_n += 1; }
                                     }
                                 }
-                                // These rows are leaving the sinks for the
-                                // accumulator (which is written to disk and
-                                // dropped), so they're no longer part of the
+                                // These rows have left the sinks for the
+                                // accumulator (written to disk and dropped
+                                // below), so they're no longer part of the
                                 // live in-memory delta gauge.
-                                let drained_rows = (drained_data.n_xrefs()
-                                    + drained_data.n_inh()
-                                    + drained_data.n_calls()
-                                    + drained_data.n_aliases()) as u64;
                                 delta_rows_ref.fetch_sub(drained_rows, Ordering::Relaxed);
-                                // Write the drained delta as a standalone
-                                // shard via `finish` — O(delta) RAM, no
-                                // prior read, no growth with the run. The
-                                // accumulator lock is only contended by
-                                // snapshot writers (snap_writer_mu
-                                // serialises them) so holding it across the
-                                // write doesn't block workers.
-                                let mut acc = accumulator_mu.lock().unwrap();
-                                acc.builder.merge_from(drained_data);
                                 file_ids.push_to(&mut acc.builder);
                                 let staged_shas: Vec<String> = drained_shas;
                                 // The shas file must reflect every durable

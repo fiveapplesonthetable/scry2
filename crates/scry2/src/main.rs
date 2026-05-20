@@ -653,6 +653,31 @@ fn partial_shas_for(out: &std::path::Path) -> std::path::PathBuf {
     p
 }
 
+/// Path of the `idx`-th delta shard. Each snapshot writes its drained
+/// delta as a standalone `.s2db` here — no merge against the prior, so
+/// snapshot RAM is O(delta) not O(accumulated), and snapshot wall time
+/// doesn't grow with the run. The final write merges all shards (plus
+/// any legacy `<out>.partial.s2db` base) into the output exactly once.
+fn partial_shard_for(out: &std::path::Path, idx: usize) -> std::path::PathBuf {
+    let mut p = out.to_path_buf();
+    let stem = p.file_name().map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    p.set_file_name(format!("{stem}.partial.shard.{idx:04}.s2db"));
+    p
+}
+
+/// Enumerate existing delta shards for `out` in index order. Used on
+/// `--resume` to continue numbering after a kill and at final-write to
+/// merge them all.
+fn list_partial_shards(out: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut shards = Vec::new();
+    for idx in 0.. {
+        let p = partial_shard_for(out, idx);
+        if p.exists() { shards.push(p); } else { break; }
+    }
+    shards
+}
+
 fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     use std::process::Stdio;
     use std::collections::HashSet;
@@ -739,13 +764,15 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     if args.resume {
         match (partial_s2db_path.exists(), partial_shas_path.exists()) {
             (true, true) => {
-                // Streaming-merge model: don't replay the partial into
-                // an in-memory builder. The partial stays on disk and
-                // each snap merges (delta + prior mmap) → new partial.
-                // Just enumerate the durable shas so we can skip
-                // already-folded CUs from the plan.
-                eprintln!("[from-kzip] --resume: using {} as merge prior",
-                    partial_s2db_path.display());
+                // Delta-shard model: the legacy single `.partial.s2db`
+                // (from older streaming-merge runs) is treated as the
+                // immutable base; new snapshots append independent delta
+                // shards. Nothing is loaded into RAM here — we only read
+                // the durable shas to skip already-folded CUs. Base +
+                // shards are merged once at the final write.
+                let n_shards = list_partial_shards(args.out).len();
+                eprintln!("[from-kzip] --resume: base {} + {} delta shard(s)",
+                    partial_s2db_path.display(), n_shards);
                 let shas = std::fs::read_to_string(&partial_shas_path)
                     .with_context(|| format!("read {}", partial_shas_path.display()))?;
                 for line in shas.lines() {
@@ -756,6 +783,17 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     done_shas.len());
             }
             (false, false) => {
+                // No base partial. But delta shards may exist from a
+                // run that never had a legacy base (or whose base was
+                // already promoted). If shas is absent we can't know
+                // which CUs are durable, so require both for resume.
+                let n_shards = list_partial_shards(args.out).len();
+                if n_shards > 0 {
+                    anyhow::bail!(
+                        "--resume: found {n_shards} delta shard(s) but no {} — \
+                         cannot determine durable CUs; discard shards and restart",
+                        partial_shas_path.display());
+                }
                 eprintln!("[from-kzip] --resume: no partial state found at {}; starting fresh",
                     partial_s2db_path.display());
             }
@@ -775,12 +813,11 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
         eprintln!("[from-kzip] --resume: skipped {skipped_resume} CUs (already snapshotted)");
     }
     if plan.is_empty() {
-        eprintln!("[from-kzip] --resume: every CU was already ingested; promoting partial to final");
-        std::fs::rename(&partial_s2db_path, args.out)
-            .with_context(|| format!("rename {} → {}",
-                partial_s2db_path.display(), args.out.display()))?;
-        let _ = std::fs::remove_file(&partial_shas_path);
-        return Ok(());
+        // Everything already ingested. Fall through with an empty plan:
+        // the workers no-op, and the final write merges the base partial
+        // + any delta shards into the output. (We can't just rename the
+        // base, since delta shards may hold CUs not yet folded in.)
+        eprintln!("[from-kzip] --resume: every CU already ingested; merging base + shards to final");
     }
 
     // Per-worker sinks (builder + pending shas, atomically swappable).
@@ -794,17 +831,19 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
         .map(|_| std::sync::Mutex::new(WorkerSink::default()))
         .collect();
     // The accumulator is the per-snap delta-collector. Workers drain
-    // their sinks into `builder`; at snap time we merge `builder` with
-    // the prior `.partial.s2db` (mmap'd, not loaded into RAM) via
-    // [`IndexBuilder::write_merged_snapshot`] and write a new partial.
-    // After a successful snap, `builder` is reset to empty — the prior
-    // partial on disk is now the durable record, and the next snap
-    // collects a fresh delta. Workers never touch this mutex; only the
+    // their sinks into `builder`; at snap time we write `builder` out as
+    // a standalone delta shard (`finish`, O(delta) RAM, no prior read),
+    // reset it, and continue. The base partial + all shards are merged
+    // once at the final write. Workers never touch this mutex; only the
     // active snapshotter does, so contention is rare.
     let accumulator_mu = std::sync::Mutex::new(Accumulator {
         builder:        IndexBuilder::new(),
         committed_shas: done_shas,
     });
+    // Monotonic shard index. Resumed runs continue numbering after the
+    // shards already on disk so a kill never overwrites a durable shard.
+    let next_shard = std::sync::atomic::AtomicUsize::new(list_partial_shards(args.out).len());
+    let next_shard_ref = &next_shard;
     // `FileIdAllocator` is shared by-reference (interior mutex inside
     // `intern`). Workers hit it once per file path during ingest,
     // not once per CU — there's no whole-CU lock to serialize on.
@@ -943,8 +982,9 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             let progress_mu = &progress_mu;
             let plan_len = plan_ref.len();
             let kzip_path = args.kzip;
-            let partial_s2db_path = partial_s2db_path_ref;
             let partial_shas_path = partial_shas_path_ref;
+            let out_path = args.out;
+            let next_shard = next_shard_ref;
             handles.push(s.spawn(move || -> Result<()> {
                 let mut extractor = kzip::SubKzipWriter::open(kzip_path)?;
                 let mut i = w_id;
@@ -1240,86 +1280,57 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                     + drained_data.n_calls()
                                     + drained_data.n_aliases()) as u64;
                                 delta_rows_ref.fetch_sub(drained_rows, Ordering::Relaxed);
-                                // Fold drained state into the
-                                // accumulator's delta, then snapshot
-                                // via streaming-merge against the
-                                // prior partial. The accumulator
-                                // lock is only contended by snapshot
-                                // writers (snap_writer_mu serialises
-                                // them) so holding it across the
-                                // write does not block workers.
-                                //
-                                // Memory: `delta` is the only data we
-                                // carry through the snap. Prior state
-                                // stays on disk (mmap'd); we never
-                                // double-allocate it in RAM.
+                                // Write the drained delta as a standalone
+                                // shard via `finish` — O(delta) RAM, no
+                                // prior read, no growth with the run. The
+                                // accumulator lock is only contended by
+                                // snapshot writers (snap_writer_mu
+                                // serialises them) so holding it across the
+                                // write doesn't block workers.
                                 let mut acc = accumulator_mu.lock().unwrap();
                                 acc.builder.merge_from(drained_data);
                                 file_ids.push_to(&mut acc.builder);
-                                for s in drained_shas { acc.committed_shas.insert(s); }
-                                let mut shas: Vec<String> = acc.committed_shas
-                                    .iter().cloned().collect();
+                                let staged_shas: Vec<String> = drained_shas;
+                                // The shas file must reflect every durable
+                                // CU: those already committed plus the ones
+                                // about to land in this shard.
+                                let mut shas: Vec<String> = acc.committed_shas.iter().cloned()
+                                    .chain(staged_shas.iter().cloned()).collect();
                                 shas.sort();
-
                                 let delta = std::mem::take(&mut acc.builder);
-                                let prior = if partial_s2db_path.exists() {
-                                    match scry2::reader::Index::open(partial_s2db_path) {
-                                        Ok(ix) => Some(ix),
-                                        Err(e) => {
-                                            // Unpark workers before bubbling
-                                            // the fatal error, else they spin
-                                            // in the park loop forever and the
-                                            // scope can't collapse.
-                                            snap_active_ref.store(false, Ordering::Release);
-                                            return Err(e).with_context(|| format!(
-                                                "open prior {}", partial_s2db_path.display()));
-                                        }
-                                    }
-                                } else { None };
 
-                                let merge_res = delta.write_merged_snapshot(
-                                    prior.as_ref(), partial_s2db_path);
-                                drop(prior);
-
-                                match merge_res {
+                                let shard_idx = next_shard.fetch_add(1, Ordering::Relaxed);
+                                let shard_path = partial_shard_for(out_path, shard_idx);
+                                match delta.finish(&shard_path) {
                                     Ok(_) => {
-                                        // Sidecar the shas file. We write it
-                                        // AFTER the partial.s2db rename so a
-                                        // crash between the two leaves the
-                                        // s2db newer than the shas — on resume
-                                        // we require both files; the bounded
-                                        // µs gap is documented as the only
-                                        // mismatch window.
+                                        // Shard durable. Record the shas
+                                        // (file first, then in-memory) so a
+                                        // crash leaves shas ⊆ written shards.
                                         if let Err(e) = write_partial_shas(&shas, partial_shas_path) {
                                             eprintln!("[from-kzip] snapshot @ {n}/{plan_len} shas write failed: {e:#}");
                                         }
-                                        eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: {} shas durable (sinks drained={drained_n}/{}, busy={skipped_n})",
+                                        for s in staged_shas { acc.committed_shas.insert(s); }
+                                        eprintln!("[from-kzip] snapshot @ {n}/{plan_len}: shard {shard_idx} ({} shas durable, sinks drained={drained_n}/{}, busy={skipped_n})",
                                             shas.len(), drained_n + skipped_n);
                                     }
                                     Err(e) => {
-                                        // The merge consumed `delta`, so the
-                                        // drained CUs are unrecoverable in
-                                        // memory. The prior partial on disk
-                                        // is untouched (atomic rename only
-                                        // fires on success), so it stays a
-                                        // valid resume point. Abort rather
-                                        // than silently drop those CUs from
-                                        // the final index — `--resume` re-
-                                        // indexes them, since their shas were
-                                        // never committed to `.partial.shas`.
-                                        // Unpark workers first so the scope
-                                        // can collapse instead of deadlocking
-                                        // on the park loop.
+                                        // Shard write failed; `delta` is
+                                        // consumed and the staged CUs are
+                                        // gone from memory. committed_shas
+                                        // is untouched, so `--resume` re-
+                                        // indexes them. Abort rather than
+                                        // silently drop them. Unpark workers
+                                        // first so the scope can collapse.
                                         drop(acc);
                                         snap_active_ref.store(false, Ordering::Release);
                                         return Err(e).with_context(|| format!(
-                                            "snapshot @ {n}/{plan_len}"));
+                                            "write shard {} for snapshot @ {n}/{plan_len}",
+                                            shard_path.display()));
                                     }
                                 }
-                                // Merge done — unpark the workers.
-                                // Drop the accumulator lock first so a
-                                // resuming worker that snapshots next
-                                // doesn't contend on it.
+                                // Shard written — unpark the workers. Drop
+                                // the accumulator lock first so a resuming
+                                // worker that snapshots next doesn't contend.
                                 drop(acc);
                                 snap_active_ref.store(false, Ordering::Release);
                             }
@@ -1372,23 +1383,61 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     }
 
     file_ids.drain_into(&mut final_delta);
-    let prior = if partial_s2db_path.exists() {
+    // Final merge — chained streaming so peak RAM stays one merge
+    // (~the largest snapshot), not the whole union. We fold sources in
+    // one at a time via `write_merged_snapshot` (in-memory delta +
+    // mmap'd prior → new file), never holding the full slice in a
+    // builder:
+    //   acc := merge(in-memory remainder, base partial)
+    //   acc := merge(shard_i loaded as delta, acc)   for each shard
+    //   rename(acc → output)
+    // Each step's prior stays on disk (mmap); only one small delta is
+    // resident. This runs with all workers joined and every indexer
+    // gone, so the machine is free.
+    let shards = list_partial_shards(args.out);
+    eprintln!("[from-kzip] final merge: remainder (xrefs={}) + base({}) + {} shard(s)",
+        final_delta.n_xrefs(),
+        if partial_s2db_path.exists() { "yes" } else { "no" }, shards.len());
+
+    // Step 1: remainder ⊕ base → acc tmp (acc lives at a dedicated path
+    // so it never collides with a shard or the final output).
+    let acc_path = args.out.with_extension("s2db.merging");
+    let base = if partial_s2db_path.exists() {
         Some(scry2::reader::Index::open(&partial_s2db_path)
-            .with_context(|| format!("open prior {} for final merge",
-                partial_s2db_path.display()))?)
+            .with_context(|| format!("open base {}", partial_s2db_path.display()))?)
     } else { None };
-    eprintln!("[from-kzip] writing — final delta: xrefs={} syms={} files={} inhs={} calls={} (prior on disk: {})",
-        final_delta.n_xrefs(), final_delta.n_syms(), final_delta.n_files(),
-        final_delta.n_inh(), final_delta.n_calls(),
-        prior.as_ref().map(|p| format!("{} xrefs", p.n_xrefs()))
-            .unwrap_or_else(|| "none".to_string()));
-    let bytes = final_delta.write_merged_snapshot(prior.as_ref(), args.out)?;
-    drop(prior);
-    // Final write succeeded — discard the rolling partial files so
-    // the next from-kzip invocation against this `--out` doesn't
-    // pick up a stale snapshot.
+    final_delta.write_merged_snapshot(base.as_ref(), &acc_path)
+        .with_context(|| "final merge: remainder ⊕ base")?;
+    drop(base);
+
+    // Step 2: fold each shard into the accumulator, one at a time.
+    for (i, src) in shards.iter().enumerate() {
+        let mut shard_delta = IndexBuilder::new();
+        {
+            let ix = scry2::reader::Index::open(src)
+                .with_context(|| format!("open shard {}", src.display()))?;
+            shard_delta.populate_from_index(&ix)
+                .with_context(|| format!("replay shard {}", src.display()))?;
+        }
+        let acc_ix = scry2::reader::Index::open(&acc_path)
+            .with_context(|| format!("open acc {}", acc_path.display()))?;
+        let next_path = args.out.with_extension(format!("s2db.merging.{i}"));
+        shard_delta.write_merged_snapshot(Some(&acc_ix), &next_path)
+            .with_context(|| format!("final merge: shard {i} ⊕ acc"))?;
+        drop(acc_ix);
+        std::fs::rename(&next_path, &acc_path)
+            .with_context(|| format!("rotate acc {} → {}", next_path.display(), acc_path.display()))?;
+        eprintln!("[from-kzip] final merge: folded shard {}/{}", i + 1, shards.len());
+    }
+
+    std::fs::rename(&acc_path, args.out)
+        .with_context(|| format!("promote {} → {}", acc_path.display(), args.out.display()))?;
+    let bytes = std::fs::metadata(args.out).map(|m| m.len()).unwrap_or(0);
+    // Final write succeeded — discard the base partial, shards, and
+    // shas so the next from-kzip against this `--out` starts clean.
     let _ = std::fs::remove_file(&partial_s2db_path);
     let _ = std::fs::remove_file(&partial_shas_path);
+    for src in &shards { let _ = std::fs::remove_file(src); }
     let _ = std::fs::remove_dir_all(&staging);
     eprintln!("[from-kzip] done in {:.2}s → {} ({:.2} GB)",
         t0.elapsed().as_secs_f64(), args.out.display(), bytes as f64 / 1e9);

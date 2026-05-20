@@ -156,6 +156,20 @@ pub fn ingest_tolerant<R: Read>(
             }
             Err(e) => return Err(e),
         };
+        // Guard the allocation: a corrupt length prefix could demand a
+        // multi-GB resize and OOM-kill the worker (aborting the whole
+        // run). Real Kythe entries are at most a few MB even for huge
+        // MarkedSource, so anything past this cap is a corrupted stream —
+        // treat it like a truncation.
+        const MAX_ENTRY_LEN: usize = 1 << 28; // 256 MiB
+        if len > MAX_ENTRY_LEN {
+            if tolerate_trunc {
+                eprintln!("[ingest] oversize entry len {len} after {} entries; treating as truncation",
+                    stats.entries);
+                break;
+            }
+            bail!("entry length {len} exceeds sane maximum {MAX_ENTRY_LEN} (corrupt stream)");
+        }
         buf.resize(len, 0);
         match r.read_exact(&mut buf) {
             Ok(()) => {}
@@ -675,14 +689,20 @@ fn read_proto_field(buf: &[u8], mut pos: usize) -> Option<(u32, u8, usize, usize
             let (_, p2) = read_varint_at(buf, pos)?;
             (pos, p2)
         }
-        1 => (pos, pos + 8),                 // fixed64
+        1 => {                               // fixed64
+            let end = pos.checked_add(8).filter(|&e| e <= buf.len())?;
+            (pos, end)
+        }
         2 => {                               // length-delim
             let (len, p2) = read_varint_at(buf, pos)?;
             let end = p2.checked_add(len as usize)?;
             if end > buf.len() { return None; }
             (p2, end)
         }
-        5 => (pos, pos + 4),                 // fixed32
+        5 => {                               // fixed32
+            let end = pos.checked_add(4).filter(|&e| e <= buf.len())?;
+            (pos, end)
+        }
         _ => return None,
     };
     Some((field, wire, val_end, val_start))
@@ -803,11 +823,13 @@ fn parse_entry(buf: &[u8]) -> Result<Entry> {
             bail!("Entry: unexpected wire type {} for field {}", wire, field);
         }
         let len = read_varint_bytes(buf, &mut pos)? as usize;
-        if pos + len > buf.len() {
-            bail!("Entry: field {} len {} extends past buffer (pos {} buf {})",
-                field, len, pos, buf.len());
-        }
-        let slice = &buf[pos..pos + len];
+        // checked_add: `len` is an untrusted u64 from the stream, so
+        // `pos + len` could wrap usize and pass a naive `> buf.len()`
+        // check, then panic (or mis-slice) on the index below.
+        let end = pos.checked_add(len)
+            .filter(|&e| e <= buf.len())
+            .with_context(|| format!("Entry: field {field} len {len} extends past buffer (pos {pos} buf {})", buf.len()))?;
+        let slice = &buf[pos..end];
         pos += len;
         match field {
             1 => e.source     = parse_vname(slice)?,
@@ -832,10 +854,12 @@ fn parse_vname(buf: &[u8]) -> Result<VName> {
             bail!("VName: unexpected wire type {} for field {}", wire, field);
         }
         let len = read_varint_bytes(buf, &mut pos)? as usize;
-        if pos + len > buf.len() {
-            bail!("VName: field {} len {} extends past buffer", field, len);
-        }
-        let slice = &buf[pos..pos + len];
+        // checked_add: `len` is untrusted; avoid a usize wrap that would
+        // defeat the bound check and panic on the slice below.
+        let end = pos.checked_add(len)
+            .filter(|&e| e <= buf.len())
+            .with_context(|| format!("VName: field {field} len {len} extends past buffer"))?;
+        let slice = &buf[pos..end];
         pos += len;
         match field {
             1 => v.signature = String::from_utf8_lossy(slice).into_owned(),

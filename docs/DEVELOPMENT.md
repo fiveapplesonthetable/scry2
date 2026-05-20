@@ -17,9 +17,10 @@ If you just want to *use* scry2, read [INSTALL.md](INSTALL.md) instead.
 | Bazel | 6.x | only if you're rebuilding Kythe from source (see "Kythe patches" below) |
 | `gh` (optional) | latest | for PRs, not required to build |
 
-scry2 has five direct crate dependencies — `anyhow`, `clap`,
-`memmap2`, `twox-hash`, `libc` — and nothing else. No build.rs, no
-codegen, no C/C++ compilation. The release build takes 30 s clean.
+scry2 has eight direct crate dependencies — `memmap2`, `anyhow`,
+`clap`, `twox-hash`, `serde`, `serde_json`, `zip`, `memchr` — and
+nothing else. No build.rs, no codegen, no C/C++ compilation. The
+release build takes 30 s clean.
 
 ## Build & test
 
@@ -34,7 +35,7 @@ cargo build --release -p scry2-bench
 # add --features rocksdb-backend to include rocksdb (5-min C++ build)
 ```
 
-Six tests cover:
+The test suite covers:
 * round-trip of every section (xrefs, syms, names, files, inhs, calls)
 * FQN alias resolution via `add_alias`
 * callgraph both directions + dedup
@@ -81,7 +82,8 @@ scry2/
         └── src/{main, workload, stats, backend, be_mmap, be_redb, be_rocks}.rs
 ```
 
-Every `.rs` file is under the 700-line cap.
+The largest modules are `main.rs`, `kythe.rs`, `kzip.rs`,
+`writer.rs`, and `lib.rs`.
 
 ## Adding a new Kythe edge type
 
@@ -359,87 +361,109 @@ the peek can't locate a recognizable primary path (corrupted or
 non-standard CU layout), the orchestrator full-decodes and re-checks
 the filter, so no CU is silently dropped.
 
-### Resume on kill: `--resume` + rolling snapshots
+### Resume on kill: `--resume` + delta-shard snapshots
 
 Long AOSP runs get killed (host reboot, OOM, operator). `from-kzip`
-maintains a rolling builder snapshot so the next invocation picks up
-where the last one stopped.
+writes its in-RAM delta to standalone `.s2db` shards as the run
+progresses, so the next invocation picks up where the last one
+stopped without re-indexing durable CUs.
 
 ```bash
 # First run — gets killed mid-way through 12 000 CUs.
 scry2 from-kzip --kzip aosp.kzip --kythe-root … \
     --in frameworks/base,frameworks/native,system/,art/,libcore/ \
-    --snapshot-every 2000 \
+    --snapshot-rows 250000000 \
     -o /var/scry2/aosp.s2db
 
-# Restart picks up from /var/scry2/aosp.s2db.partial.{s2db,shas}.
+# Restart picks up from the delta shards + the durable sha list.
 scry2 from-kzip --kzip aosp.kzip --kythe-root … \
     --in frameworks/base,frameworks/native,system/,art/,libcore/ \
     --resume \
     -o /var/scry2/aosp.s2db
 ```
 
-What `--snapshot-every N` does, in detail:
+How the run is structured:
 
-1. After every `N` *successful* CUs (`ingest_tolerant` returned Ok
-   AND child exited 0 AND the entry stream was non-empty) one
-   worker locks `snap_state_mu`, locks `builder_mu`, calls
-   `FileIdAllocator::push_to(&mut builder)` to flush deferred
-   `(path, file_id)` mappings, clones the live builder, and releases
-   `builder_mu`. The clone is the snapshot's data.
-2. The shas that became successful since the last snapshot move
-   from `pending` into `committed` under the same lock — so the
-   snapshot's `<out>.partial.shas` reflects exactly what the clone
-   captured.
-3. `write_snapshot` does `clone.finish(<out>.partial.s2db.tmp)` →
-   atomic rename → write `<out>.partial.shas.tmp` → atomic rename
-   (in that order so a crash between the two renames leaves the
-   newer `.s2db` partial paired with a strictly older `.shas`,
-   which `--resume` rejects with a clear error rather than silently
-   double-counting).
-4. Empty / failed CUs DO NOT get a sha. On resume those CUs are
-   re-run — safe, because a failed CU contributed zero rows the
-   first time around.
+* Each worker owns its own `WorkerSink` (a local `IndexBuilder` plus
+  a `pending_shas` list). A CU is ingested into a per-CU builder,
+  then merged into the worker's sink under a brief lock — the
+  indexer subprocess and its stderr drain run with the sink free.
+* A shared `Accumulator` collects drained sinks at snapshot time.
+* A `delta_rows` gauge tracks the live in-RAM delta
+  (xrefs + inherits + calls + aliases) across all sinks.
+
+What triggers a snapshot:
+
+1. **Row budget — the primary trigger.** `--snapshot-rows`
+   (default `250_000_000`, ≈ a ~25 GB delta) bounds peak memory:
+   when the in-RAM delta crosses the budget a snapshot fires,
+   regardless of CU count, so the peak is deterministic no matter
+   how rows distribute across CUs. `0` disables it.
+2. **CU count — the coarse fallback.** `--snapshot-every`
+   (default `2000`) fires a snapshot after that many *successful*
+   CUs (`ingest_tolerant` returned Ok AND child exited 0 AND the
+   entry stream was non-empty). `0` disables it.
+
+What a snapshot does:
+
+1. Sets `snap_active` and waits for in-flight indexers to drain, so
+   the snapshot runs with worker subprocess RSS released.
+2. Drains every worker sink it can `try_lock` (a sink busy mid-merge
+   is skipped this tick and folded next time — its CU's rows and sha
+   stay together, so the shas list never names a CU whose rows
+   aren't durable) into the accumulator, subtracting the drained
+   count from `delta_rows`.
+3. Writes the accumulator's builder as a standalone delta shard via
+   `delta.finish(<out>.partial.shard.NNNN.s2db)` — `O(delta)` RAM,
+   no read of the prior shards, so snapshot wall time does not grow
+   with the run.
+4. Writes the durable `<out>.partial.shas` checkpoint atomically
+   (`.tmp` + rename + fsync) AFTER the shard lands, so the sha list
+   is always a subset of the rows already written to shards.
+
+Empty / failed CUs never get a sha, so `--resume` re-runs them —
+safe, since a failed CU contributed zero rows the first time.
 
 What `--resume` does:
 
-1. If `<out>.partial.s2db` and `<out>.partial.shas` are both
-   present, open the s2db as an `Index`, then
-   `IndexBuilder::populate_from_index(&ix)` replays every
-   xref / sym / file / inherit / call / alias back into a fresh
-   builder via the reader's `iter_*` methods.
-2. The shas file populates a `HashSet<String>` skip set; the plan
-   loop drops every CU whose sha is in that set.
-3. Indexing continues from where the snapshot left off, taking
-   further snapshots every `--snapshot-every` successes.
-4. On final `builder.finish(<out>.s2db)` success, the `partial.*`
-   files are removed.
+1. Treats any legacy single `<out>.partial.s2db` (from older runs)
+   as an immutable base and enumerates `<out>.partial.shard.NNNN.s2db`
+   in index order. Nothing is loaded into RAM here — shards are
+   merged once at the final write.
+2. The `<out>.partial.shas` file populates a skip set; the plan
+   loop drops every CU whose sha is listed. Shard numbering for the
+   resumed run continues after the highest shard already on disk, so
+   a kill never overwrites a durable shard.
+3. Indexing continues, taking further snapshots under the same two
+   triggers.
+
+The final write (always, not just on resume) folds everything into
+the authoritative output exactly once via a chained streaming merge:
+the remaining in-RAM delta is merged with the base partial, then each
+shard — loaded as a delta and merged via `write_merged_snapshot` —
+is folded into the running accumulator one at a time. Each step's
+prior stays on disk (mmap), so peak RAM is one merge's delta, never
+the whole accumulated index. On success the base partial, all shards,
+and the shas file are removed.
 
 Failure modes the design handles:
-- **Mid-snapshot crash** between the `.s2db.tmp` rename and the
-  `.shas.tmp` rename: the next `--resume` sees mismatched files
-  (newer s2db, older shas) and bails with `partial state is
-  incomplete` rather than double-counting.
-- **Crash with no shas yet committed**: only one of the two files
-  is present; same `--resume` failure path.
-- **Both files absent under --resume**: starts fresh, prints a
-  reassuring note.
+- **Crash mid-snapshot**: the shas checkpoint is written only after
+  its shard lands, so `--resume` never sees a sha for rows that
+  aren't on disk.
+- **Delta shards present but no shas under `--resume`**: bails with a
+  clear error rather than guessing which CUs are durable.
+- **Both base and shards absent under `--resume`**: starts fresh,
+  prints a reassuring note.
 - **Worker panic mid-CU**: `CleanupPath` Drop guards remove the
   sub-kzip / jvm_tmp paths from `--staging` even during unwind.
   External `kill -9` bypasses Drop, leaving a few files in
   staging which the next clean run wipes (`remove_dir_all(&staging)`
   at end of `cmd_from_kzip`).
-- **`FileIdAllocator` state lost in snapshot**: handled by
-  `push_to(&mut builder)` immediately before the clone — without
-  this, mid-run snapshots would carry zero `files` rows and
-  resumed `ref` queries couldn't resolve file paths.
 
-Picking `--snapshot-every`: snapshot wall is dominated by the
-builder clone (~1 s/GB of in-memory state) plus the `finish()`
-write (~10 s/GB compressed serialization). The default `2000`
-yields one snapshot per ~5 minutes of AOSP indexer wall — small
-enough that a kill costs at most 5 min of redo work, large
-enough that snapshots are <2 % overhead.
+Picking the triggers: leave `--snapshot-rows` at the default to bound
+peak RAM; lower it on a memory-tight host. `--snapshot-every` is a
+coarse durability backstop — a smaller value caps redo work on a kill
+at the cost of more frequent shard writes.
 
 ## Code style — what the reviewer will flag
 

@@ -57,7 +57,7 @@ if [[ ! -d "$KYTHE_SRC" ]]; then
     git clone --depth=1 -b v0.0.75 https://github.com/kythe/kythe.git "$KYTHE_SRC"
 fi
 if [[ ! -d "$SCRY_SRC" ]]; then
-    git clone --depth=1 https://github.com/fiveapplesonthetable/scry "$SCRY_SRC"
+    git clone --depth=1 https://github.com/fiveapplesonthetable/scry2 "$SCRY_SRC"
 fi
 
 cd "$KYTHE_SRC"

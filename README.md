@@ -54,6 +54,6 @@ path. Every read is a memcmp on mmap'd bytes.
 * Build: 80 M xrefs in **12 s** (projected from bench), 1 GB index.
 * Warm query p50: **1.8 µs** point lookup / **3.7 µs** prefix scan.
 * Disk: **991 MB** for 80 M xrefs (zero overhead vs the raw row bytes).
-* Test coverage: 6 unit tests across round-trip, FQN aliases,
+* Test coverage: unit tests across round-trip, FQN aliases,
   callgraph (both directions, dedup), name-substring, and the
   hand-rolled Kythe Entry decoder.

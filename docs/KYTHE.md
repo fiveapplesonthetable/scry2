@@ -39,9 +39,12 @@ aliases come from `/kythe/edge/named` (see below).
 | `/kythe/loc/start` | anchor start byte offset (ASCII decimal) | populates `AnchorAccum.start` |
 | `/kythe/loc/end` | anchor end byte offset | populates `AnchorAccum.end` — needed for body-anchor extents |
 
-Everything else is ignored. We don't decode `/kythe/code` (the
-MarkedSource pretty-name proto) — instead we get FQNs via the `named`
-edge below.
+We also decode `/kythe/code` (the MarkedSource pretty-name proto):
+`parse_marked_source_fqn` renders it into a flat FQN like
+`android::Parcel::writeStrongBinder` and registers that as a sym
+alias — this is the cxx path to FQN lookup, since cxx_indexer emits
+no `named` edge. For Java/JVM/Go we get FQNs via the `named` edge
+below. Everything else is ignored.
 
 ## Edges scry2 consumes
 
@@ -104,9 +107,9 @@ contribute to the `calls` table that `callgraph` walks.
 
 * Reads the kzip, writes delimited `Entry` protos to stdout.
 * Crashes if all CUs in the kzip are non-cxx (e.g. a Java-only kzip).
-  scry2's `from-kzip` redirects stderr to `/dev/null` and tolerates
-  truncated entry streams, so this doesn't sink the multi-language
-  ingest.
+  scry2's `from-kzip` captures the child's stderr tail through a pipe
+  (`drain_tail`) for failure diagnosis and tolerates truncated entry
+  streams, so this doesn't sink the multi-language ingest.
 * Does NOT emit `/kythe/edge/named` — for cxx, the VName signature
   string already encodes the canonical USR (`c:@N@android@C@Binder@F@…`).
   Result: substring search works; FQN aliases don't help much for cxx.
@@ -173,10 +176,6 @@ order to apply the patches) is in
   cross-translation-unit C++ refs split between forward-decl call
   sites and definition-site refs. Proper fix is a per-CU bridge map
   applied at xref emission. Tracked as a v0.2 follow-up.
-* **No MarkedSource decode.** Kythe's `/kythe/code` fact carries a
-  proto-encoded pretty-printed name. For cxx symbols this is what
-  would give us "clear demangled identifier" without falling back to
-  USR-style names. Substring search papers over it for now.
 * **Source-level Kotlin gaps.** Public Kythe v0.0.75 ships no
   source-level Kotlin indexer. JVM bytecode mostly fills the gap, but
   lambda bodies / inline functions don't survive the round-trip.

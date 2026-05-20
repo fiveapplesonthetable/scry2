@@ -56,9 +56,9 @@ cd scry2 && cargo build --release -p scry2
 sudo install -m 755 target/release/scry2 /usr/local/bin/
 ```
 
-The release build takes ~30 s. Seven small crate deps
-(`anyhow`, `clap`, `memmap2`, `serde`, `serde_json`, `twox-hash`,
-`libc`); no `build.rs`, no codegen, no C/C++.
+The release build takes ~30 s. Eight small crate deps
+(`memmap2`, `anyhow`, `clap`, `twox-hash`, `serde`, `serde_json`,
+`zip`, `memchr`); no `build.rs`, no codegen, no C/C++.
 
 ## What you get
 

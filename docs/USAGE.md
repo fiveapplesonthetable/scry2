@@ -306,5 +306,4 @@ For a full AOSP index (~1 GB on disk, ~80 M xrefs) the bench at
 `docs/BENCH.md` projects warm point lookups at 1.8 µs and warm prefix
 scans at 3.7 µs — the queries themselves get dwarfed by process
 startup. To eliminate startup overhead for an LLM running many
-queries in one session, build scry2 as a stdin-driven REPL is a
-v0.2 idea, currently not in scope.
+queries in one session, use `scry2 repl` (see above).

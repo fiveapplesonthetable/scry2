@@ -61,17 +61,20 @@ it doesn't.
 
 One `.s2db` file. Every section is **page-aligned** so the kernel can
 mmap each independently and the bench's `posix_fadvise(DONTNEED)`
-cleanly evicts a single section's pages. All multi-byte integers are
-**big-endian** packed so `memcmp` on a row's prefix gives lex order
-on `(primary_key, …)` — that lets every query reduce to a binary
-search on a slice plus a linear walk.
+cleanly evicts a single section's pages. Row keys are **big-endian**
+packed so `memcmp` on a row's prefix gives lex order on
+`(primary_key, …)` — that lets every query reduce to a binary search
+on a slice plus a linear walk. The 256-byte Header is the only
+host-endian structure. The blob offsets carried in the `syms`,
+`names`, and `files` rows are `u64`, since the blob can exceed 4 GiB
+on an AOSP-scale index.
 
 | section | row format | sort order | purpose |
 |---|---|---|---|
 | `xrefs` | `(sym u64, role u8, file u32, off u32)` = 17 B | `(sym, role, file, off)` | core: every anchor → sym attribution |
-| `syms` | `(sym u64, kind u8, lang u8, name_off u32, name_len u16)` = 16 B | by sym | sym → (name, kind, language) |
-| `names` | `(name_off u32, name_len u16, _pad u16, sym u64)` = 16 B | by name bytes | alpha-sorted name → sym lookup, **including aliases** from `/kythe/edge/named` |
-| `files` | `(file u32, path_off u32, path_len u16)` = 10 B | by file | file id → path |
+| `syms` | `(sym u64, kind u8, lang u8, name_off u64, name_len u16)` = 20 B | by sym | sym → (name, kind, language) |
+| `names` | `(name_off u64, name_len u16, sym u64)` = 18 B | by name bytes | alpha-sorted name → sym lookup, **including aliases** from `/kythe/edge/named` |
+| `files` | `(file u32, path_off u64, path_len u16)` = 14 B | by file | file id → path |
 | `inhs` | `(child u64, parent u64)` = 16 B | by (child, parent) | inheritance edges (extends, overrides, satisfies) |
 | `calls` | `(caller u64, callee u64, role u8)` = 17 B | by caller | callgraph DOWN — `calls_from(X)` is one binary search |
 | `crev`  | same rows | by callee | callgraph UP — `called_by(X)` is one binary search; no linear scan |
@@ -235,7 +238,7 @@ What lets scry2 collapse all of that to *one binary search*:
   read path. Other databases pay for write-tolerance even when
   reading.
 * **Packed fixed-width rows.** Each row is `[u8; 17]` (xrefs) or
-  `[u8; 16]` (syms). No length prefix, no header, no padding. A
+  `[u8; 20]` (syms). No length prefix, no header, no padding. A
   10 GB file = a 10 GB sorted array; no other overhead.
 * **Big-endian keys = free comparator.** Multi-byte fields are
   packed BE, so `memcmp` on the row bytes IS the lexicographic

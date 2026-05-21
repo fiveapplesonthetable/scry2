@@ -114,9 +114,7 @@ the final pass, so no already-ingested work is repeated. Without
 After every CU finishes, the run does **one k-way streaming pass** over
 (the in-RAM remainder delta + the base partial + every shard). Each source
 is mmap'd and read exactly once, so peak RAM is roughly one output blob
-rather than the whole union. The **trigram substring index is built once**
-over the final alpha-sorted names table at this point — it never
-complicates the per-CU ingest or the merge.
+rather than the whole union.
 
 ## Query verbs — by example
 

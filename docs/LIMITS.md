@@ -65,14 +65,13 @@ Name → sym lookup has two paths with different semantics:
 
 ## Substring search semantics
 
-`--substr` is **case-sensitive by default**; pass `-i` / `--ignore-case`
-for case-insensitive matching. Both are trigram-accelerated: the v5
-trigram index is a **case-insensitive candidate filter** (the dictionary
-holds lowercased trigrams), and a verify step over each surviving
-candidate enforces the chosen case — raw-byte comparison when
-case-sensitive, ASCII-folded when case-insensitive. A needle shorter than
-3 bytes has no trigram, so it falls back to a linear scan over the names
-table (same result set, slower).
+`--substr` runs a **parallel linear scan** over the names table
+(`memchr::memmem`, chunked across cores). It is **case-sensitive by
+default**; pass `-i` / `--ignore-case` for case-insensitive matching —
+the scan lowercases both the needle and each candidate before the
+substring check. Each call is bounded by its per-call cap (`--limit`),
+which also caps how many matching symbols flow into the `ref` /
+`callers --substr` aggregation, so a broad needle stays bounded.
 
 ## `--inject-cu-arg` re-encode detects only argument changes
 
@@ -93,9 +92,8 @@ be widened — compare the whole CU, or always re-encode.
 `Index::open` validates that every section's `(offset, count, stride)`
 fits within the mapped file (with checked arithmetic, so a corrupt header
 can't overflow into a spuriously in-range end). It does **not** validate
-internal references: blob offsets in sym/name/file/type rows, trigram
-posting offsets, and name row-ids in posting lists are trusted to be
-in-range. `.s2db` is a build output produced by `from-kzip` on the same
+internal references: blob offsets in sym/name/file/type rows are trusted
+to be in-range. `.s2db` is a build output produced by `from-kzip` on the same
 host; opening an untrusted or corrupt file can still panic on an
 out-of-range slice during a query. scry2 is not hardened against
 adversarial index files.

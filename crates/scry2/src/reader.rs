@@ -38,10 +38,7 @@ impl Index {
         // query or the final merge's shard re-read. Checked arithmetic so
         // a corrupt header can't overflow into a spurious in-range end.
         let map_len = map.len() as u64;
-        // v4 sections (typed/childrev/inhrev/sig) are zero in a v3 file, so
-        // their bounds check (0+0 <= map_len) trivially passes — that's what
-        // makes a v4 reader open a v3 file.
-        let sections: [(&str, u64, u64, u64); 12] = [
+        let sections: [(&str, u64, u64, u64); 14] = [
             ("xrefs",    hdr.xrefs_off,    hdr.xrefs_n,    XREF_LEN as u64),
             ("syms",     hdr.syms_off,     hdr.syms_n,     SYM_LEN  as u64),
             ("names",    hdr.names_off,    hdr.names_n,    NAME_LEN as u64),
@@ -53,6 +50,10 @@ impl Index {
             ("childrev", hdr.childrev_off, hdr.childrev_n, INH_LEN  as u64),
             ("inhrev",   hdr.inhrev_off,   hdr.inhrev_n,   INH_LEN  as u64),
             ("sig",      hdr.sig_off,      hdr.sig_n,      TYPE_LEN as u64),
+            // Trigram dict counts rows (TRIGRAM_LEN each); postings is a
+            // flat byte run (stride 1) of LE u32 ids.
+            ("trigram_dict", hdr.trigram_dict_off, hdr.trigram_dict_n, TRIGRAM_LEN as u64),
+            ("trigram_post", hdr.trigram_post_off, hdr.trigram_post_len, 1),
             ("blob",     hdr.blob_off,     hdr.blob_len,   1),
         ];
         for (name, off, n, stride) in sections {
@@ -76,6 +77,9 @@ impl Index {
     pub fn n_inhrev(&self) -> u64 { self.hdr.inhrev_n }
     pub fn n_childrev(&self) -> u64 { self.hdr.childrev_n }
     pub fn n_sig(&self) -> u64 { self.hdr.sig_n }
+    /// Number of distinct trigrams in the v5 substring index (0 if the
+    /// names table was empty or had no name >= 3 bytes).
+    pub fn n_trigram_dict(&self) -> u64 { self.hdr.trigram_dict_n }
 
     // -- raw section slices --------------------------------------------------
 
@@ -132,6 +136,16 @@ impl Index {
     fn sig_slice(&self) -> &[u8] {
         let off = self.hdr.sig_off as usize;
         let len = self.hdr.sig_n as usize * TYPE_LEN;
+        &self.map[off..off + len]
+    }
+    fn trigram_dict_slice(&self) -> &[u8] {
+        let off = self.hdr.trigram_dict_off as usize;
+        let len = self.hdr.trigram_dict_n as usize * TRIGRAM_LEN;
+        &self.map[off..off + len]
+    }
+    fn trigram_post_slice(&self) -> &[u8] {
+        let off = self.hdr.trigram_post_off as usize;
+        let len = self.hdr.trigram_post_len as usize;
         &self.map[off..off + len]
     }
     fn blob(&self) -> &[u8] {
@@ -242,29 +256,160 @@ impl Index {
         out
     }
 
-    /// Return all syms whose qualified name contains `needle` (case-
-    /// sensitive substring). Linear scan over the name index; for 5M
-    /// syms × 64 B/name = 320 MB this is 1 SSD pass.
+    /// Read the name-row at `row_id` (an index into the alpha-sorted names
+    /// table) as `(blob_slice, sym)`. Row layout: name_off u64 BE,
+    /// name_len u16 BE, sym u64 BE. Used by the trigram path to verify a
+    /// candidate and recover its sym.
+    fn name_row<'a>(&self, names: &[u8], blob: &'a [u8], row_id: u32) -> (&'a [u8], u64) {
+        let row_off = row_id as usize * NAME_LEN;
+        let off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap()) as usize;
+        let len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap()) as usize;
+        let sym = u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap());
+        (&blob[off..off + len], sym)
+    }
+
+    /// Look up `tri` in the trigram dictionary (sorted ascending by the
+    /// 3-byte key), returning its `(post_off_bytes, post_count)` posting
+    /// slot, or None if absent. Binary search over the 3-byte key only.
+    fn trigram_lookup(&self, dict: &[u8], tri: [u8; 3]) -> Option<(usize, usize)> {
+        let n = self.hdr.trigram_dict_n as usize;
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let row = mid * TRIGRAM_LEN;
+            let key: [u8; 3] = dict[row..row + 3].try_into().unwrap();
+            match key.cmp(&tri) {
+                std::cmp::Ordering::Less    => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal   => {
+                    // Layout: trigram[3] + _pad[1] + post_off u64 BE + post_count u32 BE.
+                    let post_off = u64::from_be_bytes(dict[row + 4..row + 12].try_into().unwrap()) as usize;
+                    let post_count = u32::from_be_bytes(dict[row + 12..row + 16].try_into().unwrap()) as usize;
+                    return Some((post_off, post_count));
+                }
+            }
+        }
+        None
+    }
+
+    /// Read a trigram's posting list (LE u32 name-row-ids, ascending) at
+    /// `(post_off_bytes, post_count)` into a Vec.
+    fn trigram_postings(&self, post: &[u8], post_off: usize, post_count: usize) -> Vec<u32> {
+        let mut out = Vec::with_capacity(post_count);
+        for i in 0..post_count {
+            let b = post_off + i * 4;
+            out.push(u32::from_le_bytes(post[b..b + 4].try_into().unwrap()));
+        }
+        out
+    }
+
+    /// Return all syms whose qualified name contains `needle`
+    /// (case-INSENSITIVE substring), up to `limit`.
     ///
-    /// Uses `memchr::memmem::Finder` for the inner string search: it
-    /// precomputes a SIMD-friendly state machine once per call and
-    /// is ~10× faster than the naive `windows(needle.len()).position`
-    /// pattern on long names, which dominates wall time on AOSP
-    /// (~5M names averaging 60 bytes).
+    /// Fast path (the common case): when the v5 trigram index is present
+    /// and `needle` has at least 3 bytes, intersect the posting lists of
+    /// the needle's distinct lowercased trigrams. The intersection is a
+    /// NECESSARY but not sufficient condition — a name can hold all of the
+    /// needle's trigrams without holding the needle contiguously (e.g.
+    /// "abcZZbcd" has both "abc" and "bcd" but not "abcd") — so each
+    /// surviving candidate is verified with a real (case-insensitive)
+    /// substring check before its sym is collected. This turns a ~92M-row
+    /// linear scan into a few small list intersections plus a handful of
+    /// verifications: sub-millisecond on realistic substrings.
+    ///
+    /// Fallback path: a needle shorter than 3 bytes has no trigram, and an
+    /// index built before v5 (or with an empty names table) has no dict —
+    /// in both cases we keep the parallel linear scan, so behaviour is
+    /// never worse than before.
+    ///
+    /// Result semantics match the prior linear scan: the same set of syms
+    /// (deduped), capped at `limit`. Order may differ — the trigram path
+    /// visits candidates in name-row-id order of the smallest posting
+    /// list, not whole-table order — which the callers already tolerate.
     pub fn syms_matching_substring(&self, needle: &str, limit: usize) -> Vec<u64> {
         let n = self.hdr.names_n as usize;
         let nb = needle.as_bytes();
+        if nb.is_empty() || n == 0 || limit == 0 { return Vec::new(); }
+
+        // Trigram fast path: 3+ byte needle AND a non-empty dict.
+        if nb.len() >= 3 && self.hdr.trigram_dict_n > 0 {
+            return self.syms_matching_substring_trigram(needle, limit);
+        }
+        self.syms_matching_substring_linear(nb, limit)
+    }
+
+    /// Trigram-accelerated substring search. See `syms_matching_substring`.
+    fn syms_matching_substring_trigram(&self, needle: &str, limit: usize) -> Vec<u64> {
+        let names = self.names_slice();
+        let blob = self.blob();
+        let dict = self.trigram_dict_slice();
+        let post = self.trigram_post_slice();
+
+        // Distinct lowercased trigrams of the needle. Lowercasing matches
+        // the build side (case-insensitive search). A trigram absent from
+        // the dict means NO name contains it, so no name can contain the
+        // needle → empty result.
+        let lneedle: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+        let mut tris: Vec<[u8; 3]> = lneedle.windows(3)
+            .map(|w| [w[0], w[1], w[2]]).collect();
+        tris.sort_unstable();
+        tris.dedup();
+
+        // Gather each trigram's posting list. Bail to empty the moment any
+        // trigram is missing (necessary condition fails for every name).
+        let mut lists: Vec<Vec<u32>> = Vec::with_capacity(tris.len());
+        for tri in tris {
+            match self.trigram_lookup(dict, tri) {
+                Some((off, count)) => lists.push(self.trigram_postings(post, off, count)),
+                None => return Vec::new(),
+            }
+        }
+        if lists.is_empty() {
+            // Shouldn't happen (needle.len() >= 3 yields >= 1 window), but
+            // be safe rather than index an empty Vec below.
+            return self.syms_matching_substring_linear(needle.as_bytes(), limit);
+        }
+
+        // k-way sorted intersection, smallest list first so we probe the
+        // fewest candidates. Each list is ascending and duplicate-free, so
+        // the intersection is a simple "present in every other list" check
+        // via binary search.
+        lists.sort_unstable_by_key(|l| l.len());
+        let (smallest, rest) = lists.split_first().unwrap();
+
+        // Case-insensitive substring verify: lowercase the candidate's
+        // bytes and search for the lowercased needle. Trigram intersection
+        // is necessary-not-sufficient, so this filters the false positives.
+        let nfind = memchr::memmem::Finder::new(&lneedle);
+        let mut out = Vec::with_capacity(limit.min(64));
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for &cand in smallest {
+            // Candidate must appear in every other (larger) posting list.
+            let in_all = rest.iter().all(|l| l.binary_search(&cand).is_ok());
+            if !in_all { continue; }
+            let (name, sym) = self.name_row(names, blob, cand);
+            let lname: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+            if nfind.find(&lname).is_some() && seen.insert(sym) {
+                out.push(sym);
+                if out.len() >= limit { break; }
+            }
+        }
+        out
+    }
+
+    /// Parallel linear scan over the whole name table — the fallback when
+    /// the needle is shorter than a trigram or no trigram index exists.
+    /// Matches case-INSENSITIVELY to agree with the trigram path. Splits
+    /// the table across cores; each thread keeps the first `limit` matches
+    /// in its contiguous range and the parts are concatenated in row order
+    /// then truncated, so the result is the first-`limit` set a serial
+    /// scan would return.
+    fn syms_matching_substring_linear(&self, nb: &[u8], limit: usize) -> Vec<u64> {
+        let n = self.hdr.names_n as usize;
         if nb.is_empty() || n == 0 { return Vec::new(); }
         let names = self.names_slice();
         let blob = self.blob();
-        // A substring (not prefix) match has to examine every name — there
-        // is no trigram index — and substring hits scatter across the
-        // alpha-sorted table, so it can't stop early. Split the table
-        // across cores: at 91M names a serial scan is ~30s; parallel it is
-        // a couple seconds. Each thread keeps the first `limit` matches in
-        // its contiguous row range, and the parts are concatenated in row
-        // order then truncated, so the result is exactly the first-`limit`
-        // set a serial scan would return.
+        let lneedle: Vec<u8> = nb.iter().map(|b| b.to_ascii_lowercase()).collect();
         let threads = std::thread::available_parallelism()
             .map(|p| p.get()).unwrap_or(1).clamp(1, n);
         let chunk = n.div_ceil(threads);
@@ -274,14 +419,17 @@ impl Index {
                 let lo = t * chunk;
                 let hi = ((t + 1) * chunk).min(n);
                 if lo >= hi { continue; }
+                let lneedle = &lneedle;
                 handles.push(s.spawn(move || {
-                    let finder = memchr::memmem::Finder::new(nb);
+                    let finder = memchr::memmem::Finder::new(lneedle.as_slice());
                     let mut local = Vec::new();
                     for i in lo..hi {
                         let row_off = i * NAME_LEN;
                         let off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap()) as usize;
                         let len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap()) as usize;
-                        if finder.find(&blob[off..off + len]).is_some() {
+                        let lname: Vec<u8> = blob[off..off + len].iter()
+                            .map(|b| b.to_ascii_lowercase()).collect();
+                        if finder.find(&lname).is_some() {
                             local.push(u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap()));
                             if local.len() >= limit { break; }
                         }
@@ -292,10 +440,13 @@ impl Index {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let mut out = Vec::with_capacity(limit.min(64));
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for part in parts {
             for sym in part {
-                out.push(sym);
-                if out.len() >= limit { return out; }
+                if seen.insert(sym) {
+                    out.push(sym);
+                    if out.len() >= limit { return out; }
+                }
             }
         }
         out

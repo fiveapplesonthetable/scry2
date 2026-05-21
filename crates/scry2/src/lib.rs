@@ -1424,4 +1424,119 @@ mod tests {
         assert_eq!(hits.len(), 1);
         let _ = std::fs::remove_file(&path);
     }
+
+    /// The trigram index must be PRESENT after a finish() write (header
+    /// fields non-zero) and a query through it must return exactly the
+    /// linear-scan answer on the same data. The decoy name "abcZZbcd"
+    /// shares the trigrams "abc" and "bcd" with the needle "abcd" but does
+    /// NOT contain "abcd" contiguously — it exercises the verify step that
+    /// drops trigram false positives.
+    #[test]
+    fn trigram_index_present_and_matches() {
+        let path = tmp("trigram_present");
+        let mut b = IndexBuilder::new();
+        // "abcd" appears in s_hit; the decoy holds abc+bcd but not abcd.
+        let s_hit   = sym_of("module.abcdef");
+        let s_decoy = sym_of("module.abcZZbcd");
+        let s_other = sym_of("module.zzzzzzz");
+        b.upsert_sym(s_hit,   kind::FUNCTION, lang::CXX, "module.abcdef");
+        b.upsert_sym(s_decoy, kind::FUNCTION, lang::CXX, "module.abcZZbcd");
+        b.upsert_sym(s_other, kind::FUNCTION, lang::CXX, "module.zzzzzzz");
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // Header carries a non-empty trigram dict.
+        assert!(ix.n_trigram_dict() > 0, "trigram section present after finish");
+
+        // 3+ char substring via the trigram path. Only the real hit, never
+        // the decoy.
+        let hits = ix.syms_matching_substring("abcd", 16);
+        assert_eq!(hits, vec![s_hit],
+            "trigram false-positive decoy 'abcZZbcd' must NOT match needle 'abcd'");
+
+        // A trigram that no name carries returns empty (the intersection
+        // short-circuits on the missing trigram).
+        assert!(ix.syms_matching_substring("qqq", 16).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A needle shorter than 3 bytes has no trigram, so the query must
+    /// fall back to the linear scan and still return the right syms.
+    #[test]
+    fn trigram_short_needle_falls_back() {
+        let path = tmp("trigram_short");
+        let mut b = IndexBuilder::new();
+        let s_xy = sym_of("foo.xy");
+        let s_z  = sym_of("foo.zz");
+        b.upsert_sym(s_xy, kind::FUNCTION, lang::CXX, "foo.xy");
+        b.upsert_sym(s_z,  kind::FUNCTION, lang::CXX, "foo.zz");
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // 2-char needle: fallback path. "xy" matches only foo.xy.
+        let hits = ix.syms_matching_substring("xy", 16);
+        assert_eq!(hits, vec![s_xy]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Substring matching is case-INSENSITIVE on both the trigram path
+    /// (3+ chars) and the linear fallback (<3 chars). The build lowercases
+    /// names, the query lowercases the needle.
+    #[test]
+    fn trigram_case_insensitive() {
+        let path = tmp("trigram_case");
+        let mut b = IndexBuilder::new();
+        let s = sym_of("com.Example.HandleRequest");
+        b.upsert_sym(s, kind::FUNCTION, lang::JAVA, "com.Example.HandleRequest");
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // Trigram path: differing case still matches.
+        assert_eq!(ix.syms_matching_substring("handlerequest", 16), vec![s]);
+        assert_eq!(ix.syms_matching_substring("EXAMPLE", 16), vec![s]);
+        // Mixed-case needle against differing-case name.
+        assert_eq!(ix.syms_matching_substring("hAnDlE", 16), vec![s]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The trigram-accelerated query and the linear scan must agree on the
+    /// SAME data. We compare the trigram result (3+ char needle, fast path)
+    /// against the fallback applied to the same needle, proving the index
+    /// doesn't drop or invent matches.
+    #[test]
+    fn trigram_matches_linear_on_same_data() {
+        let path = tmp("trigram_vs_linear");
+        let names = [
+            "android.os.Binder.clearCallingIdentity",
+            "android.os.Binder.restoreCallingIdentity",
+            "android.os.Parcel.writeStrongBinder",
+            "android.app.ActivityManager.killProcess",
+            "com.example.CallingConventionTest",
+        ];
+        let mut b = IndexBuilder::new();
+        let syms: Vec<u64> = names.iter().map(|n| {
+            let s = sym_of(n);
+            b.upsert_sym(s, kind::FUNCTION, lang::JAVA, n);
+            s
+        }).collect();
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+
+        for needle in ["Calling", "Binder", "android", "Process", "zzz_absent"] {
+            // Trigram (fast) path.
+            let mut fast = ix.syms_matching_substring(needle, 1000);
+            fast.sort_unstable();
+            // Brute-force reference: every name containing the needle
+            // case-insensitively.
+            let nlow = needle.to_ascii_lowercase();
+            let mut want: Vec<u64> = names.iter().enumerate()
+                .filter(|(_, n)| n.to_ascii_lowercase().contains(&nlow))
+                .map(|(i, _)| syms[i])
+                .collect();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(fast, want, "trigram result must equal brute force for '{needle}'");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

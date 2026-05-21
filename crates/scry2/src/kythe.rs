@@ -191,6 +191,50 @@ pub fn ingest_tolerant<R: Read>(
         stats.entries += 1;
         process_entry(&entry, &mut state, builder, file_ids, &mut stats);
     }
+    // -- Completes bridge: def-VName sym → decl-VName sym, for THIS CU.
+    //
+    // A `/kythe/edge/completes` edge links a C++ definition node (the
+    // `.cpp`) to the declaration it completes (the `.h`). Without applying
+    // it the definition's rows live under a separate, unmerged sym, so
+    // `def <method FQN>` (which resolves via the declaration's FQN alias)
+    // finds only the `.h` declaration location, not the `.cpp` body. We
+    // rewrite every buffered sym-keyed row from the def sym to the decl
+    // sym so the two unify on the queryable decl sym.
+    //
+    // Per-CU is correct: a definition VName is unique to the CU that
+    // contains it, so this remap touches only this CU's rows and is O(rows
+    // in this CU). The bridge is built here (not while streaming) because
+    // a `completes` edge can arrive after the rows it should rewrite; by
+    // finalize the whole CU — and thus every bridge — is known.
+    let bridge: HashMap<u64, u64> = state.completes_bridges.iter()
+        .map(|(def_vn, decl_vn)| (sym_of(def_vn), sym_of(decl_vn)))
+        .collect();
+    // Count APPLIED remaps (a sym that actually had a bridge entry), not
+    // the number of bridge edges — the latter says nothing about whether
+    // any row used them.
+    let mut applied: u64 = 0;
+    let mut remap = |s: u64| -> u64 {
+        match bridge.get(&s) {
+            Some(&d) => { applied += 1; d }
+            None => s,
+        }
+    };
+
+    // -- Buffered sym-keyed rows → builder, with the bridge applied.
+    for (sym, role, file, offset) in &state.xrefs {
+        builder.add_xref(remap(*sym), *role, *file, *offset);
+    }
+    for (sym, alias) in &state.aliases {
+        builder.add_alias(remap(*sym), alias);
+    }
+    for (child, parent) in &state.inherits {
+        // Both endpoints can be a bridged def VName.
+        builder.add_inherit(remap(*child), remap(*parent));
+    }
+    for (child, parent) in &state.childof {
+        builder.add_childof(remap(*child), remap(*parent));
+    }
+
     // -- Callgraph emission: resolve call_sites against body_anchors.
     //
     // Sort body anchors by (file_id, start). For each call_site
@@ -206,18 +250,14 @@ pub fn ingest_tolerant<R: Read>(
     stats.diag_pending      = state.call_sites.len() as u64;
     for (file, off, target_sym, role_byte) in &state.call_sites {
         if let Some(enc) = innermost_containing(&state.body_anchors, *file, *off) {
-            builder.add_call(enc, *target_sym, *role_byte);
+            // Bridge BOTH endpoints: the enclosing caller may be the def
+            // sym, and the callee may be a def sym too.
+            builder.add_call(remap(enc), remap(*target_sym), *role_byte);
             stats.calls_emitted += 1;
         } else {
             stats.diag_unresolved += 1;
         }
     }
-    // Apply per-stream completes bridges: rewrite any sym that came in
-    // as a definition-VName to its declaration-VName when an explicit
-    // bridge exists. The IndexBuilder doesn't currently expose that
-    // affordance; we defer it to a follow-up. The bridge count is
-    // surfaced via stats so callers can log it.
-    stats.completes_bridges = state.completes_bridges.len();
 
     // -- Resolved-type emission: render each typed edge's type node.
     //
@@ -228,7 +268,7 @@ pub fn ingest_tolerant<R: Read>(
         let g = CuTypeGraph { side: &state.types };
         for (src_key, type_key) in &state.types.edges {
             if let Some(rendered) = render_type(&g, type_key.as_str()) {
-                builder.add_type(sym_of(src_key), &rendered);
+                builder.add_type(remap(sym_of(src_key)), &rendered);
                 stats.types_emitted += 1;
             }
         }
@@ -250,11 +290,15 @@ pub fn ingest_tolerant<R: Read>(
             .map(|(s, t)| (s.as_str(), t.as_str())).collect();
         for fn_key in &state.types.functions {
             if let Some(sig) = render_signature(&g, fn_key, &state.types, &typed_of) {
-                builder.add_sig(sym_of(fn_key), &sig);
+                builder.add_sig(remap(sym_of(fn_key)), &sig);
                 stats.sigs_emitted += 1;
             }
         }
     }
+    // Report APPLIED remaps so callers can log how many def→decl rewrites
+    // actually landed (0 when a CU has completes edges but none of its
+    // buffered rows referenced a bridged def sym).
+    stats.completes_bridges = applied as usize;
     Ok(stats)
 }
 
@@ -356,6 +400,26 @@ struct IngestState {
     /// `(file_id, start, target_sym, role)` — call/ref sites waiting
     /// to be resolved against body_anchors after the stream ends.
     call_sites: Vec<(u32, u32, u64, u8)>,
+    /// Sym-keyed rows buffered for the WHOLE CU so the per-CU completes
+    /// bridge (def-VName → decl-VName) can remap them before they reach
+    /// the `IndexBuilder`. A `/kythe/edge/completes` edge can arrive after
+    /// the rows it should rewrite (the indexer emits the .cpp definition's
+    /// xrefs, then the bridge to the .h declaration), so streaming these
+    /// straight into the builder would miss the bridge. Buffering defers
+    /// every sym-keyed emission to the finalize step, where the bridge is
+    /// complete. `upsert_sym` (sym metadata) is NOT buffered: it is not
+    /// remapped — the def node keeps its own metadata row; only its
+    /// references unify onto the decl sym.
+    ///
+    /// `(sym, role, file, offset)` — resolved xref rows.
+    xrefs: Vec<(u64, u8, u32, u32)>,
+    /// `(sym, alias)` — FQN/name aliases for a sym.
+    aliases: Vec<(u64, String)>,
+    /// `(child, parent)` — inheritance edges.
+    inherits: Vec<(u64, u64)>,
+    /// `(child, parent)` — childof membership edges (stored child-first
+    /// here; `builder.add_childof` reverses to (parent, child)).
+    childof: Vec<(u64, u64)>,
     /// Resolved-type side-table, drained at CU finalize.
     ///
     /// `/kythe/edge/typed` connects a sym node to a *type node*, which is
@@ -422,6 +486,10 @@ fn process_entry(
     let completes_bridges = &mut state.completes_bridges;
     let body_anchors      = &mut state.body_anchors;
     let call_sites        = &mut state.call_sites;
+    let xrefs             = &mut state.xrefs;
+    let aliases           = &mut state.aliases;
+    let inherits          = &mut state.inherits;
+    let childof           = &mut state.childof;
     let types             = &mut state.types;
     if e.source.is_empty() { return; }
     let source_key = e.source.to_symbol_string();
@@ -441,12 +509,12 @@ fn process_entry(
         // without the user knowing the descriptor.
         if is_named_edge(&e.edge_kind) && !e.target.signature.is_empty() {
             let sym = sym_of(&source_key);
-            let raw = e.target.signature.as_ref();
-            builder.add_alias(sym, raw);
+            let raw = e.target.signature.as_str();
+            aliases.push((sym, raw.to_string()));
             stats.aliases_emitted += 1;
             if let Some(stripped) = strip_jvm_method_descriptor(raw) {
                 if stripped.len() != raw.len() {
-                    builder.add_alias(sym, stripped);
+                    aliases.push((sym, stripped.to_string()));
                     stats.aliases_emitted += 1;
                 }
             }
@@ -456,7 +524,7 @@ fn process_entry(
         if is_inherit_edge(&e.edge_kind) && !e.target.is_empty() {
             let child  = sym_of(&source_key);
             let parent = sym_of(&e.target.to_symbol_string());
-            builder.add_inherit(child, parent);
+            inherits.push((child, parent));
             stats.inherits_emitted += 1;
             return;
         }
@@ -488,7 +556,7 @@ fn process_entry(
         if is_childof_edge(&e.edge_kind) && !e.target.is_empty() {
             let child  = sym_of(&source_key);
             let parent = sym_of(&e.target.to_symbol_string());
-            builder.add_childof(child, parent);
+            childof.push((child, parent));
             stats.childof_emitted += 1;
             return;
         }
@@ -508,7 +576,7 @@ fn process_entry(
             if let (true, Some(start)) = (a.is_anchor, a.start) {
                 let file_id = file_ids.intern(&a.path);
                 emit_xref_resolved(target_sym, &e.target, role_byte, file_id, start,
-                                   builder, stats);
+                                   xrefs, builder, stats);
                 if role_byte == role::REF || role_byte == role::CALL {
                     call_sites.push((file_id, start, target_sym, role_byte));
                 }
@@ -535,7 +603,7 @@ fn process_entry(
         "/kythe/code" => {
             if let Some(fqn) = parse_marked_source_fqn(&e.fact_value) {
                 let sym = sym_of(&source_key);
-                builder.add_alias(sym, &fqn);
+                aliases.push((sym, fqn));
                 stats.aliases_emitted += 1;
             }
             // A type node's MarkedSource is the source of its rendered
@@ -553,7 +621,7 @@ fn process_entry(
                 let a = anchors.entry(source_key.clone()).or_default();
                 a.is_anchor = true;
                 if a.path.is_empty() { a.path = e.source.path.clone(); }
-                flush_ready(a, body_anchors, call_sites, builder, file_ids, stats);
+                flush_ready(a, body_anchors, call_sites, xrefs, builder, file_ids, stats);
             } else {
                 // Symbol node. Register name (= source_key for now —
                 // FQN normalization via `named` edges is a follow-up)
@@ -585,7 +653,7 @@ fn process_entry(
                 let a = anchors.entry(source_key.clone()).or_default();
                 if a.path.is_empty() { a.path = e.source.path.clone(); }
                 a.start = Some(v);
-                flush_ready(a, body_anchors, call_sites, builder, file_ids, stats);
+                flush_ready(a, body_anchors, call_sites, xrefs, builder, file_ids, stats);
             }
         }
         "/kythe/loc/end" => {
@@ -604,10 +672,12 @@ fn process_entry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_ready(
     a: &mut AnchorAccum,
     body_anchors: &mut Vec<(u32, u32, u32, u64)>,
     call_sites:   &mut Vec<(u32, u32, u64, u8)>,
+    xrefs:        &mut Vec<(u64, u8, u32, u32)>,
     builder: &mut IndexBuilder,
     file_ids: &FileIdAllocator,
     stats: &mut IngestStats,
@@ -619,7 +689,7 @@ fn flush_ready(
     let pend  = std::mem::take(&mut a.pending);
     for (target, role_byte) in pend {
         let target_sym = sym_of(&target.to_symbol_string());
-        emit_xref_resolved(target_sym, &target, role_byte, file_id, start, builder, stats);
+        emit_xref_resolved(target_sym, &target, role_byte, file_id, start, xrefs, builder, stats);
         if role_byte == role::REF || role_byte == role::CALL {
             call_sites.push((file_id, start, target_sym, role_byte));
         }
@@ -636,19 +706,24 @@ fn flush_ready(
     stats.anchors_flushed += 1;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_xref_resolved(
     sym: u64,
     target: &VName,
     role_byte: u8,
     file_id: u32,
     offset: u32,
+    xrefs: &mut Vec<(u64, u8, u32, u32)>,
     builder: &mut IndexBuilder,
     stats: &mut IngestStats,
 ) {
     if target.is_empty() { return; }
     let sym_str = target.to_symbol_string();
+    // Sym metadata streams straight in (not bridged): the def node keeps
+    // its own name/kind row. The xref row is buffered so the per-CU
+    // completes bridge can remap its sym to the decl at finalize.
     builder.upsert_sym(sym, kind::UNK, target.lang_byte(), &sym_str);
-    builder.add_xref(sym, role_byte, file_id, offset);
+    xrefs.push((sym, role_byte, file_id, offset));
     stats.xrefs_emitted += 1;
 }
 
@@ -2391,5 +2466,125 @@ mod tests {
         assert_eq!(stats.anchors_flushed, 1);
         assert_eq!(stats.xrefs_emitted, 1);
         assert_eq!(builder.n_xrefs(), 1);
+    }
+
+    /// Wire-format helpers shared by the completes-bridge test: encode a
+    /// length-delimited proto field, a bare varint, an Entry, and a VName.
+    fn ld(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+        out.push(((field << 3) | 2) as u8);
+        let mut v = bytes.len() as u64;
+        while v >= 0x80 { out.push(((v & 0x7F) | 0x80) as u8); v >>= 7; }
+        out.push(v as u8);
+        out.extend_from_slice(bytes);
+    }
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 { out.push(((v & 0x7F) | 0x80) as u8); v >>= 7; }
+        out.push(v as u8);
+    }
+    /// A C++ VName: signature + corpus + path + language (c++).
+    fn cxx_vname(sig: &[u8], path: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        ld(1, sig, &mut v);
+        ld(2, b"test", &mut v);
+        ld(4, path, &mut v);
+        ld(5, b"c++", &mut v);
+        v
+    }
+    fn entry(source: &[u8], edge: &[u8], target: &[u8], fact_name: &[u8], fact_value: &[u8]) -> Vec<u8> {
+        let mut e = Vec::new();
+        ld(1, source, &mut e);
+        if !edge.is_empty()       { ld(2, edge, &mut e); }
+        if !target.is_empty()     { ld(3, target, &mut e); }
+        if !fact_name.is_empty()  { ld(4, fact_name, &mut e); }
+        if !fact_value.is_empty() { ld(5, fact_value, &mut e); }
+        e
+    }
+    fn push_entry(stream: &mut Vec<u8>, e: Vec<u8>) {
+        varint(e.len() as u64, stream);
+        stream.extend_from_slice(&e);
+    }
+
+    /// C++ DEF↔DECL completes bridge: a `.cpp` definition node `completes`
+    /// the `.h` declaration it implements. After ingest, the FQN (an alias
+    /// on the DECL) must resolve to a sym whose xrefs include BOTH the `.h`
+    /// declaration location AND the `.cpp` definition location — i.e. the
+    /// definition's xref, which streamed in under the DEF VName's sym, was
+    /// remapped onto the DECL sym so the two unify.
+    ///
+    /// The `completes` edge is emitted LAST, after the rows it rewrites,
+    /// to exercise the deferred (finalize-time) application: a bridge that
+    /// arrives after the definition's own xref still rewrites it.
+    #[test]
+    fn completes_bridge_unifies_def_onto_decl() {
+        use crate::reader::Index;
+
+        // Nodes.
+        let decl_vn  = cxx_vname(b"#decl", b"foo.h");
+        let def_vn   = cxx_vname(b"#def",  b"foo.cpp");
+        // The human FQN that `def Foo::bar` queries by — a `named` edge
+        // target whose signature carries the name.
+        let mut name_vn = Vec::new();
+        ld(1, b"Foo::bar", &mut name_vn);
+        // Declaration anchor in foo.h binding the DECL node.
+        let danchor_vn = cxx_vname(b"#da", b"foo.h");
+        // Definition anchor in foo.cpp binding the DEF node.
+        let fanchor_vn = cxx_vname(b"#fa", b"foo.cpp");
+
+        let mut stream = Vec::new();
+        // DECL is a function node + carries the FQN alias.
+        push_entry(&mut stream, entry(&decl_vn, b"", b"", b"/kythe/node/kind", b"function"));
+        push_entry(&mut stream, entry(&decl_vn, b"/kythe/edge/named", &name_vn, b"/", b""));
+        // Declaration anchor → DECL (defines/binding = DECL role).
+        push_entry(&mut stream, entry(&danchor_vn, b"", b"", b"/kythe/node/kind", b"anchor"));
+        push_entry(&mut stream, entry(&danchor_vn, b"", b"", b"/kythe/loc/start", b"100"));
+        push_entry(&mut stream, entry(&danchor_vn, b"/kythe/edge/defines/binding", &decl_vn, b"/", b""));
+        // DEF is a function node too.
+        push_entry(&mut stream, entry(&def_vn, b"", b"", b"/kythe/node/kind", b"function"));
+        // Definition anchor → DEF (defines/binding = DECL role on the DEF
+        // node — its location in foo.cpp).
+        push_entry(&mut stream, entry(&fanchor_vn, b"", b"", b"/kythe/node/kind", b"anchor"));
+        push_entry(&mut stream, entry(&fanchor_vn, b"", b"", b"/kythe/loc/start", b"200"));
+        push_entry(&mut stream, entry(&fanchor_vn, b"/kythe/edge/defines/binding", &def_vn, b"/", b""));
+        // The bridge, emitted LAST: DEF completes DECL.
+        push_entry(&mut stream, entry(&def_vn, b"/kythe/edge/completes", &decl_vn, b"/", b""));
+
+        let mut builder = IndexBuilder::new();
+        let fids = FileIdAllocator::default();
+        let stats = ingest(&stream[..], &mut builder, &fids).unwrap();
+        // The DEF's one xref row was remapped (1 applied remap).
+        assert_eq!(stats.completes_bridges, 1, "exactly the def xref remapped to decl");
+        fids.drain_into(&mut builder);
+
+        // Round-trip through the on-disk format, exactly as the `def` verb.
+        let dir = std::env::temp_dir().join(format!(
+            "scry2-completes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s2db = dir.join("completes.s2db");
+        builder.finish(&s2db).unwrap();
+        let idx = Index::open(&s2db).unwrap();
+
+        // `def Foo::bar` resolves via the alias to the DECL sym.
+        let decl_sym = sym_of(&parse_vname(&decl_vn).unwrap().to_symbol_string());
+        let def_sym  = sym_of(&parse_vname(&def_vn).unwrap().to_symbol_string());
+        assert_eq!(idx.sym_for_name("Foo::bar"), Some(decl_sym),
+            "FQN resolves to the declaration sym");
+
+        // The DECL sym now carries BOTH locations: the foo.h declaration
+        // (offset 100) and — via the bridge — the foo.cpp definition
+        // (offset 200, originally bound under the DEF sym).
+        let mut paths: Vec<(String, u32)> = idx.xrefs(decl_sym, role::DECL, role::DEF)
+            .map(|(_, _, file, off)| (idx.file_path(file).unwrap().to_string(), off))
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec![
+            ("foo.cpp".to_string(), 200),
+            ("foo.h".to_string(),   100),
+        ], "decl sym holds both the .h decl and the bridged .cpp def");
+
+        // The DEF sym has NO xrefs of its own — they all moved to DECL.
+        assert_eq!(idx.xrefs(def_sym, role::DECL, role::DEF).count(), 0,
+            "def sym's xref was remapped away");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -478,3 +478,37 @@ fn def_exact_ambiguous_name_aggregates_all_syms() {
     assert!(v.to_string().contains("Dup.java"), "the def-bearing variant missing: {v}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn def_substr_ignore_case_opt_in_only() {
+    // `--substr` defaults to case-SENSITIVE (regression guard); `-i` /
+    // `--ignore-case` opts into ASCII case folding. Exact-case `Example`
+    // matches with --substr; lowercase `example` matches only WITH
+    // --ignore-case, and misses without it.
+    let tid: String = format!("{:?}", std::thread::current().id())
+        .chars().filter(|c| c.is_ascii_digit()).collect();
+    let dir = std::env::temp_dir().join(format!("scry2-cli-ci-{}-{}", std::process::id(), tid));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s2db = dir.join("ci.s2db");
+    let mut b = IndexBuilder::new();
+    let s = sym_of("com.Example.HandleRequest");
+    b.upsert_sym(s, kind::FUNCTION, lang::JAVA, "com.Example.HandleRequest");
+    b.upsert_file(1, "core/java/com/Example.java");
+    b.add_xref(s, role::DEF, 1, 100);
+    b.finish(&s2db).unwrap();
+
+    // Exact-case substring matches under the default (case-sensitive) path.
+    let v = run(&s2db, &["def", "Example", "--substr"]);
+    assert!(n_rows(&v) >= 1, "exact-case 'Example' must match with --substr: {v}");
+
+    // Lowercase needle matches only with --ignore-case.
+    let v = run(&s2db, &["def", "example", "--substr", "--ignore-case"]);
+    assert!(n_rows(&v) >= 1, "lowercase 'example' must match with --ignore-case: {v}");
+
+    // The default --substr is case-sensitive: lowercase needle misses.
+    let v = run(&s2db, &["def", "example", "--substr"]);
+    assert_eq!(n_rows(&v), 0, "default --substr must be case-sensitive: {v}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

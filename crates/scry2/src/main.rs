@@ -102,6 +102,10 @@ enum Cmd {
         /// scan of the whole name table). Omit for an exact-FQN lookup,
         /// which is a binary search.
         #[arg(long)] substr: bool,
+        /// With --substr, fold ASCII case so NAME matches regardless of
+        /// case. Default is case-SENSITIVE (code identifiers are
+        /// case-significant). Both modes run at trigram speed.
+        #[arg(short = 'i', long = "ignore-case")] ignore_case: bool,
         /// With --substr, cap how many matching definitions to print.
         #[arg(long, default_value = "16")] limit: usize,
         /// Keep only hits whose file path contains SUBSTR.
@@ -158,6 +162,9 @@ enum Cmd {
         /// refs across matching symbols (capped at 64, raise with --limit).
         /// Prefer an exact FQN for hot paths — use `names NAME` to find it.
         #[arg(long)] substr: bool,
+        /// With --substr, fold ASCII case so NAME matches regardless of
+        /// case. Default is case-SENSITIVE. Both modes run at trigram speed.
+        #[arg(short = 'i', long = "ignore-case")] ignore_case: bool,
         /// With --substr, cap how many matching symbols to aggregate over.
         #[arg(long, default_value = "16")] limit: usize,
         /// Stop after this many hits; the result is marked truncated.
@@ -177,6 +184,9 @@ enum Cmd {
         /// call sites across matching symbols (capped at 64, raise with
         /// --limit). Prefer an exact FQN — use `names NAME` to find it.
         #[arg(long)] substr: bool,
+        /// With --substr, fold ASCII case so NAME matches regardless of
+        /// case. Default is case-SENSITIVE. Both modes run at trigram speed.
+        #[arg(short = 'i', long = "ignore-case")] ignore_case: bool,
         /// With --substr, cap how many matching symbols to aggregate over.
         #[arg(long, default_value = "16")] limit: usize,
         /// Stop after this many hits; the result is marked truncated.
@@ -428,18 +438,18 @@ fn main() -> Result<()> {
     // Query-side: build a Request, dispatch in-process or via socket.
     let req = match cli.cmd {
         Cmd::Stat => Request::Stat,
-        Cmd::Def { name, substr, limit, in_, not_in }
-            => Request::Def { name, substr, limit, in_, not_in },
+        Cmd::Def { name, substr, ignore_case, limit, in_, not_in }
+            => Request::Def { name, substr, ignore_case, limit, in_, not_in },
         Cmd::Type { name, substr, limit }
             => Request::Type { name, substr, limit },
         Cmd::Sig { name, substr, limit }
             => Request::Sig { name, substr, limit },
         Cmd::Members { name, substr, limit }
             => Request::Members { name, substr, limit },
-        Cmd::Ref { name, substr, limit, max_hits, in_, not_in, def_in }
-            => Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in },
-        Cmd::Callers { name, substr, limit, max_hits, in_, not_in, def_in }
-            => Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in },
+        Cmd::Ref { name, substr, ignore_case, limit, max_hits, in_, not_in, def_in }
+            => Request::Ref { name, substr, ignore_case, limit, max_hits, in_, not_in, def_in },
+        Cmd::Callers { name, substr, ignore_case, limit, max_hits, in_, not_in, def_in }
+            => Request::Callers { name, substr, ignore_case, limit, max_hits, in_, not_in, def_in },
         Cmd::Super { name, substr, limit, in_, not_in }
             => Request::Super { name, substr, limit, in_, not_in },
         Cmd::Sub   { name, substr, limit, in_, not_in }

@@ -38,7 +38,8 @@ use std::path::{Path, PathBuf};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Stat,
-    Def { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
+    Def { name: String, #[serde(default)] substr: bool,
+          #[serde(default)] ignore_case: bool, #[serde(default = "lim16")] limit: usize,
           #[serde(default, rename = "in")]  in_:    Option<String>,
           #[serde(default)] not_in: Option<String> },
     Type { name: String, #[serde(default)] substr: bool,
@@ -47,12 +48,14 @@ pub enum Request {
            #[serde(default = "lim16")] limit: usize },
     Members { name: String, #[serde(default)] substr: bool,
               #[serde(default = "lim16")] limit: usize },
-    Ref { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
+    Ref { name: String, #[serde(default)] substr: bool,
+          #[serde(default)] ignore_case: bool, #[serde(default = "lim16")] limit: usize,
           #[serde(default = "lim_max_hits")] max_hits: usize,
           #[serde(default, rename = "in")] in_: Option<String>,
           #[serde(default)] not_in: Option<String>,
           #[serde(default)] def_in: Option<String> },
-    Callers { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
+    Callers { name: String, #[serde(default)] substr: bool,
+              #[serde(default)] ignore_case: bool, #[serde(default = "lim16")] limit: usize,
               #[serde(default = "lim_max_hits")] max_hits: usize,
               #[serde(default, rename = "in")] in_: Option<String>,
               #[serde(default)] not_in: Option<String>,
@@ -160,8 +163,8 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
             inhs:  ix.n_inh(),
             calls: ix.n_calls(),
         },
-        Request::Def { name, substr, limit, in_, not_in } => do_xrefs(
-            ix, name, *substr, *limit, (role::DECL, role::DEF), usize::MAX,
+        Request::Def { name, substr, ignore_case, limit, in_, not_in } => do_xrefs(
+            ix, name, *substr, *ignore_case, *limit, (role::DECL, role::DEF), usize::MAX,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: None },
             /*with_type=*/true,
         ),
@@ -174,13 +177,13 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
         // return 0 because the 16 alpha-first matches were Java stubs with
         // no call edges while the C++ definition (which has the callers)
         // sorted later. Gather broadly; the output is bounded by max_hits.
-        Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
-            ix, name, *substr, (*limit).max(SUBSTR_AGG_CAP), (0, u8::MAX), *max_hits,
+        Request::Ref { name, substr, ignore_case, limit, max_hits, in_, not_in, def_in } => do_xrefs(
+            ix, name, *substr, *ignore_case, (*limit).max(SUBSTR_AGG_CAP), (0, u8::MAX), *max_hits,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
             /*with_type=*/false,
         ),
-        Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
-            ix, name, *substr, (*limit).max(SUBSTR_AGG_CAP), (role::CALL, role::CALL), *max_hits,
+        Request::Callers { name, substr, ignore_case, limit, max_hits, in_, not_in, def_in } => do_xrefs(
+            ix, name, *substr, *ignore_case, (*limit).max(SUBSTR_AGG_CAP), (role::CALL, role::CALL), *max_hits,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
             /*with_type=*/false,
         ),
@@ -217,14 +220,21 @@ const SUBSTR_AGG_CAP: usize = 64;
 
 #[allow(clippy::too_many_arguments)]
 fn do_xrefs(
-    ix: &Index, name: &str, substr: bool, sym_cap: usize,
+    ix: &Index, name: &str, substr: bool, ignore_case: bool, sym_cap: usize,
     roles: (u8, u8), max_hits: usize,
     filt: PathFilter<'_>,
     with_type: bool,
 ) -> Reply {
     let (role_lo, role_hi) = roles;
     let syms: Vec<u64> = if substr {
-        ix.syms_matching_substring(name, sym_cap)
+        // The case fold applies ONLY to substring matching; the default
+        // (case-sensitive) path is unchanged. Exact-FQN lookups
+        // (`!substr`) are never folded.
+        if ignore_case {
+            ix.syms_matching_substring_ci(name, sym_cap)
+        } else {
+            ix.syms_matching_substring(name, sym_cap)
+        }
     } else { ix.syms_for_name(name) };
     let mut groups: Vec<SymbolGroup> = Vec::new();
     let mut total = 0usize;

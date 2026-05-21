@@ -303,19 +303,40 @@ impl Index {
         out
     }
 
-    /// Return all syms whose qualified name contains `needle`
-    /// (case-INSENSITIVE substring), up to `limit`.
+    /// Return all syms whose qualified name contains `needle` as a
+    /// CASE-SENSITIVE substring, up to `limit`. The default `--substr`
+    /// path — see `syms_matching_substring_impl` for the mechanism. For an
+    /// opt-in case-insensitive search use `syms_matching_substring_ci`.
+    pub fn syms_matching_substring(&self, needle: &str, limit: usize) -> Vec<u64> {
+        self.syms_matching_substring_impl(needle, limit, /*ignore_case=*/false)
+    }
+
+    /// Return all syms whose qualified name contains `needle` as a
+    /// CASE-INSENSITIVE (ASCII-folded) substring, up to `limit`. The opt-in
+    /// `--substr --ignore-case` path. Runs at the same trigram speed as the
+    /// case-sensitive default — the index is a case-folded candidate filter
+    /// either way; only the per-candidate verify differs.
+    pub fn syms_matching_substring_ci(&self, needle: &str, limit: usize) -> Vec<u64> {
+        self.syms_matching_substring_impl(needle, limit, /*ignore_case=*/true)
+    }
+
+    /// Shared substring engine for the case-sensitive default and the
+    /// opt-in case-insensitive search. The trigram index is a CASE-FOLDED
+    /// candidate filter (it was built from each name's lowercased bytes);
+    /// `ignore_case` decides only how each surviving candidate is VERIFIED.
     ///
     /// Fast path (the common case): when the v5 trigram index is present
     /// and `needle` has at least 3 bytes, intersect the posting lists of
-    /// the needle's distinct lowercased trigrams. The intersection is a
-    /// NECESSARY but not sufficient condition — a name can hold all of the
-    /// needle's trigrams without holding the needle contiguously (e.g.
-    /// "abcZZbcd" has both "abc" and "bcd" but not "abcd") — so each
-    /// surviving candidate is verified with a real (case-insensitive)
-    /// substring check before its sym is collected. This turns a ~92M-row
-    /// linear scan into a few small list intersections plus a handful of
-    /// verifications: sub-millisecond on realistic substrings.
+    /// the needle's distinct LOWERCASED trigrams (the dict is lowercased).
+    /// The intersection is a NECESSARY but not sufficient condition — a
+    /// name can hold all of the needle's trigrams without holding the
+    /// needle contiguously (e.g. "abcZZbcd" has both "abc" and "bcd" but
+    /// not "abcd") — so each surviving candidate is verified with a real
+    /// substring check before its sym is collected: case-sensitive on the
+    /// RAW bytes when `!ignore_case`, case-folded when `ignore_case`. This
+    /// turns a ~92M-row linear scan into a few small list intersections
+    /// plus a handful of verifications: sub-millisecond on realistic
+    /// substrings, regardless of the case mode.
     ///
     /// Fallback path: a needle shorter than 3 bytes has no trigram, and an
     /// index built before v5 (or with an empty names table) has no dict —
@@ -326,31 +347,31 @@ impl Index {
     /// (deduped), capped at `limit`. Order may differ — the trigram path
     /// visits candidates in name-row-id order of the smallest posting
     /// list, not whole-table order — which the callers already tolerate.
-    pub fn syms_matching_substring(&self, needle: &str, limit: usize) -> Vec<u64> {
+    fn syms_matching_substring_impl(&self, needle: &str, limit: usize, ignore_case: bool) -> Vec<u64> {
         let n = self.hdr.names_n as usize;
         let nb = needle.as_bytes();
         if nb.is_empty() || n == 0 || limit == 0 { return Vec::new(); }
 
         // Trigram fast path: 3+ byte needle AND a non-empty dict.
         if nb.len() >= 3 && self.hdr.trigram_dict_n > 0 {
-            return self.syms_matching_substring_trigram(needle, limit);
+            return self.syms_matching_substring_trigram(needle, limit, ignore_case);
         }
-        self.syms_matching_substring_linear(nb, limit)
+        self.syms_matching_substring_linear(nb, limit, ignore_case)
     }
 
-    /// Trigram-accelerated substring search. See `syms_matching_substring`.
-    fn syms_matching_substring_trigram(&self, needle: &str, limit: usize) -> Vec<u64> {
+    /// Trigram-accelerated substring search. See `syms_matching_substring_impl`.
+    fn syms_matching_substring_trigram(&self, needle: &str, limit: usize, ignore_case: bool) -> Vec<u64> {
         let names = self.names_slice();
         let blob = self.blob();
         let dict = self.trigram_dict_slice();
         let post = self.trigram_post_slice();
 
-        // Distinct trigrams of the needle (case-sensitive, matching the
-        // build side and the original linear scan). A trigram absent from
-        // the dict means NO name contains it, so no name can contain the
-        // needle → empty result.
-        let nb = needle.as_bytes();
-        let mut tris: Vec<[u8; 3]> = nb.windows(3)
+        // Distinct trigrams of the needle, ALWAYS lowercased to match the
+        // case-folded build side (the dict holds lowercased trigrams). A
+        // trigram absent from the dict means NO name contains it (in any
+        // case), so no name can contain the needle → empty result.
+        let lower_needle: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+        let mut tris: Vec<[u8; 3]> = lower_needle.windows(3)
             .map(|w| [w[0], w[1], w[2]]).collect();
         tris.sort_unstable();
         tris.dedup();
@@ -367,7 +388,7 @@ impl Index {
         if lists.is_empty() {
             // Shouldn't happen (needle.len() >= 3 yields >= 1 window), but
             // be safe rather than index an empty Vec below.
-            return self.syms_matching_substring_linear(needle.as_bytes(), limit);
+            return self.syms_matching_substring_linear(needle.as_bytes(), limit, ignore_case);
         }
 
         // k-way sorted intersection, smallest list first so we probe the
@@ -379,8 +400,12 @@ impl Index {
 
         // Substring verify: trigram intersection is necessary-not-sufficient
         // (a name can hold every needle trigram without the contiguous
-        // needle), so confirm each candidate actually contains it.
-        let nfind = memchr::memmem::Finder::new(nb);
+        // needle), so confirm each candidate actually contains it. The
+        // verify decides case: case-sensitive search of the RAW needle in
+        // the RAW name when `!ignore_case`; case-folded search of the
+        // lowercased needle in the lowercased candidate when `ignore_case`.
+        let verify_needle: &[u8] = if ignore_case { &lower_needle } else { needle.as_bytes() };
+        let nfind = memchr::memmem::Finder::new(verify_needle);
         let mut out = Vec::with_capacity(limit.min(64));
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for &cand in smallest {
@@ -388,7 +413,13 @@ impl Index {
             let in_all = rest.iter().all(|l| l.binary_search(&cand).is_ok());
             if !in_all { continue; }
             let (name, sym) = self.name_row(names, blob, cand);
-            if nfind.find(name).is_some() && seen.insert(sym) {
+            let hit = if ignore_case {
+                let lower_name: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+                nfind.find(&lower_name).is_some()
+            } else {
+                nfind.find(name).is_some()
+            };
+            if hit && seen.insert(sym) {
                 out.push(sym);
                 if out.len() >= limit { break; }
             }
@@ -398,15 +429,25 @@ impl Index {
 
     /// Parallel linear scan over the whole name table — the fallback when
     /// the needle is shorter than a trigram or no trigram index exists.
-    /// Case-sensitive, matching the trigram path. Splits the table across
-    /// cores; each thread keeps the first `limit` matches in its contiguous
-    /// range and the parts are concatenated in row order then truncated, so
-    /// the result is the first-`limit` set a serial scan would return.
-    fn syms_matching_substring_linear(&self, nb: &[u8], limit: usize) -> Vec<u64> {
+    /// The verify mirrors the trigram path: case-sensitive on the raw bytes
+    /// when `!ignore_case`, case-folded when `ignore_case`. Splits the
+    /// table across cores; each thread keeps the first `limit` matches in
+    /// its contiguous range and the parts are concatenated in row order
+    /// then truncated, so the result is the first-`limit` set a serial scan
+    /// would return.
+    fn syms_matching_substring_linear(&self, nb: &[u8], limit: usize, ignore_case: bool) -> Vec<u64> {
         let n = self.hdr.names_n as usize;
         if nb.is_empty() || n == 0 { return Vec::new(); }
         let names = self.names_slice();
         let blob = self.blob();
+        // The finder holds the needle as searched: lowercased when folding
+        // (the name is lowercased per-row below), raw otherwise.
+        let needle: Vec<u8> = if ignore_case {
+            nb.iter().map(|b| b.to_ascii_lowercase()).collect()
+        } else {
+            nb.to_vec()
+        };
+        let needle = needle.as_slice();
         let threads = std::thread::available_parallelism()
             .map(|p| p.get()).unwrap_or(1).clamp(1, n);
         let chunk = n.div_ceil(threads);
@@ -417,13 +458,20 @@ impl Index {
                 let hi = ((t + 1) * chunk).min(n);
                 if lo >= hi { continue; }
                 handles.push(s.spawn(move || {
-                    let finder = memchr::memmem::Finder::new(nb);
+                    let finder = memchr::memmem::Finder::new(needle);
                     let mut local = Vec::new();
                     for i in lo..hi {
                         let row_off = i * NAME_LEN;
                         let off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap()) as usize;
                         let len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap()) as usize;
-                        if finder.find(&blob[off..off + len]).is_some() {
+                        let row = &blob[off..off + len];
+                        let hit = if ignore_case {
+                            let lower: Vec<u8> = row.iter().map(|b| b.to_ascii_lowercase()).collect();
+                            finder.find(&lower).is_some()
+                        } else {
+                            finder.find(row).is_some()
+                        };
+                        if hit {
                             local.push(u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap()));
                             if local.len() >= limit { break; }
                         }

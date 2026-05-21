@@ -1183,7 +1183,7 @@ mod tests {
 
         // `def` surfaces the sig.
         let r = dispatch(&ix, &Request::Def {
-            name: "Gadget::frob".into(), substr: false, limit: 16,
+            name: "Gadget::frob".into(), substr: false, ignore_case: false, limit: 16,
             in_: None, not_in: None,
         });
         if let Reply::Xrefs { groups, .. } = r {
@@ -1396,7 +1396,7 @@ mod tests {
         b.finish(&path).unwrap();
         let ix = Index::open(&path).unwrap();
         let r = dispatch(&ix, &Request::Ref {
-            name: "foo".into(), substr: false, limit: 16, max_hits: 200,
+            name: "foo".into(), substr: false, ignore_case: false, limit: 16, max_hits: 200,
             in_: Some("".into()), not_in: Some("".into()), def_in: Some("".into()),
         });
         if let Reply::Xrefs { total, .. } = r {
@@ -1479,9 +1479,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Substring matching is case-INSENSITIVE on both the trigram path
-    /// (3+ chars) and the linear fallback (<3 chars). The build lowercases
-    /// the needle's raw bytes, like the original linear scan.
+    /// The DEFAULT `--substr` path is CASE-SENSITIVE on both the trigram
+    /// path (3+ chars) and the linear fallback (<3 chars). The trigram
+    /// index is a case-folded candidate filter, but the verify confirms the
+    /// exact-case substring, so wrong-case needles return nothing. This is
+    /// the regression guard for the default behaviour.
     #[test]
     fn trigram_case_sensitive() {
         let path = tmp("trigram_case");
@@ -1494,9 +1496,30 @@ mod tests {
         // Exact-case substrings match (code identifiers are case-significant).
         assert_eq!(ix.syms_matching_substring("HandleRequest", 16), vec![s]);
         assert_eq!(ix.syms_matching_substring("Example", 16), vec![s]);
-        // Wrong case does NOT match — preserves the original (no case-fold).
+        // Wrong case does NOT match — the default is case-sensitive.
         assert!(ix.syms_matching_substring("handlerequest", 16).is_empty());
         assert!(ix.syms_matching_substring("EXAMPLE", 16).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The opt-in `syms_matching_substring_ci` folds ASCII case while the
+    /// DEFAULT `syms_matching_substring` stays case-sensitive — one index
+    /// (a case-folded candidate filter) serves both, the per-query verify
+    /// decides case. Exercises the trigram path (3+ char needles).
+    #[test]
+    fn trigram_ignore_case() {
+        let path = tmp("trigram_ci");
+        let mut b = IndexBuilder::new();
+        let s = sym_of("com.Example.HandleRequest");
+        b.upsert_sym(s, kind::FUNCTION, lang::JAVA, "com.Example.HandleRequest");
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // Case-insensitive: lower- and upper-cased needles both hit.
+        assert_eq!(ix.syms_matching_substring_ci("handlerequest", 16), vec![s]);
+        assert_eq!(ix.syms_matching_substring_ci("EXAMPLE", 16), vec![s]);
+        // The default stays case-sensitive: the lowercased needle misses.
+        assert!(ix.syms_matching_substring("handlerequest", 16).is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

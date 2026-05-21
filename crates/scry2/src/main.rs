@@ -880,6 +880,24 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // `intern`). Workers hit it once per file path during ingest,
     // not once per CU — there's no whole-CU lock to serialize on.
     let file_ids = kythe::FileIdAllocator::default();
+    // On resume, continue the prior run's file-id namespace. The base
+    // partial and every existing shard carry their own (path -> id)
+    // table; without re-seeding the allocator a resumed run restarts ids
+    // at 0, and the final merge — which dedups file tables by id — would
+    // collide a resumed id with a prior shard's id and misattribute
+    // those xrefs to the wrong file.
+    if args.resume {
+        if partial_s2db_path.exists() {
+            if let Ok(ix) = scry2::reader::Index::open(&partial_s2db_path) {
+                file_ids.seed_from(&ix);
+            }
+        }
+        for shard in list_partial_shards(args.out) {
+            if let Ok(ix) = scry2::reader::Index::open(&shard) {
+                file_ids.seed_from(&ix);
+            }
+        }
+    }
     let by_lang_mu: std::sync::Mutex<std::collections::HashMap<&'static str, LangStats>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
     // Atomic progress counter so workers can report a coherent

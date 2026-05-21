@@ -251,31 +251,48 @@ pub struct IngestStats {
 /// parked in futex_wait_queue.
 #[derive(Default)]
 pub struct FileIdAllocator {
-    map: std::sync::Mutex<HashMap<String, u32>>,
+    // (path -> id, next id to assign). Held together under one lock so
+    // id assignment is atomic and `seed_from` can advance the counter
+    // past any pre-loaded ids. The counter is explicit (not `map.len()`)
+    // so a seeded, possibly-non-dense namespace can't hand out an id
+    // that collides with a seeded one.
+    inner: std::sync::Mutex<(HashMap<String, u32>, u32)>,
 }
 
 impl FileIdAllocator {
     pub fn intern(&self, path: &str) -> u32 {
-        let mut m = self.map.lock().unwrap();
-        if let Some(&id) = m.get(path) { return id; }
-        let id = m.len() as u32;
-        m.insert(path.to_string(), id);
+        let mut g = self.inner.lock().unwrap();
+        if let Some(&id) = g.0.get(path) { return id; }
+        let id = g.1;
+        g.1 += 1;
+        g.0.insert(path.to_string(), id);
         id
     }
+    /// Resume support: pre-load (path, id) pairs from a prior base/shard
+    /// so a resumed run continues the SAME file-id namespace. Without
+    /// this a resumed run restarts ids at 0, which collide with the
+    /// existing shards' ids when the final merge dedups the file tables
+    /// by id — silently misattributing xrefs to the wrong file.
+    pub fn seed_from(&self, ix: &crate::reader::Index) {
+        let mut g = self.inner.lock().unwrap();
+        for (id, path) in ix.iter_files() {
+            g.0.entry(path.to_string()).or_insert(id);
+            if id >= g.1 { g.1 = id + 1; }
+        }
+    }
     pub fn drain_into(self, builder: &mut IndexBuilder) {
-        for (path, id) in self.map.into_inner().unwrap() {
+        for (path, id) in self.inner.into_inner().unwrap().0 {
             builder.upsert_file(id, &path);
         }
     }
     /// Non-consuming variant for mid-run snapshots: copy the current
-    /// (path, id) map into `builder` so a clone-and-finish captures
-    /// every file_id that any xref might reference. `IndexBuilder::
-    /// upsert_file` is first-write-wins, so this is safe to call
-    /// repeatedly and safe to interleave with the final
-    /// `drain_into`.
+    /// (path, id) map into `builder` so each shard captures every
+    /// file_id its xrefs might reference. `IndexBuilder::upsert_file`
+    /// is first-write-wins, so this is safe to call repeatedly and to
+    /// interleave with the final `drain_into`.
     pub fn push_to(&self, builder: &mut IndexBuilder) {
-        let m = self.map.lock().unwrap();
-        for (path, &id) in m.iter() {
+        let g = self.inner.lock().unwrap();
+        for (path, &id) in g.0.iter() {
             builder.upsert_file(id, path);
         }
     }

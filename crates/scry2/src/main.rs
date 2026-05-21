@@ -14,6 +14,27 @@ use scry2::{Index, IndexBuilder, kythe, kzip, kzip::Progress as _,
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Codegen-instrumentation flag prefixes whose value is an external
+/// profile / coverage / sanitizer list file that AOSP's kzips don't ship.
+/// They influence only codegen, never the semantic AST `cxx_indexer`
+/// reads, so the CU indexes identically without them — but left in, a
+/// missing referenced file hard-fails the whole CU. Stripped per-CU
+/// before the indexer runs.
+const STRIP_FLAG_PREFIXES: &[&str] = &[
+    "-fprofile-sample-use",          // AutoFDO sampling profile (.afdo)
+    "-fprofile-use",                 // instrumented PGO profile dir/file
+    "-fprofile-instr-use",           // instrumented PGO profile
+    "-fprofile-list",                // selective-instrumentation list
+    "-fprofile-remapping-file",      // profile symbol remapping
+    "-fsanitize-coverage-allowlist", // SanitizerCoverage allow/ignore lists
+    "-fsanitize-coverage-ignorelist",
+    "-fsanitize-ignorelist",
+    "-fsanitize-blacklist",          // legacy spelling of ignorelist
+    "-fxray-attr-list",              // XRay instrumentation lists
+    "-fxray-always-instrument",
+    "-fxray-never-instrument",
+];
+
 /// Expand a leading `~/` (and bare `~`) in `s` against `home`. Pure
 /// — no env access — so tests can drive every branch without mutating
 /// process-global state. With `home = None` the tilde is preserved
@@ -1089,12 +1110,15 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                     // it changes nothing, extract_with keeps the raw
                     // proto, so this is free for the common case.
                     let extract_res = extractor.extract_with(unit, &sub_path, |cu| {
-                        // A `-fprofile-sample-use=<x>.afdo` flag points at
-                        // a codegen optimization profile that is not in
-                        // the kzip and is irrelevant to semantic indexing.
-                        // Left in, cxx_indexer hard-fails the CU with
-                        // "no such file or directory: ...afdo". Drop it.
-                        cu.argument.retain(|a| !a.starts_with("-fprofile-sample-use"));
+                        // Drop codegen-instrumentation flags that point at
+                        // external profile/coverage/sanitizer list files not
+                        // shipped in the kzip. They affect only codegen, not
+                        // the semantic AST cxx_indexer reads, but left in the
+                        // indexer hard-fails the CU with "no such file or
+                        // directory" (e.g. AutoFDO `...afdo`, cronet's
+                        // `exclude_coverage.list`). Stripping them lets the
+                        // CU index with identical symbols/xrefs.
+                        cu.argument.retain(|a| !STRIP_FLAG_PREFIXES.iter().any(|p| a.starts_with(p)));
                         for &a in matching.iter().rev() {
                             if !cu.argument.iter().any(|existing| existing == a) {
                                 cu.argument.insert(0, a.to_string());

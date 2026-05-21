@@ -186,22 +186,50 @@ impl Index {
     /// pattern on long names, which dominates wall time on AOSP
     /// (~5M names averaging 60 bytes).
     pub fn syms_matching_substring(&self, needle: &str, limit: usize) -> Vec<u64> {
-        let names = self.names_slice();
         let n = self.hdr.names_n as usize;
-        let mut out = Vec::with_capacity(limit.min(64));
         let nb = needle.as_bytes();
-        if nb.is_empty() { return out; }
-        let finder = memchr::memmem::Finder::new(nb);
+        if nb.is_empty() || n == 0 { return Vec::new(); }
+        let names = self.names_slice();
         let blob = self.blob();
-        for i in 0..n {
-            let row_off = i * NAME_LEN;
-            let name_off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap());
-            let name_len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap());
-            let row_name = &blob[name_off as usize..name_off as usize + name_len as usize];
-            if finder.find(row_name).is_some() {
-                let sym = u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap());
+        // A substring (not prefix) match has to examine every name — there
+        // is no trigram index — and substring hits scatter across the
+        // alpha-sorted table, so it can't stop early. Split the table
+        // across cores: at 91M names a serial scan is ~30s; parallel it is
+        // a couple seconds. Each thread keeps the first `limit` matches in
+        // its contiguous row range, and the parts are concatenated in row
+        // order then truncated, so the result is exactly the first-`limit`
+        // set a serial scan would return.
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get()).unwrap_or(1).clamp(1, n);
+        let chunk = n.div_ceil(threads);
+        let parts: Vec<Vec<u64>> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let lo = t * chunk;
+                let hi = ((t + 1) * chunk).min(n);
+                if lo >= hi { continue; }
+                handles.push(s.spawn(move || {
+                    let finder = memchr::memmem::Finder::new(nb);
+                    let mut local = Vec::new();
+                    for i in lo..hi {
+                        let row_off = i * NAME_LEN;
+                        let off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap()) as usize;
+                        let len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap()) as usize;
+                        if finder.find(&blob[off..off + len]).is_some() {
+                            local.push(u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap()));
+                            if local.len() >= limit { break; }
+                        }
+                    }
+                    local
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut out = Vec::with_capacity(limit.min(64));
+        for part in parts {
+            for sym in part {
                 out.push(sym);
-                if out.len() >= limit { break; }
+                if out.len() >= limit { return out; }
             }
         }
         out

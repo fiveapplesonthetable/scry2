@@ -98,38 +98,60 @@ enum Cmd {
     /// `def NAME` — print the definition site(s) of a symbol.
     Def {
         name: String,
+        /// Match NAME as a substring of the qualified name (a parallel
+        /// scan of the whole name table). Omit for an exact-FQN lookup,
+        /// which is a binary search.
         #[arg(long)] substr: bool,
+        /// With --substr, cap how many matching definitions to print.
         #[arg(long, default_value = "16")] limit: usize,
+        /// Keep only hits whose file path contains SUBSTR.
         #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        /// Drop hits whose file path contains SUBSTR.
         #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
     },
 
     /// `ref NAME` — print every reference of a symbol.
     Ref {
         name: String,
+        /// Match NAME as a substring (parallel scan); aggregates refs
+        /// across every matching symbol. Omit for an exact-FQN lookup.
         #[arg(long)] substr: bool,
+        /// With --substr, cap how many matching symbols to aggregate over.
         #[arg(long, default_value = "16")] limit: usize,
+        /// Stop after this many hits; the result is marked truncated.
         #[arg(long, default_value = "200")] max_hits: usize,
+        /// Keep only hits whose file path contains SUBSTR.
         #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        /// Drop hits whose file path contains SUBSTR.
         #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
+        /// Keep only refs that resolve to a def whose file contains SUBSTR.
         #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
     /// `callers NAME` — print every call site of a function.
     Callers {
         name: String,
+        /// Match NAME as a substring (parallel scan); aggregates call
+        /// sites across every matching symbol. Omit for exact-FQN lookup.
         #[arg(long)] substr: bool,
+        /// With --substr, cap how many matching symbols to aggregate over.
         #[arg(long, default_value = "16")] limit: usize,
+        /// Stop after this many hits; the result is marked truncated.
         #[arg(long, default_value = "200")] max_hits: usize,
+        /// Keep only hits whose file path contains SUBSTR.
         #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        /// Drop hits whose file path contains SUBSTR.
         #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
+        /// Keep only callers that resolve to a def whose file contains SUBSTR.
         #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
     /// `super NAME` — direct supertypes (extends / overrides / satisfies).
     Super {
         name: String,
+        /// Match NAME as a substring (parallel scan) instead of exact FQN.
         #[arg(long)] substr: bool,
+        /// With --substr, cap how many matching symbols to expand.
         #[arg(long, default_value = "16")] limit: usize,
         /// Restrict to supertypes whose def-file path contains SUBSTR.
         #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
@@ -140,7 +162,9 @@ enum Cmd {
     /// `sub NAME` — direct subtypes.
     Sub {
         name: String,
+        /// Match NAME as a substring (parallel scan) instead of exact FQN.
         #[arg(long)] substr: bool,
+        /// With --substr, cap how many matching symbols to expand.
         #[arg(long, default_value = "16")] limit: usize,
         /// Restrict to subtypes whose def-file path contains SUBSTR.
         #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,

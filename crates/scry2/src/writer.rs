@@ -260,7 +260,9 @@ impl IndexBuilder {
         // while we write it; the header at byte 0 is filled in last
         // via a seek-back. Section offsets are page-aligned positions
         // chosen incrementally as each prior section's `n` lands.
-        let tmp_path: PathBuf = output.with_extension("s2db.tmp");
+        // pid-suffixed so two processes writing distinct outputs in the
+        // same dir (or one writing while another lists) never share a tmp.
+        let tmp_path: PathBuf = output.with_extension(format!("s2db.tmp.{}", std::process::id()));
         let f = File::create(&tmp_path)
             .with_context(|| format!("create {}", tmp_path.display()))?;
         let mut w = BufWriter::with_capacity(8 << 20, f);
@@ -572,7 +574,8 @@ impl IndexBuilder {
         let blob_off  = pad_up(crev_off  + n_crev  * CALL_LEN as u64);
 
         // ---- 6. Write to a tempfile, then atomic rename ----
-        let tmp_path: PathBuf = path.with_extension("s2db.tmp");
+        // pid-suffixed so concurrent writers never collide on the tmp.
+        let tmp_path: PathBuf = path.with_extension(format!("s2db.tmp.{}", std::process::id()));
         let f = File::create(&tmp_path).with_context(|| format!("create {}", tmp_path.display()))?;
         let mut w = BufWriter::with_capacity(8 << 20, f);
 

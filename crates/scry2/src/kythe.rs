@@ -234,7 +234,6 @@ pub struct IngestStats {
     // spotting "0 calls emitted" failures — typically a sign that an
     // indexer used a different edge kind for childof than expected.
     pub diag_defines_seen: u64,
-    pub diag_childof_seen: u64,
     pub diag_pending:      u64,
     pub diag_unresolved:   u64,
 }

@@ -36,6 +36,18 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
+/// Cap for a zip entry's *pre-allocation*. `ZipFile::size()` is the
+/// archive's claimed uncompressed size — untrusted input. The reads
+/// below grow on demand, so capping the up-front reserve only bounds the
+/// damage a corrupt/hostile kzip can do (a bogus multi-GB size header
+/// triggering an OOM at reserve time), without affecting correctness.
+const MAX_ENTRY_PREALLOC: usize = 64 << 20;
+
+/// Pre-allocation hint for a zip entry, clamped to [`MAX_ENTRY_PREALLOC`].
+fn entry_prealloc(size: u64) -> usize {
+    (size as usize).min(MAX_ENTRY_PREALLOC)
+}
+
 // ----------------------------------------------------------------- types
 
 /// Subset of `kythe.proto.VName` we need.
@@ -402,7 +414,7 @@ pub fn read_units_filtered<P: Progress, F: Fn(&str) -> bool>(
     let mut scanned = 0usize;
     for (i, sha) in &pbunit_idx {
         let mut f = zip.by_index(*i)?;
-        let mut buf = Vec::with_capacity(f.size() as usize);
+        let mut buf = Vec::with_capacity(entry_prealloc(f.size()));
         f.read_to_end(&mut buf)?;
         scanned += 1;
         progress.report("scan", scanned, total_units);
@@ -419,7 +431,7 @@ pub fn read_units_filtered<P: Progress, F: Fn(&str) -> bool>(
     for (i, sha) in &json_idx {
         if proto_shas.contains(sha) { scanned += 1; continue; }
         let mut f = zip.by_index(*i)?;
-        let mut buf = String::with_capacity(f.size() as usize);
+        let mut buf = String::with_capacity(entry_prealloc(f.size()));
         f.read_to_string(&mut buf)?;
         scanned += 1;
         progress.report("scan", scanned, total_units);
@@ -466,7 +478,7 @@ pub fn read_units_progress<P: Progress>(path: &Path, mut progress: P) -> Result<
     // First pass: proto-encoded units (they win on collision).
     for (i, sha) in &pbunit_idx {
         let mut f = zip.by_index(*i)?;
-        let mut buf = Vec::with_capacity(f.size() as usize);
+        let mut buf = Vec::with_capacity(entry_prealloc(f.size()));
         f.read_to_end(&mut buf)?;
         let cu = parse_indexed_compilation(&buf)
             .with_context(|| format!("decode proto unit {sha}"))?;
@@ -478,7 +490,7 @@ pub fn read_units_progress<P: Progress>(path: &Path, mut progress: P) -> Result<
     for (i, sha) in &json_idx {
         if proto_shas.contains(sha) { continue; }
         let mut f = zip.by_index(*i)?;
-        let mut buf = String::with_capacity(f.size() as usize);
+        let mut buf = String::with_capacity(entry_prealloc(f.size()));
         f.read_to_string(&mut buf)?;
         let cu: IndexedCompilation = serde_json::from_str(&buf)
             .with_context(|| format!("decode JSON unit {sha}"))?;

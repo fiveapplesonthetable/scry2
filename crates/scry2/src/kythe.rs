@@ -1507,6 +1507,57 @@ mod tests {
     }
 
     #[test]
+    fn render_cxx_nested_generic_box_of_box() {
+        // Generic args recurse: tapp[Box, tapp[Box, int]] → "Box<Box<int>>".
+        let mut g = MapGraph::default();
+        g.leaf("Box", "record", BOX_CODE);
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.tapp("Box<int>", &["Box", "int"]);
+        g.tapp("Box<Box<int>>", &["Box", "Box<int>"]);
+        assert_eq!(render_type(&g, "Box<Box<int>>").as_deref(), Some("Box<Box<int>>"));
+    }
+
+    #[test]
+    fn render_cxx_volatile_int() {
+        // tapp[volatile#builtin, int] → "volatile int".
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("volatile", "volatile");
+        g.tapp("vint", &["volatile", "int"]);
+        assert_eq!(render_type(&g, "vint").as_deref(), Some("volatile int"));
+    }
+
+    #[test]
+    fn render_cxx_pointer_to_pointer() {
+        // tapp[ptr, tapp[ptr, int]] → "int * *".
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("ptr", "ptr");
+        g.tapp("int*", &["ptr", "int"]);
+        g.tapp("int**", &["ptr", "int*"]);
+        assert_eq!(render_type(&g, "int**").as_deref(), Some("int * *"));
+    }
+
+    #[test]
+    fn render_cxx_array_of_pointer_to_array_pinned_limitation() {
+        // KNOWN LIMITATION, pinned (not hidden): array-of-pointer-to-array
+        // `int (*x[])[]` = tapp[carr, tapp[ptr, tapp[carr, int]]]. The outer
+        // array appends `[]` after the ptr-to-array element render
+        // (`int (*)[]`), so we emit "int (*)[][]" rather than the strictly
+        // idiomatic "int (*[])[]". The load-bearing array-of-ptr vs
+        // ptr-to-array distinction still holds; this asserts the current
+        // behavior so any future declarator rewrite trips on the change.
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("carr", "carr");
+        g.builtin_leaf("ptr", "ptr");
+        g.tapp("int[]", &["carr", "int"]);
+        g.tapp("ptr_to_arr", &["ptr", "int[]"]);
+        g.tapp("arr_of_ptr_to_arr", &["carr", "ptr_to_arr"]);
+        assert_eq!(render_type(&g, "arr_of_ptr_to_arr").as_deref(), Some("int (*)[][]"));
+    }
+
+    #[test]
     fn render_cxx_const_ref_box_of_int() {
         // The real chain for `const Box<int>&`:
         //   tapp[lvr#builtin, tapp[const#builtin, tapp[Box, int]]]

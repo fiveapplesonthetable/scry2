@@ -673,6 +673,75 @@ mod tests {
     }
 
     #[test]
+    fn resume_file_ids_merge_to_correct_paths() {
+        // End-to-end of the resume file-id fix. A run-1 shard interns
+        // files with allocator A; a resumed run seeds a fresh allocator B
+        // from that shard so it CONTINUES the id namespace (reused files
+        // keep their id, new files get fresh non-colliding ids). After
+        // merging both shards every sym must resolve to its OWN file.
+        // Without the seed, B restarts at 0, the new file collides with a
+        // run-1 id, and the merge's by-id file-table dedup points a run-1
+        // sym at a run-2 path — the exact Binder.java->TunerDemuxInfo.cpp
+        // corruption. This test fails without seed_from and passes with it.
+        use crate::kythe::FileIdAllocator;
+        let s0 = tmp("resume-shard0");
+        let s1 = tmp("resume-shard1");
+        let merged = tmp("resume-merged");
+
+        let a = sym_of("kythe:c++:t###a");
+        let z = sym_of("kythe:c++:t###z");
+
+        // Run 1: a defined in a.cpp, declared in a shared common.h.
+        let alloc_a = FileIdAllocator::default();
+        let fa = alloc_a.intern("run1/a.cpp");
+        let fc = alloc_a.intern("common/common.h");
+        let mut h0 = IndexBuilder::new();
+        h0.upsert_sym(a, kind::FUNCTION, lang::CXX, "kythe:c++:t###a");
+        h0.add_xref(a, role::DEF, fa, 1);
+        h0.add_xref(a, role::DECL, fc, 2);
+        alloc_a.push_to(&mut h0);   // shard carries its file table
+        h0.finish(&s0).unwrap();
+
+        // Resume: fresh allocator seeded from shard0.
+        let alloc_b = FileIdAllocator::default();
+        {
+            let i0 = Index::open(&s0).unwrap();
+            alloc_b.seed_from(&i0);
+        }
+        let fc2 = alloc_b.intern("common/common.h");   // must reuse fc
+        let fz  = alloc_b.intern("run2/z.cpp");         // must be fresh
+        assert_eq!(fc2, fc, "resumed run must reuse common.h's id");
+        assert_ne!(fz, fa, "new file collided with a run-1 id");
+        assert_ne!(fz, fc, "new file collided with a run-1 id");
+        let mut h1 = IndexBuilder::new();
+        h1.upsert_sym(z, kind::FUNCTION, lang::CXX, "kythe:c++:t###z");
+        h1.add_xref(z, role::DEF, fz, 3);
+        h1.add_xref(z, role::DECL, fc2, 4);
+        alloc_b.push_to(&mut h1);
+        h1.finish(&s1).unwrap();
+
+        let i0 = Index::open(&s0).unwrap();
+        let i1 = Index::open(&s1).unwrap();
+        IndexBuilder::new().write_merged_snapshot(&[&i0, &i1], &merged).unwrap();
+        drop((i0, i1));
+
+        let m = Index::open(&merged).unwrap();
+        let paths = |sym| -> Vec<(u8, String)> {
+            m.xrefs(sym, 0, u8::MAX)
+                .map(|(_, r, f, _)| (r, m.file_path(f).unwrap_or("?").to_string()))
+                .collect()
+        };
+        let ax = paths(a);
+        assert!(ax.contains(&(role::DEF, "run1/a.cpp".into())), "a DEF: {ax:?}");
+        assert!(ax.contains(&(role::DECL, "common/common.h".into())), "a DECL: {ax:?}");
+        let zx = paths(z);
+        assert!(zx.contains(&(role::DEF, "run2/z.cpp".into())), "z DEF: {zx:?}");
+        assert!(zx.contains(&(role::DECL, "common/common.h".into())), "z DECL: {zx:?}");
+
+        for p in [&s0, &s1, &merged] { let _ = std::fs::remove_file(p); }
+    }
+
+    #[test]
     fn alias_suppressed_for_variable_kind_syms() {
         // cxx_indexer emits /kythe/code on parameters too; the parsed
         // FQN `Method::param` would otherwise leak into the names table

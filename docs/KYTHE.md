@@ -67,8 +67,10 @@ below. Everything else is ignored.
 The type nodes reached by `typed` carry compiler-resolved types — a
 deduced `auto`/`var` resolves to its concrete type and a template/generic
 to its concrete instantiation, because the indexers read the
-post-resolution AST (Clang `QualType` / javac `Type`). `sig` with param
-names is C++-only: `java_indexer` does not emit the parameter-name detail.
+post-resolution AST (Clang `QualType` / javac `Type`). `sig` renders
+parameter names for **both C++ and Java** — each parameter node carries
+its name and a `typed` edge to its type; the method's own `typed` edge
+gives the return type.
 
 scry2 strips `.N` ordinal suffixes on edge kinds (e.g.
 `/kythe/edge/childof.42` is treated as `/kythe/edge/childof`) per the

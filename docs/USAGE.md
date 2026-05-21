@@ -273,10 +273,17 @@ $ scry2 --index aosp.s2db type someCxxVar    #=> const Box<int> &
 
 ### `sig NAME` — full signature with parameter names
 
-Function signature with rendered parameter types **and names**
-(`void setEnabled(bool enabled)`). C++ only — `java_indexer` does not
-emit the parameter-name detail, so Java functions return no signature
-(honest emptiness). `def` also prints `sig:` inline when present.
+Function signature with rendered parameter types **and names**, for both
+C++ and Java:
+
+```
+$ scry2 --index aosp.s2db sig setEnabled   #=> void setEnabled(boolean enabled)
+$ scry2 --index aosp.s2db sig pick         #=> java.util.List<java.lang.String> pick(int idx, java.lang.String key)
+```
+
+`def` also prints `sig:` inline when present. Type-variable and array
+types render in the indexer's own form (e.g. `array<int>`, `T.m.K`).
+Honest emptiness: a sym with no parameter/return info renders no signature.
 
 ### `members NAME` — what a type declares
 

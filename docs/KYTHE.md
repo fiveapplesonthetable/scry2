@@ -60,6 +60,15 @@ below. Everything else is ignored.
 | `/kythe/edge/overrides`, `satisfies` | — | `inhs` row |
 | `/kythe/edge/named` | — | register `target.signature` as a human-typeable alias for the source sym — that's how `scry2 def android.os.Binder.clearCallingIdentity` resolves without `--substr` |
 | `/kythe/edge/completes`, `completes/uniquely` | — | DEFN→DECL bridge captured for cxx, see notes below |
+| `/kythe/edge/typed` | — | source sym → its type node; the type is rendered to a string (MarkedSource for named/Java-generic nodes, recursive `tapp` walk for C++ composites) and stored in the `typed` section |
+| `/kythe/edge/childof` | — | member → enclosing parent; stored reversed as `childrev` `(parent, child)` for `members` |
+| `/kythe/edge/param`, `param.N` | — | ordinal-ordered parameters of a function, used (with `typed`) to render the `sig` section — full signatures with param names |
+
+The type nodes reached by `typed` carry compiler-resolved types — a
+deduced `auto`/`var` resolves to its concrete type and a template/generic
+to its concrete instantiation, because the indexers read the
+post-resolution AST (Clang `QualType` / javac `Type`). `sig` with param
+names is C++-only: `java_indexer` does not emit the parameter-name detail.
 
 scry2 strips `.N` ordinal suffixes on edge kinds (e.g.
 `/kythe/edge/childof.42` is treated as `/kythe/edge/childof`) per the

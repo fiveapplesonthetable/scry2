@@ -75,10 +75,19 @@ on an AOSP-scale index.
 | `syms` | `(sym u64, kind u8, lang u8, name_off u64, name_len u16)` = 20 B | by sym | sym → (name, kind, language) |
 | `names` | `(name_off u64, name_len u16, sym u64)` = 18 B | by name bytes | alpha-sorted name → sym lookup, **including aliases** from `/kythe/edge/named` |
 | `files` | `(file u32, path_off u64, path_len u16)` = 14 B | by file | file id → path |
-| `inhs` | `(child u64, parent u64)` = 16 B | by (child, parent) | inheritance edges (extends, overrides, satisfies) |
+| `inhs` | `(child u64, parent u64)` = 16 B | by (child, parent) | inheritance edges (extends, overrides, satisfies); `super`/`inheritance --up` |
+| `inhrev` | same rows | by (parent, child) | `sub`/`inheritance --down` — `inherited_by(X)` is one binary search, no linear scan |
 | `calls` | `(caller u64, callee u64, role u8)` = 17 B | by caller | callgraph DOWN — `calls_from(X)` is one binary search |
 | `crev`  | same rows | by callee | callgraph UP — `called_by(X)` is one binary search; no linear scan |
-| `blob`  | concat UTF-8 | n/a | all names and paths, referenced by `(off, len)` slots |
+| `typed` | `(sym u64, str_off u64, str_len u16)` = 18 B | by sym | resolved type of a sym (deduced `auto`/`var`, concrete generics), pre-rendered to a blob string |
+| `childrev` | `(parent u64, child u64)` = 16 B | by (parent, child) | `members` — a type's methods/fields (reverse `childof`) |
+| `sig` | `(sym u64, str_off u64, str_len u16)` = 18 B | by sym | full function signature with param names (C++), pre-rendered |
+| `blob`  | concat UTF-8 | n/a | all names, paths, types, and signatures, referenced by `(off, len)` slots |
+
+The `typed`/`childrev`/`inhrev`/`sig` sections are the v4 "comprehension
+layer." Their header fields are carved from previously-reserved bytes
+and no existing row layout changed, so a **v4 reader opens a v3 file**
+(the new counts read back as 0); `Index::open` accepts version 3–4.
 
 Roughly:
 

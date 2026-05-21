@@ -1,12 +1,12 @@
 # scry2
 
 Super-lean Kythe wrapper for AOSP-scale code walks. One Rust binary,
-one mmap'd `.s2db` file, six LLM-shaped query verbs in single-digit
+one mmap'd `.s2db` file, LLM-shaped query verbs in single-digit
 microseconds.
 
 ## What it does
 
-Five verbs, no fluff:
+Navigation — where things are:
 
 ```
 scry2 def      NAME       # where is NAME defined?
@@ -14,8 +14,19 @@ scry2 ref      NAME       # every reference to NAME
 scry2 callers  NAME       # call sites that target NAME
 scry2 super    NAME       # direct supertypes of NAME (extends/overrides)
 scry2 sub      NAME       # direct subtypes of NAME
-scry2 callgraph NAME --direction up|down|both --depth N
+scry2 callgraph    NAME --direction up|down|both --depth N   # transitive call walk
+scry2 inheritance  NAME --direction up|down|both --depth N   # transitive type hierarchy
 ```
+
+Comprehension — what things are:
+
+```
+scry2 type     NAME       # NAME's resolved type (deduced auto/var, concrete generics)
+scry2 sig      NAME       # full signature with param names (C++)
+scry2 members  NAME       # methods/fields a type declares
+```
+
+`def` also shows a symbol's resolved type and signature inline.
 
 Plus two build verbs:
 

@@ -244,6 +244,49 @@ both directions from the root — `dir: "up"` and `dir: "down"` mark
 each edge. `--max-syms 200` caps total nodes so a hub function with
 10 000+ callers doesn't run away.
 
+### `inheritance NAME --direction up|down|both [--depth N]`
+
+The type-hierarchy mirror of `callgraph`, with the same id/parent/hop
+forest output. `up` walks transitive supertypes (extends/implements),
+`down` walks transitive subtypes, `both` does both. `--depth` and
+`--max-syms` bound the walk like `callgraph`.
+
+```
+# Whole ancestor chain of a type
+$ scry2 --index aosp.s2db inheritance android.os.Bundle --direction up
+# Everything that extends/implements an interface
+$ scry2 --index aosp.s2db inheritance android.os.IBinder --direction down
+```
+
+For ambiguous names prefer the exact FQN: `--substr` can also match
+type-application syms (`const(T)`, `T&`) as roots.
+
+### `type NAME` — resolved type of a symbol
+
+The compiler-resolved type, including deduced `auto`/`var` and concrete
+generic/template instantiations (not the syntactic token). C++ and Java.
+
+```
+$ scry2 --index aosp.s2db type some.Var      #=> java.util.List<java.lang.String>
+$ scry2 --index aosp.s2db type someCxxVar    #=> const Box<int> &
+```
+
+### `sig NAME` — full signature with parameter names
+
+Function signature with rendered parameter types **and names**
+(`void setEnabled(bool enabled)`). C++ only — `java_indexer` does not
+emit the parameter-name detail, so Java functions return no signature
+(honest emptiness). `def` also prints `sig:` inline when present.
+
+### `members NAME` — what a type declares
+
+The methods and fields a type/record/interface declares (reverse of
+"member is a child of its class"), each with its kind and signature.
+
+```
+$ scry2 --index aosp.s2db members android.os.Bundle
+```
+
 ## Path filters — `--in`, `--not-in`, `--def-in`
 
 All three are **substring matches**

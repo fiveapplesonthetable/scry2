@@ -28,6 +28,22 @@ pub struct IndexBuilder {
     /// Sorted+deduped at write time and emitted as the `typed` section;
     /// on a tied sym a non-empty string wins over an empty one.
     typed:    Vec<(u64, String)>,
+    /// Membership edges: `(parent, child)` from `/kythe/edge/childof`
+    /// (a child node points at its enclosing parent; we store the
+    /// reverse). Emitted, sorted by `(parent, child)`, as the `childrev`
+    /// section so `members(parent)` is an O(log n) range scan — the
+    /// mirror of how `inhrev` reverses `inherits`. All childof edges are
+    /// kept; `members` filters by the parent sym's kind at query time so
+    /// function-local children (params/locals) never surface as a
+    /// class's members.
+    childof:  Vec<(u64, u64)>,
+    /// Full rendered signature of a FUNCTION sym, with parameter names
+    /// (e.g. "void setEnabled(bool enabled)"). `(sym, sig_string)`.
+    /// Pre-rendered at ingest from the function's `param.N` edges + each
+    /// param's name/type, plus the return type. Emitted as the `sig`
+    /// section (TypeRow sorted by sym). Honest emptiness: a sym with no
+    /// renderable signature stores nothing.
+    sig:      Vec<(u64, String)>,
 }
 
 impl IndexBuilder {
@@ -91,6 +107,25 @@ impl IndexBuilder {
         self.typed.push((sym, type_str.to_string()));
     }
 
+    /// Record a `/kythe/edge/childof` edge: `child` is enclosed by
+    /// `parent`. Stored reversed as `(parent, child)` so the `childrev`
+    /// section is sorted by parent and `members(parent)` is a range
+    /// scan. All edges are kept; the `members` verb filters by the
+    /// parent sym's kind so function-local children never surface as a
+    /// class's members.
+    pub fn add_childof(&mut self, child: u64, parent: u64) {
+        self.childof.push((parent, child));
+    }
+
+    /// Record `sym`'s full rendered signature with parameter names
+    /// (e.g. "void setEnabled(bool enabled)"). Empty strings are dropped
+    /// — "honest emptiness": a sym with no renderable signature stores
+    /// nothing and `sig_of` returns None rather than a guess.
+    pub fn add_sig(&mut self, sym: u64, sig: &str) {
+        if sig.is_empty() { return; }
+        self.sig.push((sym, sig.to_string()));
+    }
+
     pub fn n_xrefs(&self) -> usize { self.xrefs.len() }
     pub fn n_syms(&self)  -> usize { self.syms.len() }
     pub fn n_files(&self) -> usize { self.files.len() }
@@ -98,6 +133,8 @@ impl IndexBuilder {
     pub fn n_aliases(&self) -> usize { self.aliases.len() }
     pub fn n_calls(&self) -> usize { self.calls.len() }
     pub fn n_typed(&self) -> usize { self.typed.len() }
+    pub fn n_childof(&self) -> usize { self.childof.len() }
+    pub fn n_sig(&self)   -> usize { self.sig.len() }
 
     /// Move every row from `other` into `self`, leaving `other`
     /// empty. The mirror of [`populate_from_index`] but in-memory
@@ -142,6 +179,8 @@ impl IndexBuilder {
         self.aliases.append(&mut other.aliases);
         self.calls.append(&mut other.calls);
         self.typed.append(&mut other.typed);
+        self.childof.append(&mut other.childof);
+        self.sig.append(&mut other.sig);
     }
 
     /// Collapse exact-duplicate rows in the append-only tables
@@ -171,8 +210,13 @@ impl IndexBuilder {
         self.aliases.dedup();
         self.typed.sort_unstable();
         self.typed.dedup();
+        self.childof.sort_unstable();
+        self.childof.dedup();
+        self.sig.sort_unstable();
+        self.sig.dedup();
         self.xrefs.len() + self.inherits.len() + self.calls.len()
             + self.aliases.len() + self.typed.len()
+            + self.childof.len() + self.sig.len()
     }
 
     /// Snapshot the current accumulated state to `path` without
@@ -216,6 +260,14 @@ impl IndexBuilder {
         }
         for (sym, ty) in ix.iter_typed() {
             self.add_type(sym, ty);
+        }
+        for (parent, child) in ix.iter_childrev() {
+            // iter_childrev yields (parent, child); add_childof takes
+            // (child, parent) and re-reverses, so round-trip the order.
+            self.add_childof(child, parent);
+        }
+        for (sym, sig) in ix.iter_sig() {
+            self.add_sig(sym, sig);
         }
         Ok(())
     }
@@ -261,6 +313,20 @@ impl IndexBuilder {
         let mut delta_typed: Vec<(u64, &str)> =
             self.typed.iter().map(|(s, t)| (*s, t.as_str())).collect();
         delta_typed.sort_unstable_by_key(|r| r.0);
+        // childof is already stored as (parent, child); sort by that key so
+        // the `childrev` fold (merge_sorted_dedup over (parent, child)) sees
+        // a sorted, deduped delta stream — exactly like `inhrev`.
+        self.childof.sort_unstable();
+        self.childof.dedup();
+        // Collapse the delta's sig table to one row per sym (sorted by sym),
+        // the shape `merge_typed_by_sym` expects (it's reused for sig — both
+        // are sym→string TypeRow sections with non-empty-wins on a tie).
+        self.sig.sort_unstable();
+        self.sig.dedup();
+        self.sig.dedup_by_key(|(s, _)| *s);
+        let mut delta_sig: Vec<(u64, &str)> =
+            self.sig.iter().map(|(s, t)| (*s, t.as_str())).collect();
+        delta_sig.sort_unstable_by_key(|r| r.0);
         let mut delta_syms: Vec<(u64, u8, u8, String)> = self.syms.drain()
             .map(|(s, (k, l, n))| (s, k, l, n)).collect();
         delta_syms.sort_unstable_by_key(|r| r.0);
@@ -407,10 +473,10 @@ impl IndexBuilder {
             }
         }
 
-        // ---- 9. inherits ----
+        // ---- 9. inherits (write + collect for the reverse index) ----
         let inh_off = pad_up(files_off + n_files * FILE_LEN as u64);
         seek_to(&mut w, inh_off)?;
-        let mut n_inh: u64 = 0;
+        let mut merged_inh: Vec<(u64, u64)> = Vec::new();
         {
             let pri = fold_sources(sources,
                 |s| Box::new(s.iter_inherits()),
@@ -419,12 +485,29 @@ impl IndexBuilder {
             for (c, p) in merge_sorted_dedup(pri, del) {
                 w.write_all(&c.to_be_bytes())?;
                 w.write_all(&p.to_be_bytes())?;
-                n_inh += 1;
+                merged_inh.push((c, p));
             }
         }
+        let n_inh = merged_inh.len() as u64;
+
+        // ---- 9b. inhrev (by-parent): the SAME edges as `inh`, reversed
+        //      to (parent, child) and re-sorted, so `inherited_by(parent)`
+        //      is an O(log n) range scan. Mirror of `crev` over `calls`.
+        let inhrev_off = pad_up(inh_off + n_inh * INH_LEN as u64);
+        seek_to(&mut w, inhrev_off)?;
+        let mut inh_rev: Vec<(u64, u64)> = merged_inh.into_iter()
+            .map(|(c, p)| (p, c))
+            .collect();
+        inh_rev.sort_unstable();
+        for (p, c) in &inh_rev {
+            w.write_all(&p.to_be_bytes())?;
+            w.write_all(&c.to_be_bytes())?;
+        }
+        let n_inhrev = inh_rev.len() as u64;
+        drop(inh_rev);
 
         // ---- 10. calls (write + collect for the reverse index) ----
-        let calls_off = pad_up(inh_off + n_inh * INH_LEN as u64);
+        let calls_off = pad_up(inhrev_off + n_inhrev * INH_LEN as u64);
         seek_to(&mut w, calls_off)?;
         let mut merged_calls: Vec<(u64, u64, u8)> = Vec::new();
         {
@@ -480,8 +563,51 @@ impl IndexBuilder {
             }
         }
 
+        // ---- 11c. childrev (by-parent membership): fold every source's
+        //      (parent, child) childrev table plus the delta. Both halves
+        //      are sorted by (parent, child), so a plain dedup merge keeps
+        //      it sorted — same shape as `inhrev`. INH_LEN rows.
+        let childrev_off = pad_up(typed_off + n_typed * TYPE_LEN as u64);
+        seek_to(&mut w, childrev_off)?;
+        let mut n_childrev: u64 = 0;
+        {
+            let pri = fold_sources(sources,
+                |s| Box::new(s.iter_childrev()),
+                |a, b| Box::new(merge_sorted_dedup(a, b)));
+            let del = self.childof.iter().copied();
+            for (parent, child) in merge_sorted_dedup(pri, del) {
+                w.write_all(&parent.to_be_bytes())?;
+                w.write_all(&child.to_be_bytes())?;
+                n_childrev += 1;
+            }
+        }
+
+        // ---- 11d. sig (sym → full signature string) ----
+        // Same TypeRow shape + sym-keyed non-empty-wins fold as `typed`;
+        // reuses `merge_typed_by_sym`. Strings append to the shared blob.
+        let sig_off = pad_up(childrev_off + n_childrev * INH_LEN as u64);
+        seek_to(&mut w, sig_off)?;
+        let mut n_sig: u64 = 0;
+        {
+            let pri = fold_sources(sources,
+                |s| Box::new(s.iter_sig()),
+                |a, b| Box::new(merge_typed_by_sym(a, b)));
+            let del = delta_sig.iter().copied();
+            for (sym, sg) in merge_typed_by_sym(pri, del) {
+                if sg.is_empty() { continue; }
+                let sg = clamp_blob_str(sg);
+                let off = blob.len() as u64;
+                let len = sg.len() as u16;
+                blob.extend_from_slice(sg.as_bytes());
+                w.write_all(&sym.to_be_bytes())?;
+                w.write_all(&off.to_be_bytes())?;
+                w.write_all(&len.to_be_bytes())?;
+                n_sig += 1;
+            }
+        }
+
         // ---- 12. blob ----
-        let blob_off = pad_up(typed_off + n_typed * TYPE_LEN as u64);
+        let blob_off = pad_up(sig_off + n_sig * TYPE_LEN as u64);
         seek_to(&mut w, blob_off)?;
         w.write_all(&blob)?;
         let blob_len = blob.len() as u64;
@@ -495,9 +621,12 @@ impl IndexBuilder {
             names_off, names_n: n_names,
             files_off, files_n: n_files,
             inh_off,   inh_n:   n_inh,
+            inhrev_off, inhrev_n: n_inhrev,
             calls_off, calls_n: n_calls,
             crev_off,  crev_n:  n_calls,
             typed_off, typed_n: n_typed,
+            childrev_off, childrev_n: n_childrev,
+            sig_off,   sig_n:   n_sig,
             blob_off,  blob_len,
             ..Default::default()
         };
@@ -610,6 +739,14 @@ impl IndexBuilder {
         self.inherits.sort_unstable();
         self.inherits.dedup();
         let n_inh = self.inherits.len() as u64;
+        // inhrev: the SAME edges as `inh`, reversed to (parent, child) and
+        // re-sorted, so `inherited_by(parent)` is an O(log n) range scan.
+        // Mirror of how `crev` reverses `calls`.
+        let mut inh_rev: Vec<(u64, u64)> = self.inherits.iter()
+            .map(|(c, p)| (*p, *c))
+            .collect();
+        inh_rev.sort_unstable();
+        let n_inhrev = inh_rev.len() as u64;
 
         // ---- 4b. Sort calls (callgraph), once by caller for
         //          `calls_from`, once by callee for `called_by`.
@@ -643,16 +780,43 @@ impl IndexBuilder {
         }
         let n_typed = typed_pos.len() as u64;
 
+        // ---- 4d. childrev (parent → child membership) ----
+        // childof was recorded reversed as (parent, child); sort by that
+        // key so `members(parent)` is an O(log n) range scan. Mirror of
+        // `inhrev`. All edges kept; `members` filters by parent kind.
+        self.childof.sort_unstable();
+        self.childof.dedup();
+        let n_childrev = self.childof.len() as u64;
+
+        // ---- 4e. sig (sym → full signature string) ----
+        // Same one-row-per-sym collapse as `typed`; strings append to the
+        // shared blob. The table stays sorted by sym for a binary search.
+        self.sig.sort_unstable();
+        self.sig.dedup();
+        let mut sig_pos: Vec<(u64, u64, u16)> = Vec::with_capacity(self.sig.len());
+        let mut last_sig_sym: Option<u64> = None;
+        for (sym, sg) in &self.sig {
+            if last_sig_sym == Some(*sym) { continue; }   // one row per sym
+            last_sig_sym = Some(*sym);
+            let sg = clamp_blob_str(sg);
+            sig_pos.push((*sym, blob.len() as u64, sg.len() as u16));
+            blob.extend_from_slice(sg.as_bytes());
+        }
+        let n_sig = sig_pos.len() as u64;
+
         // ---- 5. Compute section offsets ----
         let xrefs_off = pad_up(size_of_header() as u64);
         let syms_off  = pad_up(xrefs_off + n_xrefs * XREF_LEN as u64);
         let names_off = pad_up(syms_off  + n_syms  * SYM_LEN  as u64);
         let files_off = pad_up(names_off + n_names * NAME_LEN as u64);
         let inh_off   = pad_up(files_off + n_files * FILE_LEN as u64);
-        let calls_off = pad_up(inh_off   + n_inh   * INH_LEN  as u64);
+        let inhrev_off = pad_up(inh_off  + n_inh   * INH_LEN  as u64);
+        let calls_off = pad_up(inhrev_off + n_inhrev * INH_LEN as u64);
         let crev_off  = pad_up(calls_off + n_calls * CALL_LEN as u64);
         let typed_off = pad_up(crev_off  + n_crev  * CALL_LEN as u64);
-        let blob_off  = pad_up(typed_off + n_typed * TYPE_LEN as u64);
+        let childrev_off = pad_up(typed_off + n_typed * TYPE_LEN as u64);
+        let sig_off   = pad_up(childrev_off + n_childrev * INH_LEN as u64);
+        let blob_off  = pad_up(sig_off   + n_sig   * TYPE_LEN as u64);
 
         // ---- 6. Write to a tempfile, then atomic rename ----
         // pid-suffixed so concurrent writers never collide on the tmp.
@@ -668,9 +832,12 @@ impl IndexBuilder {
             names_off, names_n: n_names,
             files_off, files_n: n_files,
             inh_off,   inh_n:   n_inh,
+            inhrev_off, inhrev_n: n_inhrev,
             calls_off, calls_n: n_calls,
             crev_off,  crev_n:  n_crev,
             typed_off, typed_n: n_typed,
+            childrev_off, childrev_n: n_childrev,
+            sig_off,   sig_n:   n_sig,
             blob_off,  blob_len: blob.len() as u64,
             ..Default::default()
         };
@@ -713,6 +880,14 @@ impl IndexBuilder {
             w.write_all(&p.to_be_bytes())?;
         }
 
+        // inhrev is the same edges sorted by parent. Same INH_LEN byte
+        // layout as `inh`; the first u64 in this section is the parent.
+        seek_to(&mut w, inhrev_off)?;
+        for (p, c) in &inh_rev {
+            w.write_all(&p.to_be_bytes())?;
+            w.write_all(&c.to_be_bytes())?;
+        }
+
         seek_to(&mut w, calls_off)?;
         for (caller, callee, role) in &self.calls {
             w.write_all(&caller.to_be_bytes())?;
@@ -733,6 +908,21 @@ impl IndexBuilder {
 
         seek_to(&mut w, typed_off)?;
         for (sym, off, len) in &typed_pos {
+            w.write_all(&sym.to_be_bytes())?;
+            w.write_all(&off.to_be_bytes())?;
+            w.write_all(&len.to_be_bytes())?;
+        }
+
+        // childrev: (parent, child) sorted by parent. Same INH_LEN layout
+        // as `inh`/`inhrev`; the first u64 here is the parent.
+        seek_to(&mut w, childrev_off)?;
+        for (parent, child) in &self.childof {
+            w.write_all(&parent.to_be_bytes())?;
+            w.write_all(&child.to_be_bytes())?;
+        }
+
+        seek_to(&mut w, sig_off)?;
+        for (sym, off, len) in &sig_pos {
             w.write_all(&sym.to_be_bytes())?;
             w.write_all(&off.to_be_bytes())?;
             w.write_all(&len.to_be_bytes())?;

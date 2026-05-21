@@ -233,6 +233,28 @@ pub fn ingest_tolerant<R: Read>(
             }
         }
     }
+
+    // -- Signature emission: render each FUNCTION's full signature with
+    //    parameter names. `typed` already gives the type-only function
+    //    type; `sig` adds the param NAMES (e.g. `setEnabled(bool enabled)`),
+    //    which carry semantic meaning. Built from the function's `param.N`
+    //    edges (param syms, ordinal order), each param's own NAME (its
+    //    MarkedSource short name) and TYPE (its typed edge, rendered via
+    //    the same renderer the typed work uses), plus the function's
+    //    return type (its own typed edge → `fn` render, return part).
+    //    Honest emptiness: no param info / no renderable types → no row.
+    {
+        let g = CuTypeGraph { side: &state.types };
+        // sym-key → type-node-key index over the buffered typed edges.
+        let typed_of: HashMap<&str, &str> = state.types.edges.iter()
+            .map(|(s, t)| (s.as_str(), t.as_str())).collect();
+        for fn_key in &state.types.functions {
+            if let Some(sig) = render_signature(&g, fn_key, &state.types, &typed_of) {
+                builder.add_sig(sym_of(fn_key), &sig);
+                stats.sigs_emitted += 1;
+            }
+        }
+    }
     Ok(stats)
 }
 
@@ -245,6 +267,8 @@ pub struct IngestStats {
     pub aliases_emitted:   u64,
     pub calls_emitted:     u64,
     pub types_emitted:     u64,
+    pub childof_emitted:   u64,
+    pub sigs_emitted:      u64,
     pub completes_bridges: usize,
     // Diagnostic: side-table sizes at resolution time. Useful for
     // spotting "0 calls emitted" failures — typically a sign that an
@@ -359,6 +383,15 @@ struct TypeSide {
     /// The builtin operator (`ptr`, `const`, `fn`, `int`, …) of a
     /// `tbuiltin` node — the part of its signature before `#builtin`.
     builtin_op: HashMap<String, String>,
+    /// Keys of FUNCTION nodes seen this CU, in first-seen order. At CU
+    /// finalize each one is rendered into a full signature (`sig`
+    /// section) from its `param.N` edges + each param's name/type + the
+    /// function's own return type. Recorded here because the renderer
+    /// needs the whole CU's graph buffered (param/type nodes arrive in
+    /// any stream order). The param/function NAME MarkedSource and the
+    /// param/return TYPE both come from the already-buffered `code` /
+    /// `edges` tables — no extra storage needed.
+    functions: Vec<String>,
 }
 
 #[derive(Default)]
@@ -443,10 +476,22 @@ fn process_entry(
             }
             return;
         }
-        // /kythe/edge/childof in cxx_indexer connects sym scopes
-        // (namespace / class nesting), NOT anchors to functions —
-        // not useful for callgraph. We ignore it here. Function
-        // containment is reconstructed from body anchors instead.
+        // `/kythe/edge/childof` — a child node points at its enclosing
+        // parent (a field/method childof its class, a class childof its
+        // file/package, a param childof its function). We record every
+        // one as a membership edge; `members NAME` filters by the parent
+        // sym's kind at query time so only a real container (type /
+        // record / interface / package) lists members and function-local
+        // children never leak. NOT used for callgraph — call containment
+        // is reconstructed from body anchors above, since childof in
+        // cxx_indexer is sym-scope nesting, not anchor→function.
+        if is_childof_edge(&e.edge_kind) && !e.target.is_empty() {
+            let child  = sym_of(&source_key);
+            let parent = sym_of(&e.target.to_symbol_string());
+            builder.add_childof(child, parent);
+            stats.childof_emitted += 1;
+            return;
+        }
 
         // xref edges
         if let Some(role_byte) = edge_to_role(&e.edge_kind) {
@@ -516,6 +561,11 @@ fn process_entry(
                 let k = node_kind_byte(value);
                 let l = e.source.lang_byte();
                 builder.upsert_sym(sym_of(&source_key), k, l, &source_key);
+                // Remember function nodes so CU finalize can render their
+                // full signature (with param names) into the `sig` section.
+                if k == kind::FUNCTION {
+                    types.functions.push(source_key.clone());
+                }
             }
             // Record the raw Kythe kind for the type renderer (it branches
             // on "tapp"/"tbuiltin"/"record"/… text, not our compact byte).
@@ -662,6 +712,11 @@ fn is_inherit_edge(kind: &str) -> bool {
 fn is_completes_edge(kind: &str) -> bool {
     let base = kind.split('.').next().unwrap_or(kind);
     matches!(base, "/kythe/edge/completes" | "/kythe/edge/completes/uniquely")
+}
+
+fn is_childof_edge(kind: &str) -> bool {
+    let base = kind.split('.').next().unwrap_or(kind);
+    base == "/kythe/edge/childof"
 }
 
 fn is_named_edge(kind: &str) -> bool {
@@ -909,6 +964,98 @@ fn typename_from_marked_source(code: &[u8]) -> Option<String> {
     let name = parse_marked_source_fqn(code)?;
     let trimmed = name.trim_end_matches("<>").trim_end();
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+/// The short (unqualified) name from a parsed FQN: the last `::`- or
+/// `.`-separated component. `Gadget::frob::w` → `w`,
+/// `android.os.Binder.clearCallingIdentity` → `clearCallingIdentity`.
+fn short_name(fqn: &str) -> &str {
+    let after_colon = fqn.rsplit("::").next().unwrap_or(fqn);
+    after_colon.rsplit('.').next().unwrap_or(after_colon)
+}
+
+/// Render a FUNCTION's full signature WITH parameter names — the value
+/// the `sig` section adds over `typed`'s type-only function type.
+///
+/// Shape: `<ret_type> <fn_name>(<p0type> <p0name>, <p1type> <p1name>, …)`.
+///
+/// Sources, all from the CU's buffered graph:
+///   * params: the function's `/kythe/edge/param.N` targets in ordinal
+///     order (the parameter syms).
+///   * each param's NAME: its `/kythe/code` MarkedSource short name.
+///   * each param's TYPE: its `/kythe/edge/typed` node, rendered via the
+///     same renderer the typed work uses.
+///   * the return type: the function's own `/kythe/edge/typed` node — a
+///     `fn` application rendering `<ret>(args…)`; we take the `<ret>`
+///     part (before the first `(`).
+///   * the function name: the function's own `/kythe/code` MarkedSource
+///     short name.
+///
+/// Honest emptiness: returns None when the function has no param edges
+/// (so there's nothing the type-only `typed` doesn't already carry), or
+/// when nothing renders. A param whose type doesn't render still keeps
+/// its name (rendered as just the name), since the name is the point.
+fn render_signature<'a>(
+    g: &CuTypeGraph<'a>,
+    fn_key: &'a str,
+    side: &'a TypeSide,
+    typed_of: &HashMap<&'a str, &'a str>,
+) -> Option<String> {
+    // Parameter syms in ordinal order. No params → nothing to add.
+    let params = side.params.get(fn_key)?;
+    if params.is_empty() { return None; }
+
+    // Function short name from its own MarkedSource (may be absent).
+    let fn_name = side.code.get(fn_key)
+        .and_then(|c| parse_marked_source_fqn(c))
+        .map(|fqn| short_name(&fqn).to_string());
+
+    // Return type: render the function's own typed node, take the part
+    // before the first `(` (the `fn` render is `<ret>(args…)`). For a
+    // member function the member-fn `this` lands in the fn type's args,
+    // never in the return part, so this stays correct.
+    let ret_type = typed_of.get(fn_key)
+        .and_then(|tk| render_type(g, tk))
+        .map(|full| {
+            let cut = full.find('(').unwrap_or(full.len());
+            full[..cut].trim_end().to_string()
+        })
+        .filter(|s| !s.is_empty());
+
+    // Each parameter: `<type> <name>` when both render, else whichever
+    // is present. A param that yields neither is rendered as `?`.
+    let mut parts: Vec<String> = Vec::with_capacity(params.len());
+    let mut any_named = false;
+    for pkey in params.values() {
+        let pty = typed_of.get(pkey.as_str())
+            .and_then(|tk| render_type(g, tk))
+            .filter(|s| !s.is_empty());
+        let pname = side.code.get(pkey.as_str())
+            .and_then(|c| parse_marked_source_fqn(c))
+            .map(|fqn| short_name(&fqn).to_string())
+            .filter(|s| !s.is_empty());
+        if pname.is_some() { any_named = true; }
+        let part = match (pty, pname) {
+            (Some(t), Some(n)) => format!("{t} {n}"),
+            (Some(t), None)    => t,
+            (None,    Some(n)) => n,
+            (None,    None)    => "?".to_string(),
+        };
+        parts.push(part);
+    }
+    // The whole point of `sig` over `typed` is the param NAMES. If not a
+    // single param resolved a name, the type-only `typed` already carries
+    // everything — don't store a redundant row.
+    if !any_named { return None; }
+
+    let name = fn_name.unwrap_or_default();
+    let head = match (ret_type, name.is_empty()) {
+        (Some(r), false) => format!("{r} {name}"),
+        (Some(r), true)  => r,
+        (None,    false) => name,
+        (None,    true)  => String::new(),
+    };
+    Some(format!("{head}({})", parts.join(", ")))
 }
 
 /// Read one proto field header (varint tag + wire-size payload) at
@@ -1386,6 +1533,140 @@ mod tests {
         g.params.insert("loop", pm);
         // Should terminate (depth cap) — we only assert it returns.
         let _ = render_type(&g, "loop");
+    }
+
+    // ---- sig renderer (param NAMES + types) --------------------------------
+    //
+    // Real cxx_indexer output for `int Gadget::frob(Widget* w, int n)`:
+    //   * the function node's own /kythe/code MarkedSource (FROB_FN_CODE)
+    //     renders to the FQN `Gadget::frob`; short name `frob`.
+    //   * its /kythe/edge/typed points at a `fn` tapp whose render is
+    //     `int(Widget *, int)` (return then arg types).
+    //   * /kythe/edge/param.0 → param var `w`, param.1 → `n`. Each param
+    //     var's /kythe/code MarkedSource (PARAM{N}_NAME_CODE) renders to
+    //     `Gadget::frob::w` / `::n` (short name `w` / `n`), and each
+    //     param's /kythe/edge/typed gives its own type node.
+
+    // frob's own name MarkedSource (FQN `Gadget::frob`).
+    const FROB_FN_CODE: &[u8] = &[
+        0x1a, 0x07, 0x08, 0x01, 0x12, 0x03, 0x69, 0x6e, 0x74, 0x1a, 0x03, 0x12, 0x01, 0x20,
+        0x1a, 0x20, 0x1a, 0x14, 0x08, 0x04, 0x1a, 0x0a, 0x08, 0x03, 0x12, 0x06, 0x47, 0x61,
+        0x64, 0x67, 0x65, 0x74, 0x22, 0x02, 0x3a, 0x3a, 0x50, 0x01, 0x1a, 0x08, 0x08, 0x03,
+        0x12, 0x04, 0x66, 0x72, 0x6f, 0x62, 0x1a, 0x0c, 0x08, 0x06, 0x12, 0x01, 0x28, 0x22,
+        0x02, 0x2c, 0x20, 0x2a, 0x01, 0x29];
+    // param.0 `w` name MarkedSource (FQN `Gadget::frob::w`).
+    const FROB_W_NAME: &[u8] = &[
+        0x1a, 0x0b, 0x08, 0x01, 0x12, 0x07, 0x57, 0x69, 0x64, 0x67, 0x65, 0x74, 0x2a, 0x1a,
+        0x03, 0x12, 0x01, 0x20, 0x1a, 0x27, 0x1a, 0x1e, 0x08, 0x04, 0x1a, 0x0a, 0x08, 0x03,
+        0x12, 0x06, 0x47, 0x61, 0x64, 0x67, 0x65, 0x74, 0x1a, 0x08, 0x08, 0x03, 0x12, 0x04,
+        0x66, 0x72, 0x6f, 0x62, 0x22, 0x02, 0x3a, 0x3a, 0x50, 0x01, 0x1a, 0x05, 0x08, 0x03,
+        0x12, 0x01, 0x77];
+    // param.1 `n` name MarkedSource (FQN `Gadget::frob::n`).
+    const FROB_N_NAME: &[u8] = &[
+        0x1a, 0x07, 0x08, 0x01, 0x12, 0x03, 0x69, 0x6e, 0x74, 0x1a, 0x03, 0x12, 0x01, 0x20,
+        0x1a, 0x27, 0x1a, 0x1e, 0x08, 0x04, 0x1a, 0x0a, 0x08, 0x03, 0x12, 0x06, 0x47, 0x61,
+        0x64, 0x67, 0x65, 0x74, 0x1a, 0x08, 0x08, 0x03, 0x12, 0x04, 0x66, 0x72, 0x6f, 0x62,
+        0x22, 0x02, 0x3a, 0x3a, 0x50, 0x01, 0x1a, 0x05, 0x08, 0x03, 0x12, 0x01, 0x6e];
+
+    /// Build a [`TypeSide`] mirroring the frob function's CU graph, then
+    /// drive `render_signature` over it exactly as ingest does. Returns
+    /// the rendered sig (or None).
+    fn frob_typeside() -> TypeSide {
+        let mut side = TypeSide::default();
+        // Function node + its name code + param edges.
+        side.functions.push("frob".into());
+        side.code.insert("frob".into(), FROB_FN_CODE.to_vec());
+        let mut fp = std::collections::BTreeMap::new();
+        fp.insert(0u32, "w".to_string());
+        fp.insert(1u32, "n".to_string());
+        side.params.insert("frob".into(), fp);
+        // Return type: the function's typed edge → `fn` tapp = int(Widget*, int).
+        side.edges.push(("frob".into(), "fn_t".into()));
+        side.kind.insert("fn_t".into(), "tapp".into());
+        side.builtin_op.insert("fn_op".into(), "fn".into());
+        side.kind.insert("fn_op".into(), "tbuiltin".into());
+        // fn tapp params: head=fn_op, ret=int, arg0=ptr(Widget), arg1=int
+        let mut fnp = std::collections::BTreeMap::new();
+        fnp.insert(0u32, "fn_op".to_string());
+        fnp.insert(1u32, "int".to_string());
+        fnp.insert(2u32, "wptr".to_string());
+        fnp.insert(3u32, "int".to_string());
+        side.params.insert("fn_t".into(), fnp);
+        // int leaf.
+        side.kind.insert("int".into(), "tbuiltin".into());
+        side.code.insert("int".into(), INT_CODE.to_vec());
+        // Widget* tapp: head=ptr_op (builtin), arg0=Widget(record).
+        side.kind.insert("wptr".into(), "tapp".into());
+        side.builtin_op.insert("ptr_op".into(), "ptr".into());
+        side.kind.insert("ptr_op".into(), "tbuiltin".into());
+        let mut wp = std::collections::BTreeMap::new();
+        wp.insert(0u32, "ptr_op".to_string());
+        wp.insert(1u32, "Widget".to_string());
+        side.params.insert("wptr".into(), wp);
+        side.kind.insert("Widget".into(), "record".into());
+        side.code.insert("Widget".into(), WIDGET_CODE.to_vec());
+        // Param names + their typed edges.
+        side.code.insert("w".into(), FROB_W_NAME.to_vec());
+        side.code.insert("n".into(), FROB_N_NAME.to_vec());
+        side.edges.push(("w".into(), "wptr".into()));   // w : Widget *
+        side.edges.push(("n".into(), "int".into()));    // n : int
+        side
+    }
+
+    #[test]
+    fn render_signature_with_param_names_cxx() {
+        // `int Gadget::frob(Widget* w, int n)` — the sig must carry the
+        // param NAMES (w, n) and their rendered types, plus the return.
+        let side = frob_typeside();
+        let g = CuTypeGraph { side: &side };
+        let typed_of: HashMap<&str, &str> = side.edges.iter()
+            .map(|(s, t)| (s.as_str(), t.as_str())).collect();
+        let sig = render_signature(&g, "frob", &side, &typed_of).unwrap();
+        assert_eq!(sig, "int frob(Widget * w, int n)");
+        // The whole point over `typed`: the param names appear.
+        assert!(sig.contains(" w"), "param name w present: {sig}");
+        assert!(sig.contains(" n"), "param name n present: {sig}");
+    }
+
+    #[test]
+    fn render_signature_honest_emptiness_no_params() {
+        // A function with no param edges adds nothing over the type-only
+        // `typed` section, so no sig row is produced.
+        let mut side = TypeSide::default();
+        side.functions.push("g".into());
+        side.code.insert("g".into(), FROB_FN_CODE.to_vec());
+        let g = CuTypeGraph { side: &side };
+        let typed_of: HashMap<&str, &str> = HashMap::new();
+        assert_eq!(render_signature(&g, "g", &side, &typed_of), None);
+    }
+
+    #[test]
+    fn render_signature_honest_emptiness_no_param_names() {
+        // Params exist but none resolves a name (e.g. Java, which doesn't
+        // emit param-name MarkedSource). `typed` already carries the type,
+        // so sig stays empty rather than duplicating it.
+        let mut side = TypeSide::default();
+        side.functions.push("g".into());
+        let mut fp = std::collections::BTreeMap::new();
+        fp.insert(0u32, "p0".to_string());
+        side.params.insert("g".into(), fp);
+        // p0 has a type but no name code.
+        side.edges.push(("p0".into(), "int".into()));
+        side.kind.insert("int".into(), "tbuiltin".into());
+        side.code.insert("int".into(), INT_CODE.to_vec());
+        let g = CuTypeGraph { side: &side };
+        let typed_of: HashMap<&str, &str> = side.edges.iter()
+            .map(|(s, t)| (s.as_str(), t.as_str())).collect();
+        assert_eq!(render_signature(&g, "g", &side, &typed_of), None);
+    }
+
+    #[test]
+    fn short_name_strips_qualifier() {
+        assert_eq!(short_name("Gadget::frob::enabled"), "enabled");
+        assert_eq!(short_name("android.os.Binder.clearCallingIdentity"),
+                   "clearCallingIdentity");
+        assert_eq!(short_name("plain"), "plain");
+        assert_eq!(short_name("a.b::c"), "c");
     }
 
     #[test]

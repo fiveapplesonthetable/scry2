@@ -73,6 +73,9 @@ impl Index {
     pub fn n_calls(&self) -> u64 { self.hdr.calls_n }
     pub fn n_names(&self) -> u64 { self.hdr.names_n }
     pub fn n_typed(&self) -> u64 { self.hdr.typed_n }
+    pub fn n_inhrev(&self) -> u64 { self.hdr.inhrev_n }
+    pub fn n_childrev(&self) -> u64 { self.hdr.childrev_n }
+    pub fn n_sig(&self) -> u64 { self.hdr.sig_n }
 
     // -- raw section slices --------------------------------------------------
 
@@ -114,6 +117,21 @@ impl Index {
     fn typed_slice(&self) -> &[u8] {
         let off = self.hdr.typed_off as usize;
         let len = self.hdr.typed_n as usize * TYPE_LEN;
+        &self.map[off..off + len]
+    }
+    fn inhrev_slice(&self) -> &[u8] {
+        let off = self.hdr.inhrev_off as usize;
+        let len = self.hdr.inhrev_n as usize * INH_LEN;
+        &self.map[off..off + len]
+    }
+    fn childrev_slice(&self) -> &[u8] {
+        let off = self.hdr.childrev_off as usize;
+        let len = self.hdr.childrev_n as usize * INH_LEN;
+        &self.map[off..off + len]
+    }
+    fn sig_slice(&self) -> &[u8] {
+        let off = self.hdr.sig_off as usize;
+        let len = self.hdr.sig_n as usize * TYPE_LEN;
         &self.map[off..off + len]
     }
     fn blob(&self) -> &[u8] {
@@ -362,24 +380,84 @@ impl Index {
     }
 
     /// `inherited_by(parent)` returns each child. (sub)
-    /// We don't keep a reversed table — this is a linear scan over the
-    /// inh slice. For interactive queries on ~5M inheritance rows this
-    /// is ~100ms cold, ~10ms warm. If it ever needs to be O(log) we
-    /// can emit a second sorted-by-parent table.
+    /// O(log n) — binary search the parent-sorted `inhrev` section (the
+    /// same edges as `inh`, reversed to (parent, child)), then walk the
+    /// contiguous range. Mirrors `called_by` over `crev`.
     pub fn inherited_by(&self, parent: u64) -> Vec<u64> {
-        let inh = self.inh_slice();
-        let n = self.hdr.inh_n as usize;
+        let inhrev = self.inhrev_slice();
+        let n = self.hdr.inhrev_n as usize;
         let p_be = parent.to_be_bytes();
-        let mut out = Vec::new();
-        for i in 0..n {
+        let mut start = [0u8; INH_LEN];
+        start[0..8].copy_from_slice(&p_be);
+        let mut end = [0u8; INH_LEN];
+        end[0..8].copy_from_slice(&(parent.wrapping_add(1)).to_be_bytes());
+        let lo = lower_bound(inhrev, n, INH_LEN, &start);
+        let hi = lower_bound(inhrev, n, INH_LEN, &end);
+        let mut out = Vec::with_capacity(hi - lo);
+        for i in lo..hi {
             let off = i * INH_LEN;
-            let row_parent: [u8; 8] = inh[off + 8..off + 16].try_into().unwrap();
-            if row_parent == p_be {
-                let c: [u8; 8] = inh[off..off + 8].try_into().unwrap();
-                out.push(u64::from_be_bytes(c));
-            }
+            // inhrev layout: (parent u64 BE, child u64 BE)
+            let c: [u8; 8] = inhrev[off + 8..off + 16].try_into().unwrap();
+            out.push(u64::from_be_bytes(c));
         }
         out
+    }
+
+    // -- membership ----------------------------------------------------------
+
+    /// `members(parent)` returns each direct child sym recorded over
+    /// `/kythe/edge/childof` (a class's fields and methods, a package's
+    /// types). O(log n) — binary search the parent-sorted `childrev`
+    /// section. The caller is responsible for the parent-kind filter
+    /// (the `members` verb only expands a type/record/interface/package),
+    /// so function-local children (params/locals) never surface even
+    /// though they live in `childrev`.
+    pub fn members(&self, parent: u64) -> Vec<u64> {
+        let childrev = self.childrev_slice();
+        let n = self.hdr.childrev_n as usize;
+        let p_be = parent.to_be_bytes();
+        let mut start = [0u8; INH_LEN];
+        start[0..8].copy_from_slice(&p_be);
+        let mut end = [0u8; INH_LEN];
+        end[0..8].copy_from_slice(&(parent.wrapping_add(1)).to_be_bytes());
+        let lo = lower_bound(childrev, n, INH_LEN, &start);
+        let hi = lower_bound(childrev, n, INH_LEN, &end);
+        let mut out = Vec::with_capacity(hi - lo);
+        for i in lo..hi {
+            let off = i * INH_LEN;
+            // childrev layout: (parent u64 BE, child u64 BE)
+            let c: [u8; 8] = childrev[off + 8..off + 16].try_into().unwrap();
+            out.push(u64::from_be_bytes(c));
+        }
+        out
+    }
+
+    // -- sym → signature -----------------------------------------------------
+
+    /// The full rendered signature of `sym` with parameter names (e.g.
+    /// "void setEnabled(bool enabled)"), or None when none was rendered
+    /// (not a function, no param info, unrenderable types). O(log n)
+    /// binary search over the sym-sorted `sig` section. Never a guess.
+    pub fn sig_of(&self, sym: u64) -> Option<&str> {
+        let sig = self.sig_slice();
+        let n = self.hdr.sig_n as usize;
+        let sym_be = sym.to_be_bytes();
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let row_off = mid * TYPE_LEN;
+            let row_sym: [u8; 8] = sig[row_off..row_off + 8].try_into().unwrap();
+            match row_sym.cmp(&sym_be) {
+                std::cmp::Ordering::Less    => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal   => {
+                    let str_off = u64::from_be_bytes(sig[row_off + 8..row_off + 16].try_into().unwrap());
+                    let str_len = u16::from_be_bytes(sig[row_off + 16..row_off + 18].try_into().unwrap());
+                    return Some(self.blob_str(str_off, str_len));
+                }
+            }
+        }
+        None
     }
 
     // -- callgraph -----------------------------------------------------------
@@ -569,6 +647,38 @@ impl Index {
             let sym = u64::from_be_bytes(typed[off..off + 8].try_into().unwrap());
             let so  = u64::from_be_bytes(typed[off + 8..off + 16].try_into().unwrap()) as usize;
             let sl  = u16::from_be_bytes(typed[off + 16..off + 18].try_into().unwrap()) as usize;
+            let s = std::str::from_utf8(&blob[so..so + sl]).unwrap_or("");
+            (sym, s)
+        })
+    }
+
+    /// Every `(parent, child)` row in the `childrev` section, in
+    /// (parent, child) order. Used by snapshot/resume to round-trip
+    /// membership edges and by the k-way merge to fold childrev across
+    /// shards.
+    pub fn iter_childrev(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let n = self.hdr.childrev_n as usize;
+        let childrev = self.childrev_slice();
+        (0..n).map(move |i| {
+            let off = i * INH_LEN;
+            let p = u64::from_be_bytes(childrev[off..off + 8].try_into().unwrap());
+            let c = u64::from_be_bytes(childrev[off + 8..off + 16].try_into().unwrap());
+            (p, c)
+        })
+    }
+
+    /// Every `(sym, signature_string)` row in the `sig` section, in sym
+    /// order. Used by snapshot/resume to round-trip signatures and by the
+    /// k-way merge to fold sig tables across shards.
+    pub fn iter_sig(&self) -> impl Iterator<Item = (u64, &str)> + '_ {
+        let n = self.hdr.sig_n as usize;
+        let sig = self.sig_slice();
+        let blob = self.blob();
+        (0..n).map(move |i| {
+            let off = i * TYPE_LEN;
+            let sym = u64::from_be_bytes(sig[off..off + 8].try_into().unwrap());
+            let so  = u64::from_be_bytes(sig[off + 8..off + 16].try_into().unwrap()) as usize;
+            let sl  = u16::from_be_bytes(sig[off + 16..off + 18].try_into().unwrap()) as usize;
             let s = std::str::from_utf8(&blob[so..so + sl]).unwrap_or("");
             (sym, s)
         })

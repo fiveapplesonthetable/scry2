@@ -35,7 +35,14 @@
 use std::mem::size_of;
 
 pub const MAGIC: [u8; 8]   = *b"S2DBv2\0\0";
-pub const VERSION: u32     = 3;
+/// v4 adds the "comprehension layer" sections (typed/childrev/inhrev/sig).
+/// They are appended sections with their offsets carved from the header's
+/// former `_reserved` bytes (zero in a v3 file), and no existing row
+/// layout changed — so a v4 reader opens a v3 file fine (the new counts
+/// read back as 0). `Index::open` accepts version 3 or 4.
+pub const VERSION: u32     = 4;
+/// Lowest on-disk version this reader understands.
+pub const MIN_VERSION: u32 = 3;
 pub const PAGE: usize      = 4096;
 
 /// File header — first 256 bytes. Numbers count rows, *not* bytes.
@@ -70,7 +77,17 @@ pub struct Header {
     pub blob_off:     u64,
     pub blob_len:     u64,
 
-    pub _reserved:    [u8; 256 - 8 - 4 - 4 - 8*16],
+    // ---- v4 comprehension layer (zero in a v3 file) ----
+    pub typed_off:    u64,    // (sym, type-string blob ref) sorted by sym — resolved type of a sym
+    pub typed_n:      u64,
+    pub childrev_off: u64,    // (parent, child) reverse childof — `members NAME`
+    pub childrev_n:   u64,
+    pub inhrev_off:   u64,    // (parent, child) reverse inherits — O(log n) `sub`
+    pub inhrev_n:     u64,
+    pub sig_off:      u64,    // (sym, signature blob ref) sorted by sym — full rendered signature
+    pub sig_n:        u64,
+
+    pub _reserved:    [u8; 256 - 8 - 4 - 4 - 8*24],
 }
 
 impl Default for Header {
@@ -85,7 +102,11 @@ impl Default for Header {
             calls_off: 0, calls_n: 0,
             crev_off:  0, crev_n:  0,
             blob_off:  0, blob_len: 0,
-            _reserved: [0; 256 - 8 - 4 - 4 - 8*16],
+            typed_off: 0, typed_n: 0,
+            childrev_off: 0, childrev_n: 0,
+            inhrev_off: 0, inhrev_n: 0,
+            sig_off:   0, sig_n:   0,
+            _reserved: [0; 256 - 8 - 4 - 4 - 8*24],
         }
     }
 }
@@ -204,6 +225,20 @@ pub struct CallRow {
 }
 pub const CALL_LEN: usize = 17;
 const _: () = assert!(size_of::<CallRow>() == CALL_LEN);
+
+/// One sym→string row, sorted by `sym`. Backs both the `typed` section
+/// (sym → its resolved type, pre-rendered to a string at ingest) and the
+/// `sig` section (sym → its full rendered signature). The string lives in
+/// the blob, referenced by (u64 off, u16 len) like every other name. 18 B.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TypeRow {
+    pub sym:      [u8; 8],   // BE
+    pub str_off:  [u8; 8],   // BE offset into blob
+    pub str_len:  [u8; 2],   // BE length in blob
+}
+pub const TYPE_LEN: usize = 18;
+const _: () = assert!(size_of::<TypeRow>() == TYPE_LEN);
 
 /// Page-align a byte offset up to the next 4 KB boundary.
 #[inline] pub fn pad_up(n: u64) -> u64 {

@@ -29,8 +29,8 @@ impl Index {
         if hdr.magic != MAGIC {
             bail!("bad magic: not a scry2 index");
         }
-        if hdr.version != VERSION {
-            bail!("bad version: file={} reader={}", hdr.version, VERSION);
+        if hdr.version < MIN_VERSION || hdr.version > VERSION {
+            bail!("unsupported version: file={} reader supports {}..={}", hdr.version, MIN_VERSION, VERSION);
         }
         // Validate every section fits within the mapped file. A truncated
         // or zero-length .s2db (e.g. a shard whose write was killed) would
@@ -38,15 +38,22 @@ impl Index {
         // query or the final merge's shard re-read. Checked arithmetic so
         // a corrupt header can't overflow into a spurious in-range end.
         let map_len = map.len() as u64;
-        let sections: [(&str, u64, u64, u64); 8] = [
-            ("xrefs", hdr.xrefs_off, hdr.xrefs_n,  XREF_LEN as u64),
-            ("syms",  hdr.syms_off,  hdr.syms_n,   SYM_LEN  as u64),
-            ("names", hdr.names_off, hdr.names_n,  NAME_LEN as u64),
-            ("files", hdr.files_off, hdr.files_n,  FILE_LEN as u64),
-            ("inh",   hdr.inh_off,   hdr.inh_n,    INH_LEN  as u64),
-            ("calls", hdr.calls_off, hdr.calls_n,  CALL_LEN as u64),
-            ("crev",  hdr.crev_off,  hdr.crev_n,   CALL_LEN as u64),
-            ("blob",  hdr.blob_off,  hdr.blob_len, 1),
+        // v4 sections (typed/childrev/inhrev/sig) are zero in a v3 file, so
+        // their bounds check (0+0 <= map_len) trivially passes — that's what
+        // makes a v4 reader open a v3 file.
+        let sections: [(&str, u64, u64, u64); 12] = [
+            ("xrefs",    hdr.xrefs_off,    hdr.xrefs_n,    XREF_LEN as u64),
+            ("syms",     hdr.syms_off,     hdr.syms_n,     SYM_LEN  as u64),
+            ("names",    hdr.names_off,    hdr.names_n,    NAME_LEN as u64),
+            ("files",    hdr.files_off,    hdr.files_n,    FILE_LEN as u64),
+            ("inh",      hdr.inh_off,      hdr.inh_n,      INH_LEN  as u64),
+            ("calls",    hdr.calls_off,    hdr.calls_n,    CALL_LEN as u64),
+            ("crev",     hdr.crev_off,     hdr.crev_n,     CALL_LEN as u64),
+            ("typed",    hdr.typed_off,    hdr.typed_n,    TYPE_LEN as u64),
+            ("childrev", hdr.childrev_off, hdr.childrev_n, INH_LEN  as u64),
+            ("inhrev",   hdr.inhrev_off,   hdr.inhrev_n,   INH_LEN  as u64),
+            ("sig",      hdr.sig_off,      hdr.sig_n,      TYPE_LEN as u64),
+            ("blob",     hdr.blob_off,     hdr.blob_len,   1),
         ];
         for (name, off, n, stride) in sections {
             let end = n.checked_mul(stride)

@@ -221,7 +221,7 @@ fn do_xrefs(
     let (role_lo, role_hi) = roles;
     let syms: Vec<u64> = if substr {
         ix.syms_matching_substring(name, sym_cap)
-    } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
+    } else { ix.syms_for_name(name) };
     let mut groups: Vec<SymbolGroup> = Vec::new();
     let mut total = 0usize;
     // If the substring matched as many symbols as we were willing to
@@ -282,7 +282,7 @@ fn do_xrefs(
 fn do_type(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
     let syms: Vec<u64> = if substr {
         ix.syms_matching_substring(name, limit.max(SUBSTR_AGG_CAP))
-    } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
+    } else { ix.syms_for_name(name) };
     let mut hits: Vec<TypeHit> = Vec::new();
     for sym in &syms {
         let Some(ty) = ix.type_of(*sym) else { continue };
@@ -307,7 +307,7 @@ fn do_type(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
 fn do_sig(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
     let syms: Vec<u64> = if substr {
         ix.syms_matching_substring(name, limit.max(SUBSTR_AGG_CAP))
-    } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
+    } else { ix.syms_for_name(name) };
     let mut hits: Vec<SigHit> = Vec::new();
     for sym in &syms {
         let Some(sg) = ix.sig_of(*sym) else { continue };
@@ -335,7 +335,7 @@ fn do_sig(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
 fn do_members(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
     let syms: Vec<u64> = if substr {
         ix.syms_matching_substring(name, limit.max(SUBSTR_AGG_CAP))
-    } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
+    } else { ix.syms_for_name(name) };
     let is_container = |k: u8| matches!(k, kind::TYPE | kind::PACKAGE);
     let mut members: Vec<MemberHit> = Vec::new();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -374,7 +374,7 @@ fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
             .filter(|&s| ix.sym_meta(s).is_some_and(|(_, k, _)| k == kind::TYPE))
             .collect()
     } else {
-        ix.sym_for_name(name).into_iter().collect()
+        ix.syms_for_name(name)
     };
     let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
@@ -411,7 +411,7 @@ fn do_callgraph(
     let roots: Vec<u64> = if substr {
         ix.syms_matching_substring(name, root_limit)
     } else {
-        ix.sym_for_name(name).into_iter().collect()
+        ix.syms_for_name(name)
     };
     // --def-in narrows the seed roots only (scry semantics): the
     // walker doesn't carry per-frame def context, so deeper levels
@@ -511,7 +511,7 @@ fn do_inheritance(
             .filter(|&s| ix.sym_meta(s).is_some_and(|(_, k, _)| k == kind::TYPE))
             .collect()
     } else {
-        ix.sym_for_name(name).into_iter().collect()
+        ix.syms_for_name(name)
     };
     // --def-in narrows the seed roots only (matches callgraph semantics).
     let roots: Vec<u64> = match filt.def_in {

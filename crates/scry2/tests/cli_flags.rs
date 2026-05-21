@@ -450,3 +450,31 @@ fn inheritance_substr_roots_filter_to_types() {
     assert!(!dump.contains("ShapeHelper"), "non-type leaked as a root: {dump}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn def_exact_ambiguous_name_aggregates_all_syms() {
+    // A name shared by two syms — one bare (no xrefs), one carrying a def.
+    // Exact `def NAME` must aggregate BOTH, not land on the bare sym and
+    // return nothing (the regression: 12 stub-variant syms shared a Java
+    // FQN; sym_for_name picked an xref-less one → hits=0).
+    let tid: String = format!("{:?}", std::thread::current().id())
+        .chars().filter(|c| c.is_ascii_digit()).collect();
+    let dir = std::env::temp_dir().join(format!("scry2-cli-amb-{}-{}", std::process::id(), tid));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s2db = dir.join("amb.s2db");
+    let mut b = IndexBuilder::new();
+    let bare = sym_of("kythe:java:stub#a");   // shares the FQN, has no xrefs
+    let defd = sym_of("kythe:java:real#b");   // shares the FQN, has the def
+    b.upsert_sym(bare, kind::FUNCTION, lang::JAVA, "kythe:java:stub#a");
+    b.upsert_sym(defd, kind::FUNCTION, lang::JAVA, "kythe:java:real#b");
+    b.add_alias(bare, "p.Dup.method");
+    b.add_alias(defd, "p.Dup.method");
+    b.upsert_file(1, "core/java/p/Dup.java");
+    b.add_xref(defd, role::DEF, 1, 100);
+    b.finish(&s2db).unwrap();
+    let v = run(&s2db, &["def", "p.Dup.method"]);
+    assert!(v["total"].as_u64().unwrap_or(0) > 0, "exact def on ambiguous name found nothing: {v}");
+    assert!(v.to_string().contains("Dup.java"), "the def-bearing variant missing: {v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

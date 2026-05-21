@@ -171,6 +171,41 @@ impl Index {
         None
     }
 
+    /// Every sym whose name (canonical or alias) exactly equals `query`.
+    /// A name can map to several syms — a Java method present in many stub
+    /// variants, or an overload set — and they sit contiguously in the
+    /// (name, sym)-sorted index. `sym_for_name` returns only the
+    /// binary-search landing, which for an ambiguous name may be a variant
+    /// with no xrefs; def/ref/callers aggregate over all of them instead.
+    pub fn syms_for_name(&self, query: &str) -> Vec<u64> {
+        let names = self.names_slice();
+        let n = self.hdr.names_n as usize;
+        let qb = query.as_bytes();
+        // Lower bound: first row whose name >= query.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let off = mid * NAME_LEN;
+            let no = u64::from_be_bytes(names[off..off + 8].try_into().unwrap());
+            let nl = u16::from_be_bytes(names[off + 8..off + 10].try_into().unwrap());
+            if self.blob_str(no, nl).as_bytes() < qb { lo = mid + 1; } else { hi = mid; }
+        }
+        // Walk the contiguous run of exact matches.
+        let mut out = Vec::new();
+        let mut i = lo;
+        while i < n {
+            let off = i * NAME_LEN;
+            let no = u64::from_be_bytes(names[off..off + 8].try_into().unwrap());
+            let nl = u16::from_be_bytes(names[off + 8..off + 10].try_into().unwrap());
+            if self.blob_str(no, nl).as_bytes() != qb { break; }
+            out.push(u64::from_be_bytes(names[off + 10..off + 18].try_into().unwrap()));
+            i += 1;
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Diagnostic: yield up to `limit` name rows whose stored bytes
     /// match `prefix`. Walks the alphabetical name index from the
     /// lower bound for `prefix` until the prefix no longer matches.

@@ -1642,9 +1642,12 @@ mod tests {
 
     #[test]
     fn render_signature_honest_emptiness_no_param_names() {
-        // Params exist but none resolves a name (e.g. Java, which doesn't
-        // emit param-name MarkedSource). `typed` already carries the type,
-        // so sig stays empty rather than duplicating it.
+        // Params exist but none resolves a name (a degenerate node with a
+        // typed edge but no NAME MarkedSource on the param). `typed` already
+        // carries the type, so sig stays empty rather than duplicating it.
+        // (NOTE: real java_indexer DOES emit a param-name MarkedSource on each
+        // param node — see `ingest_java_indexer_sig_named_params` — so the
+        // common Java case renders names; this guards only the no-name case.)
         let mut side = TypeSide::default();
         side.functions.push("g".into());
         let mut fp = std::collections::BTreeMap::new();
@@ -1658,6 +1661,85 @@ mod tests {
         let typed_of: HashMap<&str, &str> = side.edges.iter()
             .map(|(s, t)| (s.as_str(), t.as_str())).collect();
         assert_eq!(render_signature(&g, "g", &side, &typed_of), None);
+    }
+
+    /// End-to-end Java signature emission, driven by REAL java_indexer
+    /// output (not a hand-built graph). The fixture is the verbatim
+    /// `.entries` stream the stock v0.0.75 java_indexer produced for
+    ///
+    ///   class S {
+    ///     void setEnabled(boolean enabled){}
+    ///     java.util.List<String> pick(int idx, String key){return null;}
+    ///   }
+    ///
+    /// Regenerate the fixture with the stock v0.0.75 toolchain:
+    ///   javac_extractor.jar -d DIR/cls S.java   (KYTHE_CORPUS=test,
+    ///     KYTHE_OUTPUT_DIRECTORY/ROOT_DIRECTORY=DIR)
+    ///   java_indexer.jar --temp_directory DIR/jtmp DIR/*.kzip > S.entries
+    ///
+    /// It exercises the whole pipeline the sig section depends on:
+    ///   * the function SOURCE node (java_indexer's opaque-hash function
+    ///     node) carries the `/kythe/edge/typed` (return) and `param.N`
+    ///     edges;
+    ///   * each param's NAME comes from its own `/kythe/code` MarkedSource
+    ///     (java_indexer DOES emit this — `enabled`, `idx`, `key`);
+    ///   * each param's TYPE renders via the shared type renderer
+    ///     (`boolean`, `int`, `java.lang.String`, and the `java.util.List<…>`
+    ///     tapp return);
+    ///   * the sig is keyed on the SAME sym a Java method is queryable by:
+    ///     name resolution (`def`/`sig NAME`) lands on the source node via
+    ///     its `/kythe/edge/named` alias `S.setEnabled` (the JVM descriptor
+    ///     stripped), and `sig_of` on that resolved sym returns the render.
+    #[test]
+    fn ingest_java_indexer_sig_named_params() {
+        use crate::reader::Index;
+        const ENTRIES: &[u8] =
+            include_bytes!("../tests/fixtures/java_sig_S.entries");
+
+        let mut builder = IndexBuilder::new();
+        let fids = FileIdAllocator::default();
+        let stats = ingest(ENTRIES, &mut builder, &fids).unwrap();
+        // Both methods produced a sig row (return + named params).
+        assert_eq!(stats.sigs_emitted, 2,
+            "both Java methods render a full named signature");
+        fids.drain_into(&mut builder);
+
+        // Round-trip through the on-disk format so we exercise `sig_of`
+        // and `sym_for_name` exactly as the `sig`/`def` verbs do.
+        let tid = format!("{:?}", std::thread::current().id());
+        let tid_num: String = tid.chars().filter(|c| c.is_ascii_digit()).collect();
+        let dir = std::env::temp_dir().join(format!(
+            "scry2-java-sig-{}-{}", std::process::id(), tid_num));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s2db = dir.join("java_sig.s2db");
+        builder.finish(&s2db).unwrap();
+        let idx = Index::open(&s2db).unwrap();
+
+        // The exact strings the renderer must produce, by NAME resolution
+        // (the same path the `sig NAME` / `def` verbs use). This proves
+        // the sig is keyed on the queryable sym, not stranded on a node
+        // that name lookup can't reach.
+        let set_sym = idx.sym_for_name("S.setEnabled")
+            .expect("S.setEnabled resolves (descriptor-stripped alias)");
+        assert_eq!(idx.sig_of(set_sym), Some("void setEnabled(boolean enabled)"),
+            "named param + builtin type + return on a void method");
+
+        let pick_sym = idx.sym_for_name("S.pick")
+            .expect("S.pick resolves (descriptor-stripped alias)");
+        assert_eq!(
+            idx.sig_of(pick_sym),
+            Some("java.util.List<java.lang.String> pick(int idx, java.lang.String key)"),
+            "generic return tapp + builtin and record param types + names");
+
+        // The sig section holds exactly these two rows.
+        let rows: std::collections::BTreeSet<&str> =
+            idx.iter_sig().map(|(_, s)| s).collect();
+        assert_eq!(rows.len(), 2, "exactly the two method sigs");
+        assert!(rows.contains("void setEnabled(boolean enabled)"));
+        assert!(rows.contains(
+            "java.util.List<java.lang.String> pick(int idx, java.lang.String key)"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

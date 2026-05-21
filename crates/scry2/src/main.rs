@@ -154,8 +154,9 @@ enum Cmd {
     /// `ref NAME` — print every reference of a symbol.
     Ref {
         name: String,
-        /// Match NAME as a substring (parallel scan); aggregates refs
-        /// across every matching symbol. Omit for an exact-FQN lookup.
+        /// Match NAME as a substring (parallel scan, slower); aggregates
+        /// refs across matching symbols (capped at 64, raise with --limit).
+        /// Prefer an exact FQN for hot paths — use `names NAME` to find it.
         #[arg(long)] substr: bool,
         /// With --substr, cap how many matching symbols to aggregate over.
         #[arg(long, default_value = "16")] limit: usize,
@@ -172,8 +173,9 @@ enum Cmd {
     /// `callers NAME` — print every call site of a function.
     Callers {
         name: String,
-        /// Match NAME as a substring (parallel scan); aggregates call
-        /// sites across every matching symbol. Omit for exact-FQN lookup.
+        /// Match NAME as a substring (parallel scan, slower); aggregates
+        /// call sites across matching symbols (capped at 64, raise with
+        /// --limit). Prefer an exact FQN — use `names NAME` to find it.
         #[arg(long)] substr: bool,
         /// With --substr, cap how many matching symbols to aggregate over.
         #[arg(long, default_value = "16")] limit: usize,

@@ -228,6 +228,37 @@ mod tests {
     }
 
     #[test]
+    fn resume_seeds_file_id_namespace_without_collision() {
+        // Resume bug: a fresh FileIdAllocator restarts file ids at 0,
+        // colliding with the prior shards' ids when the final merge
+        // dedups file tables by id. seed_from must continue the prior
+        // namespace: existing paths keep their id, new paths get ids
+        // above the prior max.
+        let path = tmp("fileid-seed");
+        let mut b = IndexBuilder::new();
+        b.upsert_file(0, "frameworks/base/.../Binder.java");
+        b.upsert_file(1, "frameworks/base/.../Parcel.java");
+        b.upsert_file(2, "frameworks/base/.../Context.java");
+        let s = sym_of("kythe:java:x###s");
+        b.upsert_sym(s, kind::FUNCTION, lang::JAVA, "X.s");
+        b.add_xref(s, role::DECL, 1, 10);
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+
+        let alloc = crate::kythe::FileIdAllocator::default();
+        alloc.seed_from(&ix);
+        // Existing paths keep their prior ids.
+        assert_eq!(alloc.intern("frameworks/base/.../Binder.java"), 0);
+        assert_eq!(alloc.intern("frameworks/base/.../Parcel.java"), 1);
+        // A new path gets an id ABOVE the seeded max — never colliding
+        // with a seeded id (the bug was a new path reusing id 0).
+        let nid = alloc.intern("frameworks/native/.../Other.cpp");
+        assert!(nid >= 3, "new id {nid} collided with seeded 0..2");
+        assert_eq!(alloc.intern("frameworks/native/.../Other.cpp"), nid);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn snapshot_then_resume_round_trips_all_rows() {
         // Populate a builder, snapshot to disk, open the snapshot as
         // an Index, replay it into a FRESH builder, then finish and

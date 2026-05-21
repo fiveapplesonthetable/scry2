@@ -38,7 +38,8 @@ query verbs need:
 
 Everything else in the Kythe edge model is **not** ingested — including
 `influences`/dataflow edges, `instantiates`/`specializes`, macro
-`ref/expands` and macro refs, `imports`, and `typedef`/alias edges. If a
+`ref/expands` and macro refs, and `typedef`/alias edges. (Import *sites*
+are kept: `ref/imports` folds into the `xrefs` table as a plain REF.) If a
 question needs the full edge model (e.g. "what does this template
 instantiate", dataflow reachability, macro expansion sites), use Kythe's
 own serving tables. See [VS_KYTHE.md](VS_KYTHE.md).

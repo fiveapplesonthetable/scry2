@@ -141,15 +141,21 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
             calls: ix.n_calls(),
         },
         Request::Def { name, substr, limit, in_, not_in } => do_xrefs(
-            ix, name, *substr, *limit, role::DECL, role::DEF, usize::MAX,
+            ix, name, *substr, *limit, (role::DECL, role::DEF), usize::MAX,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: None },
         ),
+        // ref/callers with --substr must aggregate edges across *all*
+        // name matches, not just the first `--limit` symbols: capping the
+        // symbol set at 16 made `callers clearCallingIdentity --substr`
+        // return 0 because the 16 alpha-first matches were Java stubs with
+        // no call edges while the C++ definition (which has the callers)
+        // sorted later. Gather broadly; the output is bounded by max_hits.
         Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
-            ix, name, *substr, *limit, 0, u8::MAX, *max_hits,
+            ix, name, *substr, (*limit).max(SUBSTR_AGG_CAP), (0, u8::MAX), *max_hits,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
         ),
         Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
-            ix, name, *substr, *limit, role::CALL, role::CALL, *max_hits,
+            ix, name, *substr, (*limit).max(SUBSTR_AGG_CAP), (role::CALL, role::CALL), *max_hits,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
         ),
         Request::Super { name, substr, limit, in_, not_in } => do_inh(
@@ -168,21 +174,27 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
     }
 }
 
-// The shape (sym-resolution + role-window + path-filter) is genuinely
-// the contract this verb implements; splitting it further would just
-// rename groups, not reduce surface.
-#[allow(clippy::too_many_arguments)]
+/// Symbol-set cap for `ref`/`callers --substr`: gather edges across this
+/// many name matches before relying on `max_hits` to bound the output.
+/// Large enough that an ambiguous leaf (`clearCallingIdentity`) still
+/// reaches the definition that actually carries the edges.
+const SUBSTR_AGG_CAP: usize = 4096;
+
 fn do_xrefs(
-    ix: &Index, name: &str, substr: bool, name_limit: usize,
-    role_lo: u8, role_hi: u8, max_hits: usize,
+    ix: &Index, name: &str, substr: bool, sym_cap: usize,
+    roles: (u8, u8), max_hits: usize,
     filt: PathFilter<'_>,
 ) -> Reply {
+    let (role_lo, role_hi) = roles;
     let syms: Vec<u64> = if substr {
-        ix.syms_matching_substring(name, name_limit)
+        ix.syms_matching_substring(name, sym_cap)
     } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
     let mut groups: Vec<SymbolGroup> = Vec::new();
     let mut total = 0usize;
-    let mut truncated = false;
+    // If the substring matched as many symbols as we were willing to
+    // gather, there may be more we didn't reach — flag it so callers know
+    // the result is a (possibly partial) aggregate, not the whole truth.
+    let mut truncated = substr && syms.len() >= sym_cap;
     'outer: for sym in &syms {
         if let Some(needle) = filt.def_in {
             if !needle.is_empty() {

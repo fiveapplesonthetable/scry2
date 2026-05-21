@@ -385,7 +385,7 @@ mod tests {
         delta.add_call(s_a, s_b, role::CALL);             // dup of prior
         delta.add_call(s_b, s_c, role::CALL);
         delta.add_call(s_a, s_c, role::REF);
-        delta.write_merged_snapshot(Some(&prior), &merged_path).unwrap();
+        delta.write_merged_snapshot(&[&prior], &merged_path).unwrap();
         drop(prior);
 
         let r1 = Index::open(&reference_path).unwrap();
@@ -451,7 +451,7 @@ mod tests {
         };
 
         mk_data().finish(&direct_path).unwrap();
-        mk_data().write_merged_snapshot(None, &merged_path).unwrap();
+        mk_data().write_merged_snapshot(&[], &merged_path).unwrap();
 
         let r1 = Index::open(&direct_path).unwrap();
         let r2 = Index::open(&merged_path).unwrap();
@@ -485,7 +485,7 @@ mod tests {
         d1.add_alias(s_a, "a_fqn");
         d1.upsert_file(1, "/a");
         d1.add_xref(s_a, role::DECL, 1, 1);
-        d1.write_merged_snapshot(None, &snap1).unwrap();
+        d1.write_merged_snapshot(&[], &snap1).unwrap();
 
         let prior1 = Index::open(&snap1).unwrap();
         let mut d2 = IndexBuilder::new();
@@ -495,7 +495,7 @@ mod tests {
         d2.upsert_file(2, "/b");
         d2.add_xref(s_b, role::DEF, 2, 2);
         d2.add_call(s_a, s_b, role::CALL);
-        d2.write_merged_snapshot(Some(&prior1), &snap2).unwrap();
+        d2.write_merged_snapshot(&[&prior1], &snap2).unwrap();
         drop(prior1);
 
         let prior2 = Index::open(&snap2).unwrap();
@@ -506,7 +506,7 @@ mod tests {
         d3.add_xref(s_c, role::DECL, 3, 1);
         d3.add_inherit(s_b, s_a);
         d3.add_call(s_b, s_c, role::CALL);
-        d3.write_merged_snapshot(Some(&prior2), &snap3).unwrap();
+        d3.write_merged_snapshot(&[&prior2], &snap3).unwrap();
         drop(prior2);
 
         let mut r = IndexBuilder::new();
@@ -548,6 +548,128 @@ mod tests {
         let _ = std::fs::remove_file(&snap2);
         let _ = std::fs::remove_file(&snap3);
         let _ = std::fs::remove_file(&reference);
+    }
+
+    #[test]
+    fn kway_merge_matches_reference_finish() {
+        // The final merge folds N shards + an in-memory remainder in ONE
+        // k-way pass (write_merged_snapshot over many sources). It must be
+        // identical to a single finish() over the union of every row:
+        // dedup, UNK->known refine across shards, variable-kind alias
+        // suppression, consistent file-id paths, and alpha name order all
+        // preserved regardless of shard count. This is the gate for the
+        // single-pass merge replacing the chained fold.
+        let s0 = tmp("kway-shard0");
+        let s1 = tmp("kway-shard1");
+        let s2 = tmp("kway-shard2");
+        let merged = tmp("kway-merged");
+        let reference = tmp("kway-reference");
+
+        let a = sym_of("kythe:c++:t###a");
+        let b = sym_of("kythe:c++:t###b");
+        let c = sym_of("kythe:c++:t###c");
+        let d = sym_of("kythe:c++:t###d");
+        let iface = sym_of("kythe:c++:t###Iface");
+        let var = sym_of("kythe:c++:t###gVar");
+
+        // shard0: a defined (FUNCTION), file 1, alias, call, a var sym+alias.
+        let mut h0 = IndexBuilder::new();
+        h0.upsert_sym(a, kind::FUNCTION, lang::CXX, "kythe:c++:t###a");
+        h0.upsert_sym(var, kind::VARIABLE, lang::CXX, "kythe:c++:t###gVar");
+        h0.add_alias(a, "ns::a");
+        h0.add_alias(var, "ns::gVar");                 // must be suppressed
+        h0.upsert_file(1, "/t/a.cpp");
+        h0.add_xref(a, role::DEF, 1, 10);
+        h0.add_call(a, b, role::CALL);
+        h0.finish(&s0).unwrap();
+
+        // shard1: a as UNK (must refine to shard0's FUNCTION), b defined,
+        // file 2, dup alias + dup call across shards, a new alias.
+        let mut h1 = IndexBuilder::new();
+        h1.upsert_sym(a, kind::UNK, lang::CXX, "");
+        h1.upsert_sym(b, kind::FUNCTION, lang::CXX, "kythe:c++:t###b");
+        h1.add_alias(a, "ns::a");                       // dup across shards
+        h1.add_alias(b, "ns::b");
+        h1.upsert_file(2, "/t/b.cpp");
+        h1.add_xref(b, role::DEF, 2, 20);
+        h1.add_call(a, b, role::CALL);                  // dup across shards
+        h1.finish(&s1).unwrap();
+
+        // shard2: c defined, inherit, dup of file 1 (same id -> same path),
+        // a call, an xref.
+        let mut h2 = IndexBuilder::new();
+        h2.upsert_sym(c, kind::FUNCTION, lang::CXX, "kythe:c++:t###c");
+        h2.add_alias(c, "ns::c");
+        h2.upsert_file(1, "/t/a.cpp");                  // consistent file id
+        h2.upsert_file(3, "/t/c.cpp");
+        h2.add_xref(c, role::DECL, 3, 30);
+        h2.add_inherit(b, iface);
+        h2.add_call(b, c, role::CALL);
+        h2.finish(&s2).unwrap();
+
+        // remainder (in-memory delta, = `self`): d defined, file 4, a call.
+        let mut delta = IndexBuilder::new();
+        delta.upsert_sym(d, kind::FUNCTION, lang::CXX, "kythe:c++:t###d");
+        delta.add_alias(d, "ns::d");
+        delta.upsert_file(4, "/t/d.cpp");
+        delta.add_xref(d, role::DEF, 4, 40);
+        delta.add_call(c, d, role::CALL);
+
+        let i0 = Index::open(&s0).unwrap();
+        let i1 = Index::open(&s1).unwrap();
+        let i2 = Index::open(&s2).unwrap();
+        delta.write_merged_snapshot(&[&i0, &i1, &i2], &merged).unwrap();
+        drop((i0, i1, i2));
+
+        // Reference: one builder holding the deduped union of every row.
+        let mut r = IndexBuilder::new();
+        r.upsert_sym(a, kind::FUNCTION, lang::CXX, "kythe:c++:t###a");
+        r.upsert_sym(b, kind::FUNCTION, lang::CXX, "kythe:c++:t###b");
+        r.upsert_sym(c, kind::FUNCTION, lang::CXX, "kythe:c++:t###c");
+        r.upsert_sym(d, kind::FUNCTION, lang::CXX, "kythe:c++:t###d");
+        r.upsert_sym(var, kind::VARIABLE, lang::CXX, "kythe:c++:t###gVar");
+        r.add_alias(a, "ns::a"); r.add_alias(b, "ns::b"); r.add_alias(c, "ns::c");
+        r.add_alias(d, "ns::d"); r.add_alias(var, "ns::gVar");
+        r.upsert_file(1, "/t/a.cpp"); r.upsert_file(2, "/t/b.cpp");
+        r.upsert_file(3, "/t/c.cpp"); r.upsert_file(4, "/t/d.cpp");
+        r.add_xref(a, role::DEF, 1, 10); r.add_xref(b, role::DEF, 2, 20);
+        r.add_xref(c, role::DECL, 3, 30); r.add_xref(d, role::DEF, 4, 40);
+        r.add_inherit(b, iface);
+        r.add_call(a, b, role::CALL); r.add_call(b, c, role::CALL);
+        r.add_call(c, d, role::CALL);
+        r.finish(&reference).unwrap();
+
+        let m  = Index::open(&merged).unwrap();
+        let rf = Index::open(&reference).unwrap();
+        assert_eq!(m.n_xrefs(), rf.n_xrefs(), "xref count");
+        assert_eq!(m.n_syms(),  rf.n_syms(),  "sym count");
+        assert_eq!(m.n_files(), rf.n_files(), "file count");
+        assert_eq!(m.n_inh(),   rf.n_inh(),   "inh count");
+        assert_eq!(m.n_calls(), rf.n_calls(), "call count");
+        assert_eq!(m.n_names(), rf.n_names(), "name count");
+        for name in ["kythe:c++:t###a", "kythe:c++:t###b", "kythe:c++:t###c",
+                     "kythe:c++:t###d", "ns::a", "ns::b", "ns::c", "ns::d"] {
+            assert_eq!(m.sym_for_name(name), rf.sym_for_name(name), "name '{name}'");
+        }
+        assert_eq!(m.sym_for_name("ns::gVar"), None, "var-kind alias suppressed");
+        assert_eq!(m.sym_meta(a).map(|(_, k, _)| k), Some(kind::FUNCTION),
+            "a must refine UNK->FUNCTION across shards");
+        for sym in [a, b, c, d] {
+            let x1: Vec<_> = m.xrefs(sym, 0, u8::MAX).collect();
+            let x2: Vec<_> = rf.xrefs(sym, 0, u8::MAX).collect();
+            assert_eq!(x1, x2, "xrefs diverge for {sym:x}");
+            let c1: Vec<_> = m.calls_from(sym).into_iter().collect();
+            let c2: Vec<_> = rf.calls_from(sym).into_iter().collect();
+            assert_eq!(c1, c2, "calls_from diverge for {sym:x}");
+        }
+        assert_eq!(m.inherited_by(iface), rf.inherited_by(iface), "inherited_by");
+        for f in 1u32..=4 {
+            assert_eq!(m.file_path(f), rf.file_path(f), "file_path({f})");
+        }
+
+        for p in [&s0, &s1, &s2, &merged, &reference] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

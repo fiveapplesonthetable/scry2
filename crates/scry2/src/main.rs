@@ -1520,52 +1520,37 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     }
 
     file_ids.drain_into(&mut final_delta);
-    // Final merge — chained streaming so peak RAM stays one merge
-    // (~the largest snapshot), not the whole union. We fold sources in
-    // one at a time via `write_merged_snapshot` (in-memory delta +
-    // mmap'd prior → new file), never holding the full slice in a
-    // builder:
-    //   acc := merge(in-memory remainder, base partial)
-    //   acc := merge(shard_i loaded as delta, acc)   for each shard
-    //   rename(acc → output)
-    // Each step's prior stays on disk (mmap); only one small delta is
-    // resident. This runs with all workers joined and every indexer
-    // gone, so the machine is free.
+    // Final merge — one k-way streaming pass over (in-memory remainder
+    // delta + base partial + every shard). Each source is mmap'd and read
+    // exactly once and the output string blob is built once, so peak RAM
+    // is ~one blob + the alias gather (bounded by alias count), not the
+    // whole union. This replaces the old chained fold, which re-read the
+    // growing accumulator once per shard (O(N*shards) IO ≈ 1 TB at 57
+    // shards) and rebuilt the full names blob + re-gathered every alias on
+    // each fold (the ~80-100G heap ceiling). Runs with all workers joined
+    // and every indexer gone, so the machine is free.
     let shards = list_partial_shards(args.out);
-    eprintln!("[from-kzip] final merge: remainder (xrefs={}) + base({}) + {} shard(s)",
+    eprintln!("[from-kzip] final merge: remainder (xrefs={}) + base({}) + {} shard(s) — single k-way pass",
         final_delta.n_xrefs(),
         if partial_s2db_path.exists() { "yes" } else { "no" }, shards.len());
 
-    // Step 1: remainder ⊕ base → acc tmp (acc lives at a dedicated path
-    // so it never collides with a shard or the final output).
     let acc_path = args.out.with_extension("s2db.merging");
-    let base = if partial_s2db_path.exists() {
-        Some(scry2::reader::Index::open(&partial_s2db_path)
-            .with_context(|| format!("open base {}", partial_s2db_path.display()))?)
-    } else { None };
-    final_delta.write_merged_snapshot(base.as_ref(), &acc_path)
-        .with_context(|| "final merge: remainder ⊕ base")?;
-    drop(base);
-
-    // Step 2: fold each shard into the accumulator, one at a time.
-    for (i, src) in shards.iter().enumerate() {
-        let mut shard_delta = IndexBuilder::new();
-        {
-            let ix = scry2::reader::Index::open(src)
-                .with_context(|| format!("open shard {}", src.display()))?;
-            shard_delta.populate_from_index(&ix)
-                .with_context(|| format!("replay shard {}", src.display()))?;
-        }
-        let acc_ix = scry2::reader::Index::open(&acc_path)
-            .with_context(|| format!("open acc {}", acc_path.display()))?;
-        let next_path = args.out.with_extension(format!("s2db.merging.{i}"));
-        shard_delta.write_merged_snapshot(Some(&acc_ix), &next_path)
-            .with_context(|| format!("final merge: shard {i} ⊕ acc"))?;
-        drop(acc_ix);
-        std::fs::rename(&next_path, &acc_path)
-            .with_context(|| format!("rotate acc {} → {}", next_path.display(), acc_path.display()))?;
-        eprintln!("[from-kzip] final merge: folded shard {}/{}", i + 1, shards.len());
+    // Open every source as a read-only mmap up front; the handles must
+    // outlive the merge, which reads through them. mmap is lazy — pages
+    // fault in during the single pass, not at open.
+    let mut source_ix: Vec<scry2::reader::Index> = Vec::with_capacity(shards.len() + 1);
+    if partial_s2db_path.exists() {
+        source_ix.push(scry2::reader::Index::open(&partial_s2db_path)
+            .with_context(|| format!("open base {}", partial_s2db_path.display()))?);
     }
+    for src in &shards {
+        source_ix.push(scry2::reader::Index::open(src)
+            .with_context(|| format!("open shard {}", src.display()))?);
+    }
+    let sources: Vec<&scry2::reader::Index> = source_ix.iter().collect();
+    final_delta.write_merged_snapshot(&sources, &acc_path)
+        .with_context(|| "final merge: remainder + base + shards (k-way)")?;
+    drop(source_ix);
 
     std::fs::rename(&acc_path, args.out)
         .with_context(|| format!("promote {} → {}", acc_path.display(), args.out.display()))?;

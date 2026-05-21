@@ -216,7 +216,7 @@ impl IndexBuilder {
     /// Returns total bytes written to `output`.
     pub fn write_merged_snapshot(
         mut self,
-        prior: Option<&crate::reader::Index>,
+        sources: &[&crate::reader::Index],
         output: &Path,
     ) -> Result<u64> {
         // ---- 1. Sort delta tables in place ----
@@ -234,24 +234,22 @@ impl IndexBuilder {
         let mut delta_files: Vec<(u32, String)> = self.files.drain().collect();
         delta_files.sort_unstable_by_key(|r| r.0);
 
-        // ---- 2. var_syms (for alias suppression) from merged syms ----
-        // First-wins: prior's kind wins if both have the same sym. We
-        // need this set before processing aliases, and we can't fold
-        // it into the syms write pass below because by_name capacity
-        // depends on knowing var_syms first (variable-kind aliases
-        // are dropped, not appended). One walk over the merged sym
-        // stream — cheap relative to xrefs/calls.
-        let var_syms = merge_var_syms(prior, &delta_syms);
+        // ---- 2. var_syms (for alias suppression) ----
+        // Variable-kind syms suppress their own aliases. The kind is
+        // known for every sym during the syms write pass below, so we
+        // collect the set there (one walk, no separate pre-scan) and
+        // consume it in the aliases pass that follows. by_name has no
+        // pre-sized capacity, so nothing here depends on knowing the
+        // set first.
+        let mut var_syms: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-        // Prior's aliases come back from `iter_aliases` in *alpha*
-        // order (it walks the alphabetical name index). Collect once
-        // into a `(sym, alias)`-sorted Vec borrowing into the mmap'd
-        // blob — no string copies, bounded by alias count not by
-        // xref/call count.
-        let mut prior_aliases: Vec<(u64, &str)> = match prior {
-            Some(p) => p.iter_aliases().collect(),
-            None    => Vec::new(),
-        };
+        // Every source's aliases come back from `iter_aliases` in *alpha*
+        // order. Gather them all once into a `(sym, alias)`-sorted Vec
+        // borrowing into the mmap'd blobs — no string copies, bounded by
+        // alias count. One gather for the whole k-way merge, not one per
+        // shard (that re-gather was the old chained fold's memory cost).
+        let mut prior_aliases: Vec<(u64, &str)> = Vec::new();
+        for s in sources { prior_aliases.extend(s.iter_aliases()); }
         prior_aliases.sort_unstable();
         prior_aliases.dedup();
 
@@ -275,10 +273,9 @@ impl IndexBuilder {
         seek_to(&mut w, xrefs_off)?;
         let mut n_xrefs: u64 = 0;
         {
-            let pri: Box<dyn Iterator<Item = (u64, u8, u32, u32)>> = match prior {
-                Some(p) => Box::new(p.iter_xrefs()),
-                None    => Box::new(std::iter::empty()),
-            };
+            let pri = fold_sources(sources,
+                |s| Box::new(s.iter_xrefs()),
+                |a, b| Box::new(merge_sorted_dedup(a, b)));
             let del = self.xrefs.iter().copied();
             for (sym, role, file, offset) in merge_sorted_dedup(pri, del) {
                 w.write_all(&sym.to_be_bytes())?;
@@ -296,12 +293,12 @@ impl IndexBuilder {
         let mut blob: Vec<u8> = Vec::new();
         let mut by_name: Vec<(u64, u16, u64)> = Vec::new();
         {
-            let pri: Box<dyn Iterator<Item = (u64, u8, u8, &str)>> = match prior {
-                Some(p) => Box::new(p.iter_syms()),
-                None    => Box::new(std::iter::empty()),
-            };
+            let pri = fold_sources(sources,
+                |s| Box::new(s.iter_syms()),
+                |a, b| Box::new(merge_syms_refine(a, b)));
             let del = delta_syms.iter().map(|(s, k, l, n)| (*s, *k, *l, n.as_str()));
             for (sym, kind, lang, name) in merge_syms_refine(pri, del) {
+                if kind == kind::VARIABLE { var_syms.insert(sym); }
                 let name = clamp_blob_str(name);
                 let off = blob.len() as u64;
                 let len = name.len() as u16;
@@ -359,10 +356,9 @@ impl IndexBuilder {
         seek_to(&mut w, files_off)?;
         let mut n_files: u64 = 0;
         {
-            let pri: Box<dyn Iterator<Item = (u32, &str)>> = match prior {
-                Some(p) => Box::new(p.iter_files()),
-                None    => Box::new(std::iter::empty()),
-            };
+            let pri = fold_sources(sources,
+                |s| Box::new(s.iter_files()),
+                |a, b| Box::new(merge_files_first_wins(a, b)));
             let del = delta_files.iter().map(|(f, p)| (*f, p.as_str()));
             for (file, path) in merge_files_first_wins(pri, del) {
                 let path = clamp_blob_str(path);
@@ -381,10 +377,9 @@ impl IndexBuilder {
         seek_to(&mut w, inh_off)?;
         let mut n_inh: u64 = 0;
         {
-            let pri: Box<dyn Iterator<Item = (u64, u64)>> = match prior {
-                Some(p) => Box::new(p.iter_inherits()),
-                None    => Box::new(std::iter::empty()),
-            };
+            let pri = fold_sources(sources,
+                |s| Box::new(s.iter_inherits()),
+                |a, b| Box::new(merge_sorted_dedup(a, b)));
             let del = self.inherits.iter().copied();
             for (c, p) in merge_sorted_dedup(pri, del) {
                 w.write_all(&c.to_be_bytes())?;
@@ -398,10 +393,9 @@ impl IndexBuilder {
         seek_to(&mut w, calls_off)?;
         let mut merged_calls: Vec<(u64, u64, u8)> = Vec::new();
         {
-            let pri: Box<dyn Iterator<Item = (u64, u64, u8)>> = match prior {
-                Some(p) => Box::new(p.iter_calls()),
-                None    => Box::new(std::iter::empty()),
-            };
+            let pri = fold_sources(sources,
+                |s| Box::new(s.iter_calls()),
+                |a, b| Box::new(merge_sorted_dedup(a, b)));
             let del = self.calls.iter().copied();
             for (caller, callee, role) in merge_sorted_dedup(pri, del) {
                 w.write_all(&caller.to_be_bytes())?;
@@ -735,6 +729,30 @@ fn clamp_blob_str(s: &str) -> &str {
     &s[..end]
 }
 
+/// Fold every source's section stream into one k-way merge via the given
+/// 2-way `merge`, in a single pass. A merge of sorted streams stays
+/// sorted (and deduped/refined by the chosen `merge`), so folding N
+/// sources left-deep is identical to what `finish` would produce on
+/// their concatenation — but each source is read exactly once (no
+/// O(N*shards) re-reads of a growing accumulator) and the output blob is
+/// built once (RAM bounded regardless of shard count).
+fn fold_sources<'s, T, M>(
+    sources: &[&'s crate::reader::Index],
+    iter_of: impl Fn(&'s crate::reader::Index) -> Box<dyn Iterator<Item = T> + 's>,
+    merge: M,
+) -> Box<dyn Iterator<Item = T> + 's>
+where
+    T: 's,
+    M: Fn(Box<dyn Iterator<Item = T> + 's>, Box<dyn Iterator<Item = T> + 's>)
+        -> Box<dyn Iterator<Item = T> + 's>,
+{
+    let mut acc: Box<dyn Iterator<Item = T> + 's> = Box::new(std::iter::empty());
+    for s in sources {
+        acc = merge(acc, iter_of(s));
+    }
+    acc
+}
+
 /// Merge two sym streams (each sorted by sym id), refining on tied ids.
 /// Yields `(sym, kind, lang, name)`. On a tie, a known kind/lang/name
 /// from either side wins over the other's UNK/empty — mirroring
@@ -875,25 +893,6 @@ where
         }
     }
     Iter { a: a.peekable(), b: b.peekable(), last: None }
-}
-
-/// Build the `var_syms` set from the merged sym stream — the final
-/// kind for a sym is the refined merge (a known kind from either source
-/// beats UNK), and the set is used to suppress alias entries for
-/// VARIABLE-kind syms.
-fn merge_var_syms(
-    prior: Option<&crate::reader::Index>,
-    delta_syms: &[(u64, u8, u8, String)],
-) -> std::collections::HashSet<u64> {
-    let pri: Box<dyn Iterator<Item = (u64, u8, u8, &str)>> = match prior {
-        Some(p) => Box::new(p.iter_syms()),
-        None    => Box::new(std::iter::empty()),
-    };
-    let del = delta_syms.iter().map(|(s, k, l, n)| (*s, *k, *l, n.as_str()));
-    merge_syms_refine(pri, del)
-        .filter(|(_, k, _, _)| *k == kind::VARIABLE)
-        .map(|(s, _, _, _)| s)
-        .collect()
 }
 
 fn size_of_header() -> usize { std::mem::size_of::<Header>() }

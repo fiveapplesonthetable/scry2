@@ -897,6 +897,32 @@ fn render_type_rec<G: TypeGraph>(g: &G, tk: G::Tk, depth: u32) -> Option<String>
             return g.node_code(tk).and_then(typename_from_marked_source);
         }
         let head = params[0];
+        if g.node_kind(head) == "tbuiltin" {
+            let op = g.builtin_op(head);
+            // Array builtins (`carr`/`array`) render their single element as
+            // `E[]`. The bound is NOT in the node — `int data[8]` is `int[]`.
+            // Nesting composes naturally via the recursive element render:
+            // `carr(carr(int))` → `int[][]`, `carr(ptr(int))` → `int *[]`.
+            if is_array_op(op) {
+                let elem = params.get(1)
+                    .and_then(|&e| render_type_rec(g, e, depth + 1))
+                    .unwrap_or_else(|| "?".to_string());
+                return Some(format!("{elem}[]"));
+            }
+            // Pointer/reference TO an array needs the parenthesized
+            // declarator: `int (*)[]`, not `int[] *`. This keeps
+            // pointer-to-array distinct from array-of-pointer (`int *[]`).
+            // Detect it STRUCTURALLY: the sole arg is an array-typed `tapp`.
+            // We render the array's ELEMENT (one level in), not the array
+            // itself, then wrap the declarator symbol in parens before `[]`.
+            if let Some(decl) = ptr_ref_decl_sym(op) {
+                if let Some(&arg) = params.get(1) {
+                    if let Some(elem) = array_element_render(g, arg, depth) {
+                        return Some(format!("{elem} ({decl})[]"));
+                    }
+                }
+            }
+        }
         let args: Vec<String> = params[1..].iter()
             .map(|&a| render_type_rec(g, a, depth + 1)
                 .unwrap_or_else(|| "?".to_string()))
@@ -924,6 +950,43 @@ fn render_type_rec<G: TypeGraph>(g: &G, tk: G::Tk, depth: u32) -> Option<String>
     let op = g.builtin_op(tk);
     if !op.is_empty() { return Some(op.to_string()); }
     None
+}
+
+/// True for the array builtin operators: C++ `carr` (constant-bound array)
+/// and Java `array`. Both render `E[]` over their single element.
+fn is_array_op(op: &str) -> bool {
+    matches!(op, "carr" | "array")
+}
+
+/// The C++ declarator symbol for a pointer/reference builtin operator, used
+/// when it points/refers to an array (`int (*)[]`, `int (&)[]`,
+/// `int (&&)[]`). Returns None for non-pointer/reference operators. Java's
+/// `array` has no pointer cases, so this is C++-only by construction.
+fn ptr_ref_decl_sym(op: &str) -> Option<&'static str> {
+    match op {
+        "ptr" => Some("*"),
+        "lvr" => Some("&"),
+        "rvr" => Some("&&"),
+        _ => None,
+    }
+}
+
+/// If `tk` is an array-typed `tapp` (its head builtin op is `carr`/`array`),
+/// render its ELEMENT type (one level inside the array) and return it; else
+/// None. Used by the pointer/reference-to-array declarator: from
+/// `ptr(carr(int))` we want the element `int`, not the array render `int[]`,
+/// so the caller can produce `int (*)[]`. The recursion budget passed in is
+/// the array node's own depth; the element renders at `depth + 1`.
+fn array_element_render<G: TypeGraph>(g: &G, tk: G::Tk, depth: u32) -> Option<String> {
+    if depth > TYPE_RENDER_MAX_DEPTH { return None; }
+    if g.node_kind(tk) != "tapp" { return None; }
+    let params = g.params(tk);
+    let head = *params.first()?;
+    if g.node_kind(head) != "tbuiltin" || !is_array_op(g.builtin_op(head)) {
+        return None;
+    }
+    let elem = *params.get(1)?;
+    render_type_rec(g, elem, depth + 1)
 }
 
 /// Render a builtin type-application head over its already-rendered args.
@@ -972,6 +1035,19 @@ fn typename_from_marked_source(code: &[u8]) -> Option<String> {
 fn short_name(fqn: &str) -> &str {
     let after_colon = fqn.rsplit("::").next().unwrap_or(fqn);
     after_colon.rsplit('.').next().unwrap_or(after_colon)
+}
+
+/// Strip a trailing array declarator from a parameter NAME. cxx_indexer's
+/// MarkedSource for an array parameter encodes the declarator on the name
+/// itself (`fill::xs[4]` → short name `xs[4]`), so the name would otherwise
+/// double the array-ness the rendered TYPE already carries (`int[] xs[4]`).
+/// The bare identifier is everything before the first `[`. A non-array name
+/// has no `[` and passes through unchanged.
+fn bare_param_name(name: &str) -> &str {
+    match name.find('[') {
+        Some(i) => name[..i].trim_end(),
+        None => name,
+    }
 }
 
 /// Render a FUNCTION's full signature WITH parameter names — the value
@@ -1032,7 +1108,7 @@ fn render_signature<'a>(
             .filter(|s| !s.is_empty());
         let pname = side.code.get(pkey.as_str())
             .and_then(|c| parse_marked_source_fqn(c))
-            .map(|fqn| short_name(&fqn).to_string())
+            .map(|fqn| bare_param_name(short_name(&fqn)).to_string())
             .filter(|s| !s.is_empty());
         if pname.is_some() { any_named = true; }
         let part = match (pty, pname) {
@@ -1479,6 +1555,112 @@ mod tests {
         assert_eq!(render_type(&g, "fn_tapp").as_deref(), Some("int(int, int)"));
     }
 
+    // ---- arrays (FIX 1) ----------------------------------------------------
+    //
+    // Node shapes captured verbatim from cxx_indexer / java_indexer on the
+    // probe files (see the report). C++ uses `carr` (constant-bound array),
+    // Java uses `array`. Both are a `tapp` whose head is a `tbuiltin` with op
+    // `carr`/`array` and whose param.1 is the element type. The bound is NOT
+    // in the node, so `int data[8]` is `int[]`, never `int[8]`.
+
+    #[test]
+    fn render_cxx_array_of_int() {
+        // `int data[8]` → tapp[carr#builtin, int] → "int[]" (no bound).
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("carr", "carr");
+        g.tapp("int[]", &["carr", "int"]);
+        assert_eq!(render_type(&g, "int[]").as_deref(), Some("int[]"));
+    }
+
+    #[test]
+    fn render_cxx_array_of_array() {
+        // `int grid[4][3]` → tapp[carr, tapp[carr, int]] → "int[][]".
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("carr", "carr");
+        g.tapp("int[]", &["carr", "int"]);
+        g.tapp("int[][]", &["carr", "int[]"]);
+        assert_eq!(render_type(&g, "int[][]").as_deref(), Some("int[][]"));
+    }
+
+    #[test]
+    fn render_cxx_array_of_pointer() {
+        // `int* ptrs[8]` (array of pointer) → tapp[carr, tapp[ptr, int]]
+        // → "int *[]". The element render (`int *`) simply gets `[]`.
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("carr", "carr");
+        g.builtin_leaf("ptr", "ptr");
+        g.tapp("int*", &["ptr", "int"]);
+        g.tapp("int*[]", &["carr", "int*"]);
+        assert_eq!(render_type(&g, "int*[]").as_deref(), Some("int *[]"));
+    }
+
+    #[test]
+    fn render_cxx_pointer_to_array_vs_array_of_pointer() {
+        // The gate: pointer-to-array (`int (*)[]`) must stay distinct from
+        // array-of-pointer (`int *[]`).
+        //   `int (*pa)[3]`  → tapp[ptr, tapp[carr, int]] → "int (*)[]"
+        //   `int* ptrs[8]`  → tapp[carr, tapp[ptr, int]] → "int *[]"
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("carr", "carr");
+        g.builtin_leaf("ptr", "ptr");
+        // pointer to array
+        g.tapp("int[]", &["carr", "int"]);
+        g.tapp("ptr_to_arr", &["ptr", "int[]"]);
+        // array of pointer
+        g.tapp("int*", &["ptr", "int"]);
+        g.tapp("arr_of_ptr", &["carr", "int*"]);
+
+        let pta = render_type(&g, "ptr_to_arr").unwrap();
+        let aop = render_type(&g, "arr_of_ptr").unwrap();
+        assert_eq!(pta, "int (*)[]");
+        assert_eq!(aop, "int *[]");
+        assert_ne!(pta, aop, "pointer-to-array must differ from array-of-pointer");
+    }
+
+    #[test]
+    fn render_cxx_lvalue_and_rvalue_ref_to_array() {
+        // `int (&)[]` and `int (&&)[]` — references to array take the same
+        // parenthesized declarator form as pointer-to-array.
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("carr", "carr");
+        g.builtin_leaf("lvr", "lvr");
+        g.builtin_leaf("rvr", "rvr");
+        g.tapp("int[]", &["carr", "int"]);
+        g.tapp("lvr_to_arr", &["lvr", "int[]"]);
+        g.tapp("rvr_to_arr", &["rvr", "int[]"]);
+        assert_eq!(render_type(&g, "lvr_to_arr").as_deref(), Some("int (&)[]"));
+        assert_eq!(render_type(&g, "rvr_to_arr").as_deref(), Some("int (&&)[]"));
+    }
+
+    #[test]
+    fn render_java_array_of_string() {
+        // `String[] names` → tapp[array#builtin, String] → element render
+        // is the FQN, so "java.lang.String[]".
+        let mut g = MapGraph::default();
+        g.leaf("String", "record", STRING_CODE);
+        g.builtin_leaf("array", "array");
+        g.tapp("String[]", &["array", "String"]);
+        assert_eq!(render_type(&g, "String[]").as_deref(),
+                   Some("java.lang.String[]"));
+    }
+
+    #[test]
+    fn render_java_array_of_array_int() {
+        // `int[][] grid` → tapp[array, tapp[array, int]] → "int[][]". Java
+        // arrays have no pointer cases, so `array(E)` is always `E[]`.
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("array", "array");
+        g.tapp("int[]", &["array", "int"]);
+        g.tapp("int[][]", &["array", "int[]"]);
+        assert_eq!(render_type(&g, "int[][]").as_deref(), Some("int[][]"));
+    }
+
     #[test]
     fn render_java_record_leaf_string() {
         // `var s = make()` → record leaf rendering to "java.lang.String"
@@ -1628,6 +1810,54 @@ mod tests {
         assert!(sig.contains(" n"), "param name n present: {sig}");
     }
 
+    // Real cxx_indexer bytes for `void fill(int xs[4])`:
+    //   * the function node's /kythe/code → FQN `fill`.
+    //   * param.0 `xs`'s /kythe/code → FQN `fill::xs[4]` (the `[4]`
+    //     declarator rides on the NAME — this is the doubling FIX 2 removes).
+    //   * `xs`'s /kythe/edge/typed → tapp[carr#builtin, int] → `int[]`.
+    const FILL_FN_CODE: &[u8] = &[
+        26, 8, 8, 1, 18, 4, 118, 111, 105, 100, 26, 3, 18, 1, 32, 26, 8, 8, 3,
+        18, 4, 102, 105, 108, 108, 26, 12, 8, 6, 18, 1, 40, 34, 2, 44, 32, 42,
+        1, 41, 42, 1, 32];
+    const FILL_XS_NAME: &[u8] = &[
+        26, 8, 8, 1, 18, 4, 105, 110, 116, 32, 26, 28, 26, 18, 8, 4, 26, 8, 8,
+        3, 18, 4, 102, 105, 108, 108, 34, 2, 58, 58, 80, 1, 26, 6, 8, 3, 18, 2,
+        120, 115, 26, 7, 8, 1, 18, 3, 91, 52, 93];
+
+    #[test]
+    fn render_signature_array_param_name_is_bare() {
+        // `void fill(int xs[4])` — FIX 1 renders the type `int[]`, FIX 2
+        // strips the `[4]` off the NAME so it reads `int[] xs`, not the
+        // doubled `int[] xs[4]` (nor the pre-fix `carr<int> xs[4]`).
+        let mut side = TypeSide::default();
+        side.functions.push("fill".into());
+        side.code.insert("fill".into(), FILL_FN_CODE.to_vec());
+        let mut fp = std::collections::BTreeMap::new();
+        fp.insert(0u32, "xs".to_string());
+        side.params.insert("fill".into(), fp);
+        // xs : carr(int) → int[]
+        side.code.insert("xs".into(), FILL_XS_NAME.to_vec());
+        side.edges.push(("xs".into(), "xs_arr".into()));
+        side.kind.insert("xs_arr".into(), "tapp".into());
+        side.builtin_op.insert("carr_op".into(), "carr".into());
+        side.kind.insert("carr_op".into(), "tbuiltin".into());
+        let mut ap = std::collections::BTreeMap::new();
+        ap.insert(0u32, "carr_op".to_string());
+        ap.insert(1u32, "int".to_string());
+        side.params.insert("xs_arr".into(), ap);
+        side.kind.insert("int".into(), "tbuiltin".into());
+        side.code.insert("int".into(), INT_CODE.to_vec());
+
+        let g = CuTypeGraph { side: &side };
+        let typed_of: HashMap<&str, &str> = side.edges.iter()
+            .map(|(s, t)| (s.as_str(), t.as_str())).collect();
+        let sig = render_signature(&g, "fill", &side, &typed_of).unwrap();
+        assert_eq!(sig, "fill(int[] xs)");
+        // The name must be the bare identifier — no `[4]` doubling.
+        assert!(!sig.contains("[4]"), "no array bound on the name: {sig}");
+        assert!(sig.contains("int[] xs"), "type carries the array, name is bare: {sig}");
+    }
+
     #[test]
     fn render_signature_honest_emptiness_no_params() {
         // A function with no param edges adds nothing over the type-only
@@ -1749,6 +1979,19 @@ mod tests {
                    "clearCallingIdentity");
         assert_eq!(short_name("plain"), "plain");
         assert_eq!(short_name("a.b::c"), "c");
+    }
+
+    #[test]
+    fn bare_param_name_strips_array_declarator() {
+        // cxx_indexer puts the array declarator on the param NAME's
+        // MarkedSource (`fill::xs[4]` → short name `xs[4]`); the bare
+        // identifier drops it so the name doesn't double the rendered type.
+        assert_eq!(bare_param_name("xs[4]"), "xs");
+        assert_eq!(bare_param_name("grid[4][3]"), "grid");
+        assert_eq!(bare_param_name("xs []"), "xs");
+        // A non-array name passes through unchanged.
+        assert_eq!(bare_param_name("w"), "w");
+        assert_eq!(bare_param_name("enabled"), "enabled");
     }
 
     #[test]

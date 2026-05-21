@@ -423,3 +423,30 @@ fn tilde_expansion_on_index_path() {
 }
 
 // Cleanup is best-effort via tmpdir naming; the test process owns the dir.
+
+#[test]
+fn inheritance_substr_roots_filter_to_types() {
+    // `--substr` resolves a substring to MANY syms; an inheritance/hierarchy
+    // query must root only on TYPES, not same-named functions or the
+    // type-application syms (`const(T)`, `T&`) a substring also matches.
+    let tid: String = format!("{:?}", std::thread::current().id())
+        .chars().filter(|c| c.is_ascii_digit()).collect();
+    let dir = std::env::temp_dir().join(format!("scry2-cli-inh-{}-{}", std::process::id(), tid));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s2db = dir.join("inh.s2db");
+    let mut b = IndexBuilder::new();
+    let base = sym_of("z.Shape");            // TYPE
+    let imp  = sym_of("z.ShapeImpl");        // TYPE, extends base
+    let func = sym_of("z.ShapeHelper.run");  // FUNCTION, also contains "Shape"
+    b.upsert_sym(base, kind::TYPE,     lang::JAVA, "z.Shape");
+    b.upsert_sym(imp,  kind::TYPE,     lang::JAVA, "z.ShapeImpl");
+    b.upsert_sym(func, kind::FUNCTION, lang::JAVA, "z.ShapeHelper.run");
+    b.add_inherit(imp, base);                // ShapeImpl extends Shape
+    b.finish(&s2db).unwrap();
+    let v = run(&s2db, &["inheritance", "Shape", "--substr", "--direction", "down"]);
+    let dump = v.to_string();
+    assert!(dump.contains("z.Shape"), "a type root should be present: {dump}");
+    assert!(!dump.contains("ShapeHelper"), "non-type leaked as a root: {dump}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

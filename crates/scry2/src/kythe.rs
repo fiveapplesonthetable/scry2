@@ -942,6 +942,12 @@ fn render_type_rec<G: TypeGraph>(g: &G, tk: G::Tk, depth: u32) -> Option<String>
     // carries the type name.
     if let Some(code) = g.node_code(tk) {
         if let Some(name) = typename_from_marked_source(code) {
+            // A type variable displays as its short name: java_indexer
+            // renders the qualified form (`T.compute.K`), cxx already emits
+            // the bare `T`. Short-name both so `K` reads like the source.
+            if kind == "tvar" {
+                return Some(short_name(&name).to_string());
+            }
             return Some(name);
         }
     }
@@ -1555,6 +1561,24 @@ mod tests {
         g.tapp("ptr_to_arr", &["ptr", "int[]"]);
         g.tapp("arr_of_ptr_to_arr", &["carr", "ptr_to_arr"]);
         assert_eq!(render_type(&g, "arr_of_ptr_to_arr").as_deref(), Some("int (*)[][]"));
+    }
+
+    // Real java_indexer MarkedSource for the `K` type variable of
+    // `<K> K pick(List<K>, int)`. It encodes the qualified form, so the
+    // tvar short-name rule must reduce it to `K` (matching how cxx emits `T`).
+    const JAVA_TVAR_K_CODE: &[u8] = &[
+        26,24,8,4,26,5,8,3,18,1,71,26,8,8,3,18,4,112,105,99,107,34,1,46,80,1,26,5,8,3,18,1,75,
+    ];
+
+    #[test]
+    fn render_java_type_variable_uses_short_name() {
+        // The fixture's MarkedSource parses to the qualified tvar name, and a
+        // tvar must display as its short name — proves the rule is load-bearing.
+        let qualified = typename_from_marked_source(JAVA_TVAR_K_CODE).unwrap();
+        assert_ne!(qualified, "K", "fixture must be the qualified tvar form, got {qualified:?}");
+        let mut g = MapGraph::default();
+        g.leaf("K", "tvar", JAVA_TVAR_K_CODE);
+        assert_eq!(render_type(&g, "K").as_deref(), Some("K"));
     }
 
     #[test]

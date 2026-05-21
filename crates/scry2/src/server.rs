@@ -366,8 +366,13 @@ fn do_members(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
 
 fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
           filt: PathFilter<'_>) -> Reply {
+    // super/sub relate TYPES; a substring also matches type-application
+    // syms (`const(T)`, `T&`) and same-named members. Keep only type-kind
+    // roots so the result isn't polluted by non-type matches.
     let syms: Vec<u64> = if substr {
-        ix.syms_matching_substring(name, limit)
+        ix.syms_matching_substring(name, limit).into_iter()
+            .filter(|&s| ix.sym_meta(s).is_some_and(|(_, k, _)| k == kind::TYPE))
+            .collect()
     } else {
         ix.sym_for_name(name).into_iter().collect()
     };
@@ -499,7 +504,12 @@ fn do_inheritance(
     filt: PathFilter<'_>,
 ) -> Reply {
     let roots: Vec<u64> = if substr {
-        ix.syms_matching_substring(name, root_limit)
+        // A hierarchy roots on TYPES. A substring also matches the
+        // type-application syms (`const(T)`, `T&`, `T&&`) and same-named
+        // members/ctors/dtors; keep only type-kind syms as roots.
+        ix.syms_matching_substring(name, root_limit).into_iter()
+            .filter(|&s| ix.sym_meta(s).is_some_and(|(_, k, _)| k == kind::TYPE))
+            .collect()
     } else {
         ix.sym_for_name(name).into_iter().collect()
     };

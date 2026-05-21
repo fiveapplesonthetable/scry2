@@ -23,7 +23,7 @@
 
 use crate::format::role;
 use crate::reader::Index;
-use crate::reply::{CallNode, InhHit, Reply, SymbolGroup, XrefHit,
+use crate::reply::{CallNode, InhHit, Reply, SymbolGroup, TypeHit, XrefHit,
                    kind_str, lang_str, role_str};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,8 @@ pub enum Request {
     Def { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
           #[serde(default, rename = "in")]  in_:    Option<String>,
           #[serde(default)] not_in: Option<String> },
+    Type { name: String, #[serde(default)] substr: bool,
+           #[serde(default = "lim16")] limit: usize },
     Ref { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
           #[serde(default = "lim_max_hits")] max_hits: usize,
           #[serde(default, rename = "in")] in_: Option<String>,
@@ -143,7 +145,9 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
         Request::Def { name, substr, limit, in_, not_in } => do_xrefs(
             ix, name, *substr, *limit, (role::DECL, role::DEF), usize::MAX,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: None },
+            /*with_type=*/true,
         ),
+        Request::Type { name, substr, limit } => do_type(ix, name, *substr, *limit),
         // ref/callers with --substr must aggregate edges across *all*
         // name matches, not just the first `--limit` symbols: capping the
         // symbol set at 16 made `callers clearCallingIdentity --substr`
@@ -153,10 +157,12 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
         Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
             ix, name, *substr, (*limit).max(SUBSTR_AGG_CAP), (0, u8::MAX), *max_hits,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
+            /*with_type=*/false,
         ),
         Request::Callers { name, substr, limit, max_hits, in_, not_in, def_in } => do_xrefs(
             ix, name, *substr, (*limit).max(SUBSTR_AGG_CAP), (role::CALL, role::CALL), *max_hits,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
+            /*with_type=*/false,
         ),
         Request::Super { name, substr, limit, in_, not_in } => do_inh(
             ix, name, *substr, *limit, /*sub=*/false,
@@ -180,10 +186,12 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
 /// reaches the definition that actually carries the edges.
 const SUBSTR_AGG_CAP: usize = 4096;
 
+#[allow(clippy::too_many_arguments)]
 fn do_xrefs(
     ix: &Index, name: &str, substr: bool, sym_cap: usize,
     roles: (u8, u8), max_hits: usize,
     filt: PathFilter<'_>,
+    with_type: bool,
 ) -> Reply {
     let (role_lo, role_hi) = roles;
     let syms: Vec<u64> = if substr {
@@ -203,6 +211,9 @@ fn do_xrefs(
             }
         }
         let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", 0, 0));
+        let typed = if with_type {
+            ix.type_of(*sym).map(str::to_string)
+        } else { None };
         let mut rows: Vec<XrefHit> = Vec::new();
         for (_, r, file, off) in ix.xrefs(*sym, role_lo, role_hi) {
             let path = ix.file_path(file).unwrap_or("?");
@@ -215,6 +226,7 @@ fn do_xrefs(
                     name: sname.to_string(),
                     kind: kind_str(knd).to_string(),
                     lang: lang_str(lng).to_string(),
+                    typed,
                     rows,
                 });
                 break 'outer;
@@ -225,11 +237,37 @@ fn do_xrefs(
                 name: sname.to_string(),
                 kind: kind_str(knd).to_string(),
                 lang: lang_str(lng).to_string(),
+                typed,
                 rows,
             });
         }
     }
     Reply::Xrefs { groups, total, truncated }
+}
+
+/// `type NAME` — the resolved type of a symbol. Resolves NAME → sym via
+/// the same exact / `--substr` path the other verbs use, then reads the
+/// `typed` section. Symbols with no resolved type are dropped (honest
+/// emptiness), so the result holds only the syms that actually carry one.
+fn do_type(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
+    let syms: Vec<u64> = if substr {
+        ix.syms_matching_substring(name, limit.max(SUBSTR_AGG_CAP))
+    } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
+    let mut hits: Vec<TypeHit> = Vec::new();
+    for sym in &syms {
+        let Some(ty) = ix.type_of(*sym) else { continue };
+        let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", 0, 0));
+        hits.push(TypeHit {
+            name: sname.to_string(),
+            kind: kind_str(knd).to_string(),
+            lang: lang_str(lng).to_string(),
+            typed: ty.to_string(),
+        });
+        if hits.len() >= limit { break; }
+    }
+    let truncated = hits.len() >= limit;
+    let total = hits.len();
+    Reply::Type { hits, total, truncated }
 }
 
 fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,

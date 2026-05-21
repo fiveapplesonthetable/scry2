@@ -23,6 +23,11 @@ pub struct IndexBuilder {
     /// reference inside the caller's body — the LLM can ask
     /// "what does X touch" not just "what does X call".
     calls:    Vec<(u64, u64, u8)>,
+    /// Resolved type of a sym, pre-rendered to a string at ingest
+    /// (`/kythe/edge/typed` → rendered type node). `(sym, type_string)`.
+    /// Sorted+deduped at write time and emitted as the `typed` section;
+    /// on a tied sym a non-empty string wins over an empty one.
+    typed:    Vec<(u64, String)>,
 }
 
 impl IndexBuilder {
@@ -76,12 +81,23 @@ impl IndexBuilder {
         self.calls.push((caller, callee, role));
     }
 
+    /// Record `sym`'s resolved type, already rendered to a display
+    /// string (e.g. "const Box<int> &", "java.lang.String"). Empty
+    /// strings are dropped — "honest emptiness": a sym with no
+    /// renderable type stores nothing and `type_of` returns None rather
+    /// than a guess.
+    pub fn add_type(&mut self, sym: u64, type_str: &str) {
+        if type_str.is_empty() { return; }
+        self.typed.push((sym, type_str.to_string()));
+    }
+
     pub fn n_xrefs(&self) -> usize { self.xrefs.len() }
     pub fn n_syms(&self)  -> usize { self.syms.len() }
     pub fn n_files(&self) -> usize { self.files.len() }
     pub fn n_inh(&self)   -> usize { self.inherits.len() }
     pub fn n_aliases(&self) -> usize { self.aliases.len() }
     pub fn n_calls(&self) -> usize { self.calls.len() }
+    pub fn n_typed(&self) -> usize { self.typed.len() }
 
     /// Move every row from `other` into `self`, leaving `other`
     /// empty. The mirror of [`populate_from_index`] but in-memory
@@ -125,6 +141,7 @@ impl IndexBuilder {
         self.inherits.append(&mut other.inherits);
         self.aliases.append(&mut other.aliases);
         self.calls.append(&mut other.calls);
+        self.typed.append(&mut other.typed);
     }
 
     /// Collapse exact-duplicate rows in the append-only tables
@@ -152,7 +169,10 @@ impl IndexBuilder {
         self.calls.dedup();
         self.aliases.sort_unstable();
         self.aliases.dedup();
-        self.xrefs.len() + self.inherits.len() + self.calls.len() + self.aliases.len()
+        self.typed.sort_unstable();
+        self.typed.dedup();
+        self.xrefs.len() + self.inherits.len() + self.calls.len()
+            + self.aliases.len() + self.typed.len()
     }
 
     /// Snapshot the current accumulated state to `path` without
@@ -194,6 +214,9 @@ impl IndexBuilder {
         for (sym, alias) in ix.iter_aliases() {
             self.add_alias(sym, alias);
         }
+        for (sym, ty) in ix.iter_typed() {
+            self.add_type(sym, ty);
+        }
         Ok(())
     }
 
@@ -228,6 +251,16 @@ impl IndexBuilder {
         self.calls.dedup();
         self.aliases.sort_unstable();
         self.aliases.dedup();
+        // Collapse the delta's typed table to one row per sym (sorted by
+        // sym), the shape `merge_typed_by_sym` expects. After sort the
+        // first row per sym is the smallest non-empty string (`add_type`
+        // drops empties) — same per-sym choice `finish` makes.
+        self.typed.sort_unstable();
+        self.typed.dedup();
+        self.typed.dedup_by_key(|(s, _)| *s);
+        let mut delta_typed: Vec<(u64, &str)> =
+            self.typed.iter().map(|(s, t)| (*s, t.as_str())).collect();
+        delta_typed.sort_unstable_by_key(|r| r.0);
         let mut delta_syms: Vec<(u64, u8, u8, String)> = self.syms.drain()
             .map(|(s, (k, l, n))| (s, k, l, n)).collect();
         delta_syms.sort_unstable_by_key(|r| r.0);
@@ -422,8 +455,33 @@ impl IndexBuilder {
         }
         drop(calls_rev);
 
+        // ---- 11b. typed (write + count; strings appended to blob) ----
+        // Fold every source's sym-sorted typed table plus the delta into
+        // one row per sym (non-empty wins on a tie), exactly like every
+        // other section. Strings append to the same blob as names/paths.
+        let typed_off = pad_up(crev_off + n_calls * CALL_LEN as u64);
+        seek_to(&mut w, typed_off)?;
+        let mut n_typed: u64 = 0;
+        {
+            let pri = fold_sources(sources,
+                |s| Box::new(s.iter_typed()),
+                |a, b| Box::new(merge_typed_by_sym(a, b)));
+            let del = delta_typed.iter().copied();
+            for (sym, ty) in merge_typed_by_sym(pri, del) {
+                if ty.is_empty() { continue; }
+                let ty = clamp_blob_str(ty);
+                let off = blob.len() as u64;
+                let len = ty.len() as u16;
+                blob.extend_from_slice(ty.as_bytes());
+                w.write_all(&sym.to_be_bytes())?;
+                w.write_all(&off.to_be_bytes())?;
+                w.write_all(&len.to_be_bytes())?;
+                n_typed += 1;
+            }
+        }
+
         // ---- 12. blob ----
-        let blob_off = pad_up(crev_off + n_calls * CALL_LEN as u64);
+        let blob_off = pad_up(typed_off + n_typed * TYPE_LEN as u64);
         seek_to(&mut w, blob_off)?;
         w.write_all(&blob)?;
         let blob_len = blob.len() as u64;
@@ -439,6 +497,7 @@ impl IndexBuilder {
             inh_off,   inh_n:   n_inh,
             calls_off, calls_n: n_calls,
             crev_off,  crev_n:  n_calls,
+            typed_off, typed_n: n_typed,
             blob_off,  blob_len,
             ..Default::default()
         };
@@ -563,6 +622,27 @@ impl IndexBuilder {
         calls_rev.sort_unstable();
         let n_crev = calls_rev.len() as u64;
 
+        // ---- 4c. typed (sym → resolved type string) ----
+        // Sort by (sym, string) then collapse to ONE row per sym. After
+        // the sort the first row for each sym is the lexicographically
+        // smallest non-empty string (`add_type` already drops empties),
+        // a deterministic choice when two CUs rendered the same sym's
+        // type slightly differently. Strings append to the blob; the
+        // TypeRow table stays sorted by sym so `type_of` is a binary
+        // search.
+        self.typed.sort_unstable();
+        self.typed.dedup();
+        let mut typed_pos: Vec<(u64, u64, u16)> = Vec::with_capacity(self.typed.len());
+        let mut last_typed_sym: Option<u64> = None;
+        for (sym, ty) in &self.typed {
+            if last_typed_sym == Some(*sym) { continue; }   // one row per sym
+            last_typed_sym = Some(*sym);
+            let ty = clamp_blob_str(ty);
+            typed_pos.push((*sym, blob.len() as u64, ty.len() as u16));
+            blob.extend_from_slice(ty.as_bytes());
+        }
+        let n_typed = typed_pos.len() as u64;
+
         // ---- 5. Compute section offsets ----
         let xrefs_off = pad_up(size_of_header() as u64);
         let syms_off  = pad_up(xrefs_off + n_xrefs * XREF_LEN as u64);
@@ -571,7 +651,8 @@ impl IndexBuilder {
         let inh_off   = pad_up(files_off + n_files * FILE_LEN as u64);
         let calls_off = pad_up(inh_off   + n_inh   * INH_LEN  as u64);
         let crev_off  = pad_up(calls_off + n_calls * CALL_LEN as u64);
-        let blob_off  = pad_up(crev_off  + n_crev  * CALL_LEN as u64);
+        let typed_off = pad_up(crev_off  + n_crev  * CALL_LEN as u64);
+        let blob_off  = pad_up(typed_off + n_typed * TYPE_LEN as u64);
 
         // ---- 6. Write to a tempfile, then atomic rename ----
         // pid-suffixed so concurrent writers never collide on the tmp.
@@ -589,6 +670,7 @@ impl IndexBuilder {
             inh_off,   inh_n:   n_inh,
             calls_off, calls_n: n_calls,
             crev_off,  crev_n:  n_crev,
+            typed_off, typed_n: n_typed,
             blob_off,  blob_len: blob.len() as u64,
             ..Default::default()
         };
@@ -647,6 +729,13 @@ impl IndexBuilder {
             w.write_all(&callee.to_be_bytes())?;
             w.write_all(&caller.to_be_bytes())?;
             w.write_all(&[*role])?;
+        }
+
+        seek_to(&mut w, typed_off)?;
+        for (sym, off, len) in &typed_pos {
+            w.write_all(&sym.to_be_bytes())?;
+            w.write_all(&off.to_be_bytes())?;
+            w.write_all(&len.to_be_bytes())?;
         }
 
         seek_to(&mut w, blob_off)?;
@@ -896,6 +985,64 @@ where
         }
     }
     Iter { a: a.peekable(), b: b.peekable(), last: None }
+}
+
+/// Merge two `(sym, type_string)` streams, each sorted by sym with one
+/// row per sym, into one row per sym. On a tied sym the non-empty string
+/// wins; if both are non-empty (two CUs rendered the same sym's type
+/// differently) the lexicographically smaller wins — a deterministic
+/// tie-break matching `finish`, which dedups its sorted typed Vec and
+/// keeps the first (smallest) string per sym. Mirrors the sym-keyed fold
+/// every other section uses so the k-way merge equals a single `finish`.
+fn merge_typed_by_sym<'a, A, B>(a: A, b: B) -> impl Iterator<Item = (u64, &'a str)>
+where
+    A: Iterator<Item = (u64, &'a str)>,
+    B: Iterator<Item = (u64, &'a str)>,
+{
+    use std::iter::Peekable;
+    struct Iter<'a, A, B>
+    where
+        A: Iterator<Item = (u64, &'a str)>,
+        B: Iterator<Item = (u64, &'a str)>,
+    {
+        a: Peekable<A>,
+        b: Peekable<B>,
+    }
+    fn pick<'a>(x: (u64, &'a str), y: (u64, &'a str)) -> (u64, &'a str) {
+        // Same sym; choose the better string. Empty loses; otherwise the
+        // lexically smaller wins (deterministic, finish-compatible).
+        match (x.1.is_empty(), y.1.is_empty()) {
+            (false, true) => x,
+            (true, false) => y,
+            _ => if x.1 <= y.1 { x } else { y },
+        }
+    }
+    impl<'a, A, B> Iterator for Iter<'a, A, B>
+    where
+        A: Iterator<Item = (u64, &'a str)>,
+        B: Iterator<Item = (u64, &'a str)>,
+    {
+        type Item = (u64, &'a str);
+        fn next(&mut self) -> Option<Self::Item> {
+            match (self.a.peek(), self.b.peek()) {
+                (Some(&(ka, _)), Some(&(kb, _))) => {
+                    match ka.cmp(&kb) {
+                        std::cmp::Ordering::Less    => self.a.next(),
+                        std::cmp::Ordering::Greater => self.b.next(),
+                        std::cmp::Ordering::Equal   => {
+                            let x = self.a.next().unwrap();
+                            let y = self.b.next().unwrap();
+                            Some(pick(x, y))
+                        }
+                    }
+                }
+                (Some(_), None) => self.a.next(),
+                (None, Some(_)) => self.b.next(),
+                (None, None)    => None,
+            }
+        }
+    }
+    Iter { a: a.peekable(), b: b.peekable() }
 }
 
 fn size_of_header() -> usize { std::mem::size_of::<Header>() }

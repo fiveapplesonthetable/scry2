@@ -110,6 +110,21 @@ enum Cmd {
         #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
     },
 
+    /// `type NAME` — print a symbol's compiler-resolved type. Resolves
+    /// the type the indexer recorded over `/kythe/edge/typed` and rendered
+    /// at ingest (`auto`/`var` declarations show their deduced type;
+    /// fields and parameters show their declared type). Symbols with no
+    /// recorded type print nothing.
+    Type {
+        name: String,
+        /// Match NAME as a substring of the qualified name (parallel scan)
+        /// instead of an exact-FQN binary search; reports the type of each
+        /// matching symbol that has one.
+        #[arg(long)] substr: bool,
+        /// With --substr, cap how many matching symbols to report.
+        #[arg(long, default_value = "16")] limit: usize,
+    },
+
     /// `ref NAME` — print every reference of a symbol.
     Ref {
         name: String,
@@ -358,6 +373,8 @@ fn main() -> Result<()> {
         Cmd::Stat => Request::Stat,
         Cmd::Def { name, substr, limit, in_, not_in }
             => Request::Def { name, substr, limit, in_, not_in },
+        Cmd::Type { name, substr, limit }
+            => Request::Type { name, substr, limit },
         Cmd::Ref { name, substr, limit, max_hits, in_, not_in, def_in }
             => Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in },
         Cmd::Callers { name, substr, limit, max_hits, in_, not_in, def_in }
@@ -446,10 +463,10 @@ fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
             kythe::ingest(f, &mut builder, &file_ids)?
         };
         eprintln!(
-            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} completes={}",
+            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} types={} completes={}",
             stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
             stats.inherits_emitted, stats.aliases_emitted, stats.calls_emitted,
-            stats.completes_bridges,
+            stats.types_emitted, stats.completes_bridges,
         );
         eprintln!(
             "[index]   {label}: diag bodies={} pending={} unresolved={}",
@@ -631,6 +648,7 @@ struct LangStats {
     inherits:  u64,
     aliases:   u64,
     calls:     u64,
+    types:     u64,
     succeeded: usize,
     empty:     usize,
     failed:    usize,
@@ -1259,6 +1277,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                         stats.inherits += cu.inherits_emitted;
                         stats.aliases  += cu.aliases_emitted;
                         stats.calls    += cu.calls_emitted;
+                        stats.types    += cu.types_emitted;
                     }
                     let failed = ingest_res.is_err() || wait_res.is_err() || !exit_ok;
                     if failed {
@@ -1533,9 +1552,9 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     // Report per-language summary + first failure tails.
     for (label, s) in &by_lang {
         eprintln!(
-            "[from-kzip] {label}: CUs={} (ok={} empty={} failed={}) entries={} anchors={} xrefs={} inh={} alias={} calls={}",
+            "[from-kzip] {label}: CUs={} (ok={} empty={} failed={}) entries={} anchors={} xrefs={} inh={} alias={} calls={} types={}",
             s.cus, s.succeeded, s.empty, s.failed,
-            s.entries, s.anchors, s.xrefs, s.inherits, s.aliases, s.calls,
+            s.entries, s.anchors, s.xrefs, s.inherits, s.aliases, s.calls, s.types,
         );
         for (i, tail) in s.fail_tails.iter().enumerate() {
             eprintln!("[from-kzip] {label} failure {}/{}:", i + 1, s.fail_tails.len());

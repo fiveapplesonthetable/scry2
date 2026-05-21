@@ -72,6 +72,7 @@ impl Index {
     pub fn n_inh(&self)   -> u64 { self.hdr.inh_n }
     pub fn n_calls(&self) -> u64 { self.hdr.calls_n }
     pub fn n_names(&self) -> u64 { self.hdr.names_n }
+    pub fn n_typed(&self) -> u64 { self.hdr.typed_n }
 
     // -- raw section slices --------------------------------------------------
 
@@ -108,6 +109,11 @@ impl Index {
     fn crev_slice(&self) -> &[u8] {
         let off = self.hdr.crev_off as usize;
         let len = self.hdr.crev_n as usize * CALL_LEN;
+        &self.map[off..off + len]
+    }
+    fn typed_slice(&self) -> &[u8] {
+        let off = self.hdr.typed_off as usize;
+        let len = self.hdr.typed_n as usize * TYPE_LEN;
         &self.map[off..off + len]
     }
     fn blob(&self) -> &[u8] {
@@ -262,6 +268,34 @@ impl Index {
                     let name_off = u64::from_be_bytes(syms[row_off + 10..row_off + 18].try_into().unwrap());
                     let name_len = u16::from_be_bytes(syms[row_off + 18..row_off + 20].try_into().unwrap());
                     return Some((self.blob_str(name_off, name_len), kind, lang));
+                }
+            }
+        }
+        None
+    }
+
+    // -- sym → resolved type -------------------------------------------------
+
+    /// The resolved type of `sym`, rendered to a string at ingest
+    /// (`/kythe/edge/typed` → rendered type node). O(log n) binary search
+    /// over the sym-sorted `typed` section. Returns None when the sym has
+    /// no typed edge or its type couldn't be rendered — never a guess.
+    pub fn type_of(&self, sym: u64) -> Option<&str> {
+        let typed = self.typed_slice();
+        let n = self.hdr.typed_n as usize;
+        let sym_be = sym.to_be_bytes();
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let row_off = mid * TYPE_LEN;
+            let row_sym: [u8; 8] = typed[row_off..row_off + 8].try_into().unwrap();
+            match row_sym.cmp(&sym_be) {
+                std::cmp::Ordering::Less    => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal   => {
+                    let str_off = u64::from_be_bytes(typed[row_off + 8..row_off + 16].try_into().unwrap());
+                    let str_len = u16::from_be_bytes(typed[row_off + 16..row_off + 18].try_into().unwrap());
+                    return Some(self.blob_str(str_off, str_len));
                 }
             }
         }
@@ -520,6 +554,23 @@ impl Index {
             if canon.get(&sym) == Some(&(no, nl)) { return None; }
             let s = std::str::from_utf8(&blob[no as usize..no as usize + nl as usize]).ok()?;
             Some((sym, s))
+        })
+    }
+
+    /// Every `(sym, type_string)` row in the `typed` section, in sym
+    /// order. Used by snapshot/resume to round-trip resolved types and
+    /// by the k-way merge to fold typed tables across shards.
+    pub fn iter_typed(&self) -> impl Iterator<Item = (u64, &str)> + '_ {
+        let n = self.hdr.typed_n as usize;
+        let typed = self.typed_slice();
+        let blob = self.blob();
+        (0..n).map(move |i| {
+            let off = i * TYPE_LEN;
+            let sym = u64::from_be_bytes(typed[off..off + 8].try_into().unwrap());
+            let so  = u64::from_be_bytes(typed[off + 8..off + 16].try_into().unwrap()) as usize;
+            let sl  = u16::from_be_bytes(typed[off + 16..off + 18].try_into().unwrap()) as usize;
+            let s = std::str::from_utf8(&blob[so..so + sl]).unwrap_or("");
+            (sym, s)
         })
     }
 

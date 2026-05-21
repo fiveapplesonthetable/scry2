@@ -218,6 +218,21 @@ pub fn ingest_tolerant<R: Read>(
     // affordance; we defer it to a follow-up. The bridge count is
     // surfaced via stats so callers can log it.
     stats.completes_bridges = state.completes_bridges.len();
+
+    // -- Resolved-type emission: render each typed edge's type node.
+    //
+    // The whole CU's type-node graph is now buffered, so a `tapp` and its
+    // param/leaf nodes are all present regardless of stream order. Render
+    // once per typed edge; store only what renders ("honest emptiness").
+    {
+        let g = CuTypeGraph { side: &state.types };
+        for (src_key, type_key) in &state.types.edges {
+            if let Some(rendered) = render_type(&g, type_key.as_str()) {
+                builder.add_type(sym_of(src_key), &rendered);
+                stats.types_emitted += 1;
+            }
+        }
+    }
     Ok(stats)
 }
 
@@ -229,6 +244,7 @@ pub struct IngestStats {
     pub inherits_emitted:  u64,
     pub aliases_emitted:   u64,
     pub calls_emitted:     u64,
+    pub types_emitted:     u64,
     pub completes_bridges: usize,
     // Diagnostic: side-table sizes at resolution time. Useful for
     // spotting "0 calls emitted" failures — typically a sign that an
@@ -316,6 +332,33 @@ struct IngestState {
     /// `(file_id, start, target_sym, role)` — call/ref sites waiting
     /// to be resolved against body_anchors after the stream ends.
     call_sites: Vec<(u32, u32, u64, u8)>,
+    /// Resolved-type side-table, drained at CU finalize.
+    ///
+    /// `/kythe/edge/typed` connects a sym node to a *type node*, which is
+    /// often a `tapp` composite whose structure is in `param.N` edges and
+    /// whose leaves carry `/kythe/code` MarkedSource. None of that is
+    /// stream-ordered, so we buffer the whole type-node graph for the CU
+    /// and render once at the end against [`render_type`].
+    types: TypeSide,
+}
+
+/// Per-CU buffer of everything the type renderer needs. Keyed by the
+/// node's VName symbol string (the same key `to_symbol_string` produces).
+#[derive(Default)]
+struct TypeSide {
+    /// `/kythe/edge/typed`: sym-node key → type-node key.
+    edges: Vec<(String, String)>,
+    /// `/kythe/node/kind` of a type node ("tapp", "record", "tbuiltin", …).
+    kind: HashMap<String, String>,
+    /// `/kythe/code` MarkedSource bytes of a type node.
+    code: HashMap<String, Vec<u8>>,
+    /// `param.N` targets of a `tapp`, by ordinal. A BTree keeps them in
+    /// ascending N so the head (param.0) and args (param.1..) come out
+    /// ordered without a post-sort.
+    params: HashMap<String, std::collections::BTreeMap<u32, String>>,
+    /// The builtin operator (`ptr`, `const`, `fn`, `int`, …) of a
+    /// `tbuiltin` node — the part of its signature before `#builtin`.
+    builtin_op: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -346,6 +389,7 @@ fn process_entry(
     let completes_bridges = &mut state.completes_bridges;
     let body_anchors      = &mut state.body_anchors;
     let call_sites        = &mut state.call_sites;
+    let types             = &mut state.types;
     if e.source.is_empty() { return; }
     let source_key = e.source.to_symbol_string();
 
@@ -381,6 +425,22 @@ fn process_entry(
             let parent = sym_of(&e.target.to_symbol_string());
             builder.add_inherit(child, parent);
             stats.inherits_emitted += 1;
+            return;
+        }
+        // `/kythe/edge/typed` — sym node → type node. Buffer the edge;
+        // the type node's facts/params may not have arrived yet, so we
+        // render at CU finalize over the whole accumulated graph.
+        if e.edge_kind == "/kythe/edge/typed" && !e.target.is_empty() {
+            types.edges.push((source_key, e.target.to_symbol_string()));
+            return;
+        }
+        // `/kythe/edge/param.N` — a `tapp`'s head (N=0) and args (N>=1).
+        if let Some(ord) = parse_param_ordinal(&e.edge_kind) {
+            if !e.target.is_empty() {
+                types.params.entry(source_key)
+                    .or_default()
+                    .insert(ord, e.target.to_symbol_string());
+            }
             return;
         }
         // /kythe/edge/childof in cxx_indexer connects sym scopes
@@ -433,6 +493,14 @@ fn process_entry(
                 builder.add_alias(sym, &fqn);
                 stats.aliases_emitted += 1;
             }
+            // A type node's MarkedSource is the source of its rendered
+            // name (`Widget`, `int`, `java.lang.String`). Buffer it for the
+            // finalize-time type render. kind/code can arrive in either
+            // order, so we keep the bytes for every node and let the
+            // renderer read only the ones a typed edge actually reaches —
+            // unreferenced entries are dropped when the CU's side-table is.
+            types.code.entry(source_key.clone())
+                .or_insert_with(|| e.fact_value.clone());
         }
         "/kythe/node/kind" => {
             let value = std::str::from_utf8(&e.fact_value).unwrap_or("");
@@ -448,6 +516,18 @@ fn process_entry(
                 let k = node_kind_byte(value);
                 let l = e.source.lang_byte();
                 builder.upsert_sym(sym_of(&source_key), k, l, &source_key);
+            }
+            // Record the raw Kythe kind for the type renderer (it branches
+            // on "tapp"/"tbuiltin"/"record"/… text, not our compact byte).
+            // A builtin node also exposes its operator via its signature
+            // (`ptr#builtin`, `const#builtin`, `int#builtin`).
+            if is_type_node_kind(value) {
+                types.kind.insert(source_key.clone(), value.to_string());
+                if value == "tbuiltin" {
+                    if let Some(op) = builtin_op_of(&e.source.signature) {
+                        types.builtin_op.insert(source_key.clone(), op.to_string());
+                    }
+                }
             }
         }
         "/kythe/loc/start" => {
@@ -692,6 +772,145 @@ const _MS_KINDS_DOC: (u32, u32, u32) = (MS_TYPE, MS_IDENTIFIER, MS_CONTEXT);
 // are used directly by the rendering heuristic.
 #[allow(dead_code)] const _MS_TYPE_USED_FOR_DOC: u32 = MS_TYPE;
 
+// ============================================================
+// Resolved-type renderer (backs the `typed` section)
+// ============================================================
+//
+// A symbol's resolved type comes in over `/kythe/edge/typed`, pointing
+// at a *type node*. Two shapes occur:
+//
+//   1. A named leaf — `record` / `interface` / `tbuiltin` / `tvar`
+//      carrying a `/kythe/code` MarkedSource. We render that proto to a
+//      clean type name (`Widget`, `int`, `java.lang.String`).
+//
+//   2. A `tapp` (type application) — a composite with no useful
+//      MarkedSource for our purposes (C++ `Box<int>`, `const Box<int>&`,
+//      `int*`, function types). Its structure is in `/kythe/edge/param.N`:
+//      `param.0` is the *head*, `param.1..` the arguments. We render it
+//      recursively. A builtin head (signature `ptr#builtin`, `const#builtin`,
+//      `fn#builtin`, …) maps to C++ syntax; a record/interface head renders
+//      as `Head<arg, …>`. Java `tapp` nodes (`List<String>`) ALSO carry a
+//      MarkedSource but it uses parameter-lookup tokens that only make
+//      sense with the param edges in hand, so we render those recursively
+//      too — the param structure is the single source of truth.
+//
+// The renderer is generic over a [`TypeGraph`] so the ingest path drives
+// it over the per-CU side-table while tests drive it over a hand-built
+// graph mirroring the exact node shapes the indexers emit.
+
+/// Read-only view of the type-node graph for one CU. A `Tk` is whatever
+/// opaque ticket the caller keys nodes by (in ingest, the node's VName
+/// symbol string; in tests, a small integer or `&str`).
+pub trait TypeGraph {
+    type Tk: Copy + Eq;
+    /// Kythe `/kythe/node/kind` of `tk` ("record", "tapp", "tbuiltin", …),
+    /// or "" if unknown.
+    fn node_kind(&self, tk: Self::Tk) -> &str;
+    /// Raw `/kythe/code` MarkedSource bytes for `tk`, if it has one.
+    fn node_code(&self, tk: Self::Tk) -> Option<&[u8]>;
+    /// The node's `param.N` targets in ascending N order (head first),
+    /// or empty if it has none. Returned owned so the renderer can
+    /// recurse without aliasing the graph's internal storage.
+    fn params(&self, tk: Self::Tk) -> Vec<Self::Tk>;
+    /// The builtin "operator" name for a `tbuiltin` head: the part of the
+    /// node's signature before `#builtin` (`ptr`, `const`, `fn`, `int`,
+    /// …). Returns "" for non-builtin nodes.
+    fn builtin_op(&self, tk: Self::Tk) -> &str;
+}
+
+/// Render the type node `tk` to a display string, or None if it carries
+/// neither a MarkedSource name nor a renderable `tapp` structure (honest
+/// emptiness — a wrong type is worse than absent).
+pub fn render_type<G: TypeGraph>(g: &G, tk: G::Tk) -> Option<String> {
+    render_type_rec(g, tk, 0)
+}
+
+/// Recursion depth cap. Real C++ composites nest a handful deep
+/// (`const Box<int>&` is 3); a cycle in a corrupt graph would otherwise
+/// spin. 64 is far past any real type and bounds the stack.
+const TYPE_RENDER_MAX_DEPTH: u32 = 64;
+
+fn render_type_rec<G: TypeGraph>(g: &G, tk: G::Tk, depth: u32) -> Option<String> {
+    if depth > TYPE_RENDER_MAX_DEPTH { return None; }
+    let kind = g.node_kind(tk);
+    if kind == "tapp" {
+        // Composite: head = param.0, args = param.1.. . Recurse.
+        let params = g.params(tk);
+        if params.is_empty() {
+            // No structure to recurse into — fall back to MarkedSource if
+            // present (some Java tapps), else give up.
+            return g.node_code(tk).and_then(typename_from_marked_source);
+        }
+        let head = params[0];
+        let args: Vec<String> = params[1..].iter()
+            .map(|&a| render_type_rec(g, a, depth + 1)
+                .unwrap_or_else(|| "?".to_string()))
+            .collect();
+        if g.node_kind(head) == "tbuiltin" {
+            return Some(render_builtin_app(g.builtin_op(head), &args));
+        }
+        // Non-builtin head (record/interface like `Box`, `List`) →
+        // `Head<arg, …>`. Render the head as a leaf name.
+        let head_name = render_type_rec(g, head, depth + 1)?;
+        if args.is_empty() {
+            return Some(head_name);
+        }
+        return Some(format!("{head_name}<{}>", args.join(", ")));
+    }
+    // Named leaf (record / interface / tbuiltin / tvar): its MarkedSource
+    // carries the type name.
+    if let Some(code) = g.node_code(tk) {
+        if let Some(name) = typename_from_marked_source(code) {
+            return Some(name);
+        }
+    }
+    // A bare builtin leaf with no code but a known operator (e.g.
+    // `int#builtin` reached as an arg) renders to the operator name.
+    let op = g.builtin_op(tk);
+    if !op.is_empty() { return Some(op.to_string()); }
+    None
+}
+
+/// Render a builtin type-application head over its already-rendered args.
+/// `op` is the builtin operator name (`ptr`, `lvr`, `const`, `fn`, …).
+/// Unknown operators fall back to `op<args>` so a new builtin still
+/// produces a legible (if generic) rendering rather than nothing.
+fn render_builtin_app(op: &str, args: &[String]) -> String {
+    let a0 = || args.first().map(String::as_str).unwrap_or("?");
+    match op {
+        "ptr"      => format!("{} *", a0()),
+        "lvr"      => format!("{} &", a0()),
+        "rvr"      => format!("{} &&", a0()),
+        "const"    => format!("const {}", a0()),
+        "volatile" => format!("volatile {}", a0()),
+        // Function type: arg0 is the return type, the rest are parameters.
+        "fn" => {
+            let ret = a0();
+            let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
+            format!("{ret}({})", rest.join(", "))
+        }
+        // A builtin with no args is a scalar (`int`, `void`, `char`).
+        _ if args.is_empty() => op.to_string(),
+        // Unknown composite builtin — keep it legible.
+        _ => format!("{op}<{}>", args.join(", ")),
+    }
+}
+
+/// Render a `/kythe/code` MarkedSource to a clean *type name* (as opposed
+/// to [`parse_marked_source_fqn`], which is tuned for callable FQNs —
+/// truncating parameter lists and dropping return types). For a type
+/// node the FQN renderer already produces the right name in the common
+/// cases (`Widget`, `int`, `java.lang.String`); the one artifact is a
+/// trailing empty `<>` that a generic class/interface definition's
+/// MarkedSource appends (`java.util.List<>`). Strip that — the concrete
+/// arguments come from the enclosing `tapp`'s param edges, never from the
+/// head's own decoration.
+fn typename_from_marked_source(code: &[u8]) -> Option<String> {
+    let name = parse_marked_source_fqn(code)?;
+    let trimmed = name.trim_end_matches("<>").trim_end();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
 /// Read one proto field header (varint tag + wire-size payload) at
 /// `pos` from `buf`. Returns `(field, wire, val_end, val_start)` where
 /// `val_start..val_end` is the payload slice. Returns None on EOF.
@@ -790,6 +1009,57 @@ fn node_kind_byte(s: &str) -> u8 {
 
 fn parse_ascii_u32(b: &[u8]) -> Option<u32> {
     std::str::from_utf8(b).ok()?.parse().ok()
+}
+
+/// Parse the ordinal N out of a `/kythe/edge/param.N` edge kind. Returns
+/// None for any other edge (including a bare `/kythe/edge/param` with no
+/// ordinal, which the indexers don't emit for type applications).
+fn parse_param_ordinal(kind: &str) -> Option<u32> {
+    kind.strip_prefix("/kythe/edge/param.")?.parse().ok()
+}
+
+/// True for the `/kythe/node/kind` values that name a *type* node — the
+/// ones a `/kythe/edge/typed` target can be. Limits what the type
+/// side-table retains.
+fn is_type_node_kind(kind: &str) -> bool {
+    matches!(kind,
+        "tapp" | "tbuiltin" | "tvar" | "record" | "interface" | "sum" | "talias")
+}
+
+/// The builtin "operator" of a `tbuiltin` node, i.e. the part of its
+/// signature before `#builtin`. `ptr#builtin` → `ptr`, `int#builtin` →
+/// `int`. Returns None when the signature isn't a `#builtin` form.
+fn builtin_op_of(signature: &str) -> Option<&str> {
+    let op = signature.strip_suffix("#builtin")
+        .or_else(|| signature.split("#builtin").next().filter(|p| *p != signature))?;
+    if op.is_empty() { None } else { Some(op) }
+}
+
+/// [`TypeGraph`] over the per-CU side-table. Nodes are keyed by their
+/// VName symbol string. The renderer walks only the nodes a typed edge
+/// actually reaches, so an entry the side-table buffered but nothing
+/// referenced is simply never visited.
+struct CuTypeGraph<'a> {
+    side: &'a TypeSide,
+}
+
+impl<'a> TypeGraph for CuTypeGraph<'a> {
+    type Tk = &'a str;
+    fn node_kind(&self, tk: &'a str) -> &str {
+        self.side.kind.get(tk).map(String::as_str).unwrap_or("")
+    }
+    fn node_code(&self, tk: &'a str) -> Option<&[u8]> {
+        self.side.code.get(tk).map(Vec::as_slice)
+    }
+    fn params(&self, tk: &'a str) -> Vec<&'a str> {
+        match self.side.params.get(tk) {
+            Some(pm) => pm.values().map(String::as_str).collect(),
+            None => Vec::new(),
+        }
+    }
+    fn builtin_op(&self, tk: &'a str) -> &str {
+        self.side.builtin_op.get(tk).map(String::as_str).unwrap_or("")
+    }
 }
 
 // -- proto wire decoder --------------------------------------------------
@@ -892,6 +1162,252 @@ fn parse_vname(buf: &[u8]) -> Result<VName> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, HashMap};
+
+    // ---- Real `/kythe/code` MarkedSource bytes ----
+    //
+    // Captured verbatim from the stock v0.0.75 indexers run on tiny probe
+    // files (see the renderer tests below for the exact source). These are
+    // the leaf type nodes' code facts; the recursive renderer turns them
+    // into the rendered type names the indexer's own structure implies.
+
+    // cxx_indexer: `struct Widget {}` record node.
+    const WIDGET_CODE: &[u8] = &[0x08, 0x03, 0x12, 0x06, 0x57, 0x69, 0x64, 0x67, 0x65, 0x74];
+    // cxx_indexer: `int#builtin` tbuiltin node.
+    const INT_CODE: &[u8] = &[0x08, 0x03, 0x12, 0x03, 0x69, 0x6e, 0x74];
+    // cxx_indexer: `template <typename T> struct Box` record node.
+    const BOX_CODE: &[u8] = &[0x08, 0x03, 0x12, 0x03, 0x42, 0x6f, 0x78];
+    // java_indexer: `java.lang.String` record node (typed target of `var s`).
+    const STRING_CODE: &[u8] = &[
+        0x1a, 0x27, 0x1a, 0x0a, 0x08, 0x0c, 0x12, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63,
+        0x1a, 0x09, 0x08, 0x0c, 0x12, 0x05, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x1a, 0x09, 0x08,
+        0x0c, 0x12, 0x05, 0x63, 0x6c, 0x61, 0x73, 0x73, 0x22, 0x01, 0x20, 0x50, 0x01, 0x1a,
+        0x1b, 0x08, 0x04, 0x1a, 0x08, 0x08, 0x03, 0x12, 0x04, 0x6a, 0x61, 0x76, 0x61, 0x1a,
+        0x08, 0x08, 0x03, 0x12, 0x04, 0x6c, 0x61, 0x6e, 0x67, 0x22, 0x01, 0x2e, 0x50, 0x01,
+        0x1a, 0x0a, 0x08, 0x03, 0x12, 0x06, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67];
+    // java_indexer: `java.util.List` interface head of the `List<String>`
+    // tapp (param.0). Its own MarkedSource carries a trailing empty `<>`
+    // generic decoration that `typename_from_marked_source` strips.
+    const LIST_HEAD_CODE: &[u8] = &[
+        0x1a, 0x20, 0x1a, 0x0a, 0x08, 0x0c, 0x12, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63,
+        0x1a, 0x0d, 0x08, 0x0c, 0x12, 0x09, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x66, 0x61, 0x63,
+        0x65, 0x22, 0x01, 0x20, 0x50, 0x01, 0x1a, 0x1b, 0x08, 0x04, 0x1a, 0x08, 0x08, 0x03,
+        0x12, 0x04, 0x6a, 0x61, 0x76, 0x61, 0x1a, 0x08, 0x08, 0x03, 0x12, 0x04, 0x75, 0x74,
+        0x69, 0x6c, 0x22, 0x01, 0x2e, 0x50, 0x01, 0x1a, 0x08, 0x08, 0x03, 0x12, 0x04, 0x4c,
+        0x69, 0x73, 0x74, 0x1a, 0x0c, 0x08, 0x0a, 0x12, 0x01, 0x3c, 0x22, 0x02, 0x2c, 0x20,
+        0x2a, 0x01, 0x3e];
+
+    /// In-memory [`TypeGraph`] for the renderer tests. Each node is keyed
+    /// by a `&'static str` ticket and carries a kind, optional code-fact
+    /// bytes, optional param edges, and an optional builtin operator —
+    /// mirroring exactly the four facts the ingest side-table buffers.
+    #[derive(Default)]
+    struct MapGraph {
+        kind:    HashMap<&'static str, &'static str>,
+        code:    HashMap<&'static str, &'static [u8]>,
+        params:  HashMap<&'static str, BTreeMap<u32, &'static str>>,
+        builtin: HashMap<&'static str, &'static str>,
+    }
+    impl MapGraph {
+        fn leaf(&mut self, tk: &'static str, kind: &'static str, code: &'static [u8]) {
+            self.kind.insert(tk, kind);
+            self.code.insert(tk, code);
+        }
+        fn builtin_leaf(&mut self, tk: &'static str, op: &'static str) {
+            self.kind.insert(tk, "tbuiltin");
+            self.builtin.insert(tk, op);
+        }
+        /// A `tapp` whose params are `[head, args...]` in that order.
+        fn tapp(&mut self, tk: &'static str, params: &[&'static str]) {
+            self.kind.insert(tk, "tapp");
+            let mut pm = BTreeMap::new();
+            for (i, p) in params.iter().enumerate() { pm.insert(i as u32, *p); }
+            self.params.insert(tk, pm);
+        }
+    }
+    impl TypeGraph for MapGraph {
+        type Tk = &'static str;
+        fn node_kind(&self, tk: &'static str) -> &str {
+            self.kind.get(tk).copied().unwrap_or("")
+        }
+        fn node_code(&self, tk: &'static str) -> Option<&[u8]> {
+            self.code.get(tk).copied()
+        }
+        fn params(&self, tk: &'static str) -> Vec<&'static str> {
+            self.params.get(tk).map(|m| m.values().copied().collect()).unwrap_or_default()
+        }
+        fn builtin_op(&self, tk: &'static str) -> &str {
+            self.builtin.get(tk).copied().unwrap_or("")
+        }
+    }
+
+    // The renderer tests below assert the exact strings the indexers' node
+    // graphs imply. The node SHAPES (kinds, param ordering, builtin head
+    // signatures) and the leaf code-fact BYTES are taken from real
+    // cxx_indexer / java_indexer output:
+    //
+    //   f.cc:
+    //     auto w   = make_widget();   // Widget       (record leaf)
+    //     auto k   = identity(42);    // int          (tbuiltin leaf)
+    //     Box<int> bi;                // Box<int>     (tapp record-head)
+    //     const Box<int>& cbi = bi;   // const Box<int> &   (nested tapp)
+    //     int*  p;                    // int *        (tapp ptr#builtin)
+    //     Widget* wp;                 // Widget *
+    //   F.java:
+    //     var s  = make();            // java.lang.String   (record leaf)
+    //     var xs = list();            // java.util.List<java.lang.String>
+
+    #[test]
+    fn render_cxx_record_leaf_widget() {
+        let mut g = MapGraph::default();
+        g.leaf("Widget", "record", WIDGET_CODE);
+        assert_eq!(render_type(&g, "Widget").as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn render_cxx_builtin_leaf_int() {
+        // `identity(42)` deduces `int` — a `tbuiltin` leaf carrying the
+        // `int` MarkedSource.
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        assert_eq!(render_type(&g, "int").as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn render_cxx_tapp_box_of_int() {
+        // tapp[Box(record, code), int(tbuiltin, code)] → "Box<int>".
+        let mut g = MapGraph::default();
+        g.leaf("Box", "record", BOX_CODE);
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.tapp("Box<int>", &["Box", "int"]);
+        assert_eq!(render_type(&g, "Box<int>").as_deref(), Some("Box<int>"));
+    }
+
+    #[test]
+    fn render_cxx_const_ref_box_of_int() {
+        // The real chain for `const Box<int>&`:
+        //   tapp[lvr#builtin, tapp[const#builtin, tapp[Box, int]]]
+        let mut g = MapGraph::default();
+        g.leaf("Box", "record", BOX_CODE);
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("lvr", "lvr");
+        g.builtin_leaf("const", "const");
+        g.tapp("Box<int>", &["Box", "int"]);
+        g.tapp("const Box<int>", &["const", "Box<int>"]);
+        g.tapp("const Box<int> &", &["lvr", "const Box<int>"]);
+        let r = render_type(&g, "const Box<int> &").unwrap();
+        assert!(r.contains("const Box<int>"), "got {r:?}");
+        assert!(r.contains('&'), "got {r:?}");
+        assert_eq!(r, "const Box<int> &");
+    }
+
+    #[test]
+    fn render_cxx_pointer_to_int() {
+        // tapp[ptr#builtin, int] → "int *".
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("ptr", "ptr");
+        g.tapp("int*", &["ptr", "int"]);
+        assert_eq!(render_type(&g, "int*").as_deref(), Some("int *"));
+    }
+
+    #[test]
+    fn render_cxx_pointer_to_record() {
+        // tapp[ptr#builtin, Widget] → "Widget *".
+        let mut g = MapGraph::default();
+        g.leaf("Widget", "record", WIDGET_CODE);
+        g.builtin_leaf("ptr", "ptr");
+        g.tapp("Widget*", &["ptr", "Widget"]);
+        assert_eq!(render_type(&g, "Widget*").as_deref(), Some("Widget *"));
+    }
+
+    #[test]
+    fn render_cxx_function_type() {
+        // tapp[fn#builtin, int(ret), int, int] → "int(int, int)". The head
+        // node and the tapp node are distinct nodes (distinct tickets).
+        let mut g = MapGraph::default();
+        g.leaf("int", "tbuiltin", INT_CODE);
+        g.builtin_leaf("fn#builtin", "fn");
+        g.tapp("fn_tapp", &["fn#builtin", "int", "int", "int"]);
+        assert_eq!(render_type(&g, "fn_tapp").as_deref(), Some("int(int, int)"));
+    }
+
+    #[test]
+    fn render_java_record_leaf_string() {
+        // `var s = make()` → record leaf rendering to "java.lang.String"
+        // (the assertion accepts either "String" or the FQN form).
+        let mut g = MapGraph::default();
+        g.leaf("String", "record", STRING_CODE);
+        let r = render_type(&g, "String").unwrap();
+        assert!(r == "String" || r == "java.lang.String", "got {r:?}");
+        assert_eq!(r, "java.lang.String");
+    }
+
+    #[test]
+    fn render_java_tapp_list_of_string() {
+        // `var xs = list()` → tapp[List(interface,code), String(record,code)].
+        // The List head's own MarkedSource carries a trailing `<>` that
+        // `typename_from_marked_source` strips; the concrete arg comes from
+        // param.1.
+        let mut g = MapGraph::default();
+        g.leaf("List", "interface", LIST_HEAD_CODE);
+        g.leaf("String", "record", STRING_CODE);
+        g.tapp("List<String>", &["List", "String"]);
+        let r = render_type(&g, "List<String>").unwrap();
+        assert!(r.contains("List"), "got {r:?}");
+        assert!(r.contains("String"), "got {r:?}");
+        assert_eq!(r, "java.util.List<java.lang.String>");
+    }
+
+    #[test]
+    fn render_honest_emptiness_on_unknown_node() {
+        // A node with no kind, no code, no params, no builtin op — the
+        // renderer returns None rather than inventing a type.
+        let g = MapGraph::default();
+        assert_eq!(render_type(&g, "ghost"), None);
+        // A tapp whose head can't render and which has no args also yields
+        // None (head_name is required).
+        let mut g2 = MapGraph::default();
+        g2.tapp("bad", &["ghost"]);
+        assert_eq!(render_type(&g2, "bad"), None);
+    }
+
+    #[test]
+    fn render_type_cycle_is_bounded() {
+        // A corrupt graph with a self-referential tapp must not spin: the
+        // depth cap returns (a possibly-degraded) result, never hangs.
+        let mut g = MapGraph::default();
+        g.builtin_leaf("ptr", "ptr");
+        // tapp "loop" = ptr<loop> — references itself as its only arg.
+        let mut pm = BTreeMap::new();
+        pm.insert(0u32, "ptr");
+        pm.insert(1u32, "loop");
+        g.kind.insert("loop", "tapp");
+        g.params.insert("loop", pm);
+        // Should terminate (depth cap) — we only assert it returns.
+        let _ = render_type(&g, "loop");
+    }
+
+    #[test]
+    fn builtin_op_of_extracts_operator() {
+        assert_eq!(builtin_op_of("ptr#builtin"), Some("ptr"));
+        assert_eq!(builtin_op_of("const#builtin"), Some("const"));
+        assert_eq!(builtin_op_of("int#builtin"), Some("int"));
+        // Composite builtin signature `fn#builtin(void#builtin)` — the
+        // operator is still `fn`.
+        assert_eq!(builtin_op_of("fn#builtin(void#builtin)"), Some("fn"));
+        // Non-builtin signatures yield None.
+        assert_eq!(builtin_op_of("Widget#c#bgf6LUGjSuL"), None);
+        assert_eq!(builtin_op_of("#builtin"), None);
+    }
+
+    #[test]
+    fn parse_param_ordinal_reads_index() {
+        assert_eq!(parse_param_ordinal("/kythe/edge/param.0"), Some(0));
+        assert_eq!(parse_param_ordinal("/kythe/edge/param.7"), Some(7));
+        assert_eq!(parse_param_ordinal("/kythe/edge/param"), None);
+        assert_eq!(parse_param_ordinal("/kythe/edge/typed"), None);
+    }
 
     #[test]
     fn strip_descriptor_method_with_primitive_return() {

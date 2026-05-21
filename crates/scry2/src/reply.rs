@@ -21,7 +21,22 @@ pub struct SymbolGroup {
     pub name: String,
     pub kind: String,
     pub lang: String,
+    /// The symbol's compiler-resolved type, rendered to a string (e.g.
+    /// "const Box<int> &", "java.lang.String"), when the index has one.
+    /// Omitted from JSON when absent so `def` output stays clean for the
+    /// (common) symbols that have no typed edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed: Option<String>,
     pub rows: Vec<XrefHit>,
+}
+
+/// One `type NAME` result: a symbol and its resolved type.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TypeHit {
+    pub name: String,
+    pub kind: String,
+    pub lang: String,
+    pub typed: String,
 }
 
 /// One node in a callgraph BFS — produced by `callgraph`. Each node
@@ -59,6 +74,7 @@ pub enum Reply {
     Xrefs  { groups: Vec<SymbolGroup>, total: usize, truncated: bool },
     Inh    { hits: Vec<InhHit>, total: usize },
     Callgraph { nodes: Vec<CallNode>, total: usize, truncated: bool },
+    Type   { hits: Vec<TypeHit>, total: usize, truncated: bool },
     Error  { error: String },
 }
 
@@ -112,10 +128,21 @@ pub fn emit(reply: &Reply, as_json: bool) {
         }
         Reply::Xrefs { groups, total, truncated } => {
             for g in groups {
-                println!("# {}  [{}/{}]", g.name, g.kind, g.lang);
+                match &g.typed {
+                    Some(t) => println!("# {}  [{}/{}]  : {}", g.name, g.kind, g.lang, t),
+                    None    => println!("# {}  [{}/{}]", g.name, g.kind, g.lang),
+                }
                 for r in &g.rows {
                     println!("  {} {}@{}", r.role, r.file, r.off);
                 }
+            }
+            if *truncated { eprintln!("(truncated)"); }
+            eprintln!("hits={total}");
+        }
+        Reply::Type { hits, total, truncated } => {
+            for h in hits {
+                println!("# {}  [{}/{}]", h.name, h.kind, h.lang);
+                println!("  {}", h.typed);
             }
             if *truncated { eprintln!("(truncated)"); }
             eprintln!("hits={total}");

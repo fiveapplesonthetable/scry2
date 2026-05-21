@@ -279,6 +279,7 @@ mod tests {
         b.add_xref(s_bar, role::REF,  1, 200);
         b.add_inherit(s_bar, s_foo);
         b.add_call(s_foo, s_bar, role::CALL);
+        b.add_type(s_bar, "const Box<int> &");
 
         // Snapshot (non-consuming) — produces a usable .s2db.
         b.snapshot(&snap_path).unwrap();
@@ -300,6 +301,9 @@ mod tests {
         assert_eq!(r.inherits_of(s_bar), vec![s_foo]);
         let calls: Vec<_> = r.calls_from(s_foo).into_iter().map(|(s,_)|s).collect();
         assert_eq!(calls, vec![s_bar]);
+        assert_eq!(r.type_of(s_bar), Some("const Box<int> &"),
+            "resolved type survives the snapshot/resume round-trip");
+        assert_eq!(r.type_of(s_foo), None, "no typed edge → None after resume");
 
         let _ = std::fs::remove_file(&snap_path);
         let _ = std::fs::remove_file(&resumed_path);
@@ -348,6 +352,8 @@ mod tests {
         reference.add_call(s_a, s_b, role::CALL);
         reference.add_call(s_b, s_c, role::CALL);
         reference.add_call(s_a, s_c, role::REF);
+        reference.add_type(s_a, "int");
+        reference.add_type(s_var, "const Box<int> &");
         reference.finish(&reference_path).unwrap();
 
         // Streaming: split the same rows across prior + delta with
@@ -367,6 +373,7 @@ mod tests {
         prior_builder.add_xref(s_b, role::DEF,  2, 50);
         prior_builder.add_inherit(s_impl, s_iface);
         prior_builder.add_call(s_a, s_b, role::CALL);
+        prior_builder.add_type(s_var, "const Box<int> &");   // var's type in prior
         prior_builder.finish(&prior_path).unwrap();
 
         let prior = Index::open(&prior_path).unwrap();
@@ -385,6 +392,8 @@ mod tests {
         delta.add_call(s_a, s_b, role::CALL);             // dup of prior
         delta.add_call(s_b, s_c, role::CALL);
         delta.add_call(s_a, s_c, role::REF);
+        delta.add_type(s_a, "int");                       // a's type in delta only
+        delta.add_type(s_var, "const Box<int> &");        // dup of prior's type
         delta.write_merged_snapshot(&[&prior], &merged_path).unwrap();
         drop(prior);
 
@@ -425,6 +434,14 @@ mod tests {
             assert_eq!(r1.file_path(f), r2.file_path(f),
                 "file_path({f}) diverges");
         }
+        assert_eq!(r1.n_typed(), r2.n_typed(), "typed count diverges");
+        for sym in [s_a, s_b, s_c, s_iface, s_impl, s_var] {
+            assert_eq!(r1.type_of(sym), r2.type_of(sym),
+                "type_of diverges for {sym:x}");
+        }
+        assert_eq!(r2.type_of(s_a), Some("int"), "a's type from delta");
+        assert_eq!(r2.type_of(s_var), Some("const Box<int> &"), "var's type folded");
+        assert_eq!(r2.type_of(s_b), None, "no typed edge for b");
 
         let _ = std::fs::remove_file(&reference_path);
         let _ = std::fs::remove_file(&merged_path);
@@ -573,6 +590,8 @@ mod tests {
         let var = sym_of("kythe:c++:t###gVar");
 
         // shard0: a defined (FUNCTION), file 1, alias, call, a var sym+alias.
+        // var carries a resolved type; a gets an EMPTY type here (must lose
+        // to shard1's non-empty type on the tied-sym merge).
         let mut h0 = IndexBuilder::new();
         h0.upsert_sym(a, kind::FUNCTION, lang::CXX, "kythe:c++:t###a");
         h0.upsert_sym(var, kind::VARIABLE, lang::CXX, "kythe:c++:t###gVar");
@@ -581,10 +600,13 @@ mod tests {
         h0.upsert_file(1, "/t/a.cpp");
         h0.add_xref(a, role::DEF, 1, 10);
         h0.add_call(a, b, role::CALL);
+        h0.add_type(var, "const Box<int> &");          // var's resolved type
+        h0.add_type(a, "");                            // empty: dropped by add_type
         h0.finish(&s0).unwrap();
 
         // shard1: a as UNK (must refine to shard0's FUNCTION), b defined,
         // file 2, dup alias + dup call across shards, a new alias.
+        // a now gets a non-empty type (lands), b gets one too.
         let mut h1 = IndexBuilder::new();
         h1.upsert_sym(a, kind::UNK, lang::CXX, "");
         h1.upsert_sym(b, kind::FUNCTION, lang::CXX, "kythe:c++:t###b");
@@ -593,10 +615,13 @@ mod tests {
         h1.upsert_file(2, "/t/b.cpp");
         h1.add_xref(b, role::DEF, 2, 20);
         h1.add_call(a, b, role::CALL);                  // dup across shards
+        h1.add_type(a, "int *");                        // a's resolved type
+        h1.add_type(b, "Widget");
+        h1.add_type(var, "const Box<int> &");           // dup of shard0's type
         h1.finish(&s1).unwrap();
 
         // shard2: c defined, inherit, dup of file 1 (same id -> same path),
-        // a call, an xref.
+        // a call, an xref. c carries a type.
         let mut h2 = IndexBuilder::new();
         h2.upsert_sym(c, kind::FUNCTION, lang::CXX, "kythe:c++:t###c");
         h2.add_alias(c, "ns::c");
@@ -605,15 +630,18 @@ mod tests {
         h2.add_xref(c, role::DECL, 3, 30);
         h2.add_inherit(b, iface);
         h2.add_call(b, c, role::CALL);
+        h2.add_type(c, "java.util.List<java.lang.String>");
         h2.finish(&s2).unwrap();
 
-        // remainder (in-memory delta, = `self`): d defined, file 4, a call.
+        // remainder (in-memory delta, = `self`): d defined, file 4, a call,
+        // d carries a type.
         let mut delta = IndexBuilder::new();
         delta.upsert_sym(d, kind::FUNCTION, lang::CXX, "kythe:c++:t###d");
         delta.add_alias(d, "ns::d");
         delta.upsert_file(4, "/t/d.cpp");
         delta.add_xref(d, role::DEF, 4, 40);
         delta.add_call(c, d, role::CALL);
+        delta.add_type(d, "void(int, int)");
 
         let i0 = Index::open(&s0).unwrap();
         let i1 = Index::open(&s1).unwrap();
@@ -637,6 +665,10 @@ mod tests {
         r.add_inherit(b, iface);
         r.add_call(a, b, role::CALL); r.add_call(b, c, role::CALL);
         r.add_call(c, d, role::CALL);
+        r.add_type(a, "int *"); r.add_type(b, "Widget");
+        r.add_type(c, "java.util.List<java.lang.String>");
+        r.add_type(d, "void(int, int)");
+        r.add_type(var, "const Box<int> &");
         r.finish(&reference).unwrap();
 
         let m  = Index::open(&merged).unwrap();
@@ -666,6 +698,23 @@ mod tests {
         for f in 1u32..=4 {
             assert_eq!(m.file_path(f), rf.file_path(f), "file_path({f})");
         }
+
+        // typed: the k-way merge must fold the typed tables across shards +
+        // delta identically to a single finish().
+        assert_eq!(m.n_typed(), rf.n_typed(), "typed count");
+        for sym in [a, b, c, d, var] {
+            assert_eq!(m.type_of(sym), rf.type_of(sym), "type_of diverges for {sym:x}");
+        }
+        // Spot the concrete expectations: a's empty type in shard0 lost to
+        // shard1's non-empty one; every sym's stored type round-trips.
+        assert_eq!(m.type_of(a), Some("int *"), "a's non-empty type wins over shard0's empty");
+        assert_eq!(m.type_of(b), Some("Widget"));
+        assert_eq!(m.type_of(c), Some("java.util.List<java.lang.String>"));
+        assert_eq!(m.type_of(d), Some("void(int, int)"));
+        assert_eq!(m.type_of(var), Some("const Box<int> &"));
+        // A sym with no typed edge returns None in both.
+        assert_eq!(m.type_of(iface), None);
+        assert_eq!(rf.type_of(iface), None);
 
         for p in [&s0, &s1, &s2, &merged, &reference] {
             let _ = std::fs::remove_file(p);

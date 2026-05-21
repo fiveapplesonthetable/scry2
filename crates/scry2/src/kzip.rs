@@ -51,7 +51,7 @@ fn entry_prealloc(size: u64) -> usize {
 // ----------------------------------------------------------------- types
 
 /// Subset of `kythe.proto.VName` we need.
-#[derive(Default, Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct VName {
     pub signature: String,
@@ -61,14 +61,14 @@ pub struct VName {
     pub language:  String,
 }
 
-#[derive(Default, Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct FileInfo {
     pub path:   String,
     pub digest: String,
 }
 
-#[derive(Default, Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct FileInput {
     #[serde(alias = "vName")]
@@ -79,7 +79,7 @@ pub struct FileInput {
     // currently drop them and let the indexer fall back to defaults.
 }
 
-#[derive(Default, Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct CompilationUnit {
     #[serde(alias = "vName")]
@@ -592,12 +592,12 @@ impl SubKzipWriter {
     }
 
     /// Same as [`extract`] but applies `transform` to the
-    /// `IndexedCompilation` before emitting the pbunit, letting the
+    /// `CompilationUnit` before emitting the pbunit, letting the
     /// caller mutate per-CU args / source_file / etc. (e.g. inject a
     /// `--patch-module=java.base=…` for libcore CUs). When the
-    /// transform mutates the unit, we re-encode from the decoded
-    /// struct so changes actually land in the sub-kzip; otherwise we
-    /// preserve the raw bytes verbatim.
+    /// transform mutates ANY field of the unit, we re-encode from the
+    /// decoded struct so changes actually land in the sub-kzip;
+    /// otherwise we preserve the raw bytes verbatim.
     pub fn extract_with<F: FnOnce(&mut CompilationUnit)>(
         &mut self, unit: &Unit, dst: &Path, transform: F,
     ) -> Result<usize> {
@@ -609,12 +609,15 @@ impl SubKzipWriter {
         zout.add_directory("root/pbunits/", opts)?;
         zout.add_directory("root/files/", opts)?;
         zout.start_file(format!("root/pbunits/{}", unit.sha), opts)?;
-        // Snapshot args BEFORE/AFTER transform to detect actual mutation
-        // — if the transform was a no-op we can keep raw_proto.
+        // Snapshot the WHOLE unit BEFORE/AFTER the transform to detect
+        // any field mutation (argument, source_file, required_input,
+        // v_name, …) — if the transform was a genuine no-op we can keep
+        // the verbatim raw_proto; otherwise re-encode so the mutation
+        // actually lands in the sub-kzip.
         let mut cu = unit.cu.unit.clone();
-        let before = cu.argument.clone();
+        let before = cu.clone();
         transform(&mut cu);
-        if let (true, Some(raw)) = (cu.argument == before, unit.raw_proto.as_ref()) {
+        if let (true, Some(raw)) = (cu == before, unit.raw_proto.as_ref()) {
             zout.write_all(raw)?;
         } else {
             let ic = IndexedCompilation { unit: cu };
@@ -1014,6 +1017,101 @@ mod tests {
         assert!(!names.contains("root/pbunits/bbb"), "unit bbb must not leak");
         assert!(!names.contains("root/files/222"), "blob for bbb must not leak");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Helper for the extract_with mutation tests: build a one-CU kzip
+    /// on disk, read it back via the production walker (so `raw_proto`
+    /// is populated and the raw fast-path is live), then run
+    /// `extract_with(transform)` and return the decoded pbunit emitted
+    /// into the output kzip.
+    fn extract_with_roundtrip<F: FnOnce(&mut CompilationUnit)>(
+        tag: &str, transform: F,
+    ) -> CompilationUnit {
+        use std::io::Write;
+        let dir = std::env::temp_dir()
+            .join(format!("scry2-extractwith-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("in.kzip");
+        let dst = dir.join("out.kzip");
+
+        let f = std::fs::File::create(&src).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        z.add_directory("root/", opts).unwrap();
+        z.add_directory("root/pbunits/", opts).unwrap();
+        z.add_directory("root/files/", opts).unwrap();
+        let cu = IndexedCompilation {
+            unit: CompilationUnit {
+                v_name: VName { language: "c++".into(), ..Default::default() },
+                required_input: vec![FileInput {
+                    v_name: VName::default(),
+                    info: FileInfo { path: "f.h".into(), digest: "111".into() },
+                }],
+                argument: vec!["clang++".into(), "-c".into()],
+                source_file: vec!["f.cpp".into()],
+                ..Default::default()
+            },
+        };
+        z.start_file("root/pbunits/aaa", opts).unwrap();
+        z.write_all(&encode_indexed_compilation(&cu)).unwrap();
+        z.start_file("root/files/111", opts).unwrap();
+        z.write_all(b"contents").unwrap();
+        z.finish().unwrap();
+
+        // Read back via the walker — proto units carry raw_proto, so
+        // the no-op fast-path is genuinely exercised.
+        let units = read_units(&src).unwrap();
+        let unit = units.into_iter().find(|u| u.sha == "aaa").unwrap();
+        assert!(unit.raw_proto.is_some(), "proto unit must carry raw_proto");
+
+        let mut w = SubKzipWriter::open(&src).unwrap();
+        w.extract_with(&unit, &dst, transform).unwrap();
+
+        // Decode the emitted pbunit back out.
+        let extracted = std::fs::File::open(&dst).unwrap();
+        let mut z2 = zip::ZipArchive::new(extracted).unwrap();
+        let mut buf = Vec::new();
+        z2.by_name("root/pbunits/aaa").unwrap().read_to_end(&mut buf).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        parse_indexed_compilation(&buf).unwrap().unit
+    }
+
+    #[test]
+    fn extract_with_reencodes_non_argument_mutation() {
+        // A transform that mutates a field OTHER than `argument` (here:
+        // pushes a source_file) must be reflected in the emitted
+        // pbunit. If extract_with wrongly took the raw_proto fast-path
+        // by only watching `argument`, this mutation would be lost.
+        let out = extract_with_roundtrip("srcfile", |cu| {
+            cu.source_file.push("extra.cpp".into());
+        });
+        assert_eq!(out.source_file, vec!["f.cpp", "extra.cpp"],
+                   "non-argument mutation must land in the emitted pbunit");
+    }
+
+    #[test]
+    fn extract_with_reencodes_argument_mutation() {
+        // The existing --inject-cu-arg path mutates only `argument`;
+        // it must still re-encode and reflect the change.
+        let out = extract_with_roundtrip("arg", |cu| {
+            cu.argument.push("--patch-module=java.base=foo".into());
+        });
+        assert_eq!(out.argument,
+                   vec!["clang++", "-c", "--patch-module=java.base=foo"],
+                   "argument mutation must land in the emitted pbunit");
+    }
+
+    #[test]
+    fn extract_with_noop_preserves_unit() {
+        // A no-op transform keeps the unit byte-identical (raw_proto
+        // fast-path); the decoded result must equal the input CU.
+        let out = extract_with_roundtrip("noop", |_| {});
+        assert_eq!(out.argument, vec!["clang++", "-c"]);
+        assert_eq!(out.source_file, vec!["f.cpp"]);
+        assert_eq!(out.required_input.len(), 1);
+        assert_eq!(out.required_input[0].info.digest, "111");
+        assert_eq!(out.v_name.language, "c++");
     }
 
     #[test]

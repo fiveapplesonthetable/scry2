@@ -27,6 +27,12 @@ pub struct SymbolGroup {
     /// (common) symbols that have no typed edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typed: Option<String>,
+    /// The symbol's full rendered signature with parameter names (e.g.
+    /// "void setEnabled(bool enabled)"), when the index has one. Omitted
+    /// from JSON when absent so `def` output stays clean for symbols
+    /// with no rendered signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
     pub rows: Vec<XrefHit>,
 }
 
@@ -37,6 +43,29 @@ pub struct TypeHit {
     pub kind: String,
     pub lang: String,
     pub typed: String,
+}
+
+/// One `sig NAME` result: a symbol and its full rendered signature
+/// (with parameter names).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SigHit {
+    pub name: String,
+    pub kind: String,
+    pub lang: String,
+    pub sig:  String,
+}
+
+/// One `members NAME` result: a direct member of a container, with its
+/// own kind/name (and signature when it's a function we've rendered).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MemberHit {
+    pub name: String,
+    pub kind: String,
+    pub lang: String,
+    /// The member's full signature when it's a function we rendered one
+    /// for. Omitted otherwise so the output stays clean for fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 /// One node in a callgraph BFS — produced by `callgraph`. Each node
@@ -74,7 +103,13 @@ pub enum Reply {
     Xrefs  { groups: Vec<SymbolGroup>, total: usize, truncated: bool },
     Inh    { hits: Vec<InhHit>, total: usize },
     Callgraph { nodes: Vec<CallNode>, total: usize, truncated: bool },
+    /// `inheritance NAME` — reuses the callgraph BFS-forest node shape
+    /// (id/parent/hop), but each node is a type reached by walking the
+    /// inheritance graph (up = supertypes, down = subtypes).
+    Inheritance { nodes: Vec<CallNode>, total: usize, truncated: bool },
     Type   { hits: Vec<TypeHit>, total: usize, truncated: bool },
+    Sig    { hits: Vec<SigHit>, total: usize, truncated: bool },
+    Members { container: String, members: Vec<MemberHit>, total: usize, truncated: bool },
     Error  { error: String },
 }
 
@@ -132,6 +167,9 @@ pub fn emit(reply: &Reply, as_json: bool) {
                     Some(t) => println!("# {}  [{}/{}]  : {}", g.name, g.kind, g.lang, t),
                     None    => println!("# {}  [{}/{}]", g.name, g.kind, g.lang),
                 }
+                if let Some(s) = &g.sig {
+                    println!("  sig: {s}");
+                }
                 for r in &g.rows {
                     println!("  {} {}@{}", r.role, r.file, r.off);
                 }
@@ -145,6 +183,34 @@ pub fn emit(reply: &Reply, as_json: bool) {
                 println!("  {}", h.typed);
             }
             if *truncated { eprintln!("(truncated)"); }
+            eprintln!("hits={total}");
+        }
+        Reply::Sig { hits, total, truncated } => {
+            for h in hits {
+                println!("# {}  [{}/{}]", h.name, h.kind, h.lang);
+                println!("  {}", h.sig);
+            }
+            if *truncated { eprintln!("(truncated)"); }
+            eprintln!("hits={total}");
+        }
+        Reply::Members { container, members, total, truncated } => {
+            println!("# {container}");
+            for m in members {
+                match &m.sig {
+                    Some(s) => println!("  {} [{}/{}]  {}", m.name, m.kind, m.lang, s),
+                    None    => println!("  {} [{}/{}]", m.name, m.kind, m.lang),
+                }
+            }
+            if *truncated { eprintln!("(truncated)"); }
+            eprintln!("members={total}");
+        }
+        Reply::Inheritance { nodes, total, truncated } => {
+            for n in nodes {
+                let p = n.parent.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+                println!("  id={:<3} parent={:<3} hop={} {:<4} {}",
+                         n.id, p, n.hop, n.dir, n.name);
+            }
+            if *truncated { eprintln!("(inheritance truncated)"); }
             eprintln!("hits={total}");
         }
         Reply::Inh { hits, total } => {

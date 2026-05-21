@@ -23,8 +23,9 @@
 
 use crate::format::role;
 use crate::reader::Index;
-use crate::reply::{CallNode, InhHit, Reply, SymbolGroup, TypeHit, XrefHit,
-                   kind_str, lang_str, role_str};
+use crate::reply::{CallNode, InhHit, MemberHit, Reply, SigHit, SymbolGroup,
+                   TypeHit, XrefHit, kind_str, lang_str, role_str};
+use crate::format::kind;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -42,6 +43,10 @@ pub enum Request {
           #[serde(default)] not_in: Option<String> },
     Type { name: String, #[serde(default)] substr: bool,
            #[serde(default = "lim16")] limit: usize },
+    Sig  { name: String, #[serde(default)] substr: bool,
+           #[serde(default = "lim16")] limit: usize },
+    Members { name: String, #[serde(default)] substr: bool,
+              #[serde(default = "lim16")] limit: usize },
     Ref { name: String, #[serde(default)] substr: bool, #[serde(default = "lim16")] limit: usize,
           #[serde(default = "lim_max_hits")] max_hits: usize,
           #[serde(default, rename = "in")] in_: Option<String>,
@@ -80,6 +85,19 @@ pub enum Request {
                 /// Root-level only: drop seed roots whose def-file
                 /// path doesn't contain SUBSTR. Matches scry semantics.
                 #[serde(default)] def_in: Option<String> },
+    /// Transitive inheritance walk — the inheritance-graph analogue of
+    /// `callgraph`. up = supertypes (walk `inh`: child→parent), down =
+    /// subtypes (walk `inhrev`: parent→child), both = union. Same
+    /// BFS-forest reply shape as `callgraph`.
+    Inheritance { name: String,
+                  #[serde(default = "default_direction")] direction: String,
+                  #[serde(default = "default_depth")] depth: usize,
+                  #[serde(default = "default_max_syms")] max_syms: usize,
+                  #[serde(default)] substr: bool,
+                  #[serde(default = "default_root_limit")] root_limit: usize,
+                  #[serde(default, rename = "in")] in_: Option<String>,
+                  #[serde(default)] not_in: Option<String>,
+                  #[serde(default)] def_in: Option<String> },
 }
 fn default_root_limit() -> usize { 16 }
 fn lim16() -> usize { 16 }
@@ -148,6 +166,8 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
             /*with_type=*/true,
         ),
         Request::Type { name, substr, limit } => do_type(ix, name, *substr, *limit),
+        Request::Sig { name, substr, limit } => do_sig(ix, name, *substr, *limit),
+        Request::Members { name, substr, limit } => do_members(ix, name, *substr, *limit),
         // ref/callers with --substr must aggregate edges across *all*
         // name matches, not just the first `--limit` symbols: capping the
         // symbol set at 16 made `callers clearCallingIdentity --substr`
@@ -174,6 +194,11 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
         ),
         Request::Callgraph { name, direction, depth, max_syms, substr, root_limit,
                              in_, not_in, def_in } => do_callgraph(
+            ix, name, direction, *depth, *max_syms, *substr, *root_limit,
+            PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
+        ),
+        Request::Inheritance { name, direction, depth, max_syms, substr, root_limit,
+                               in_, not_in, def_in } => do_inheritance(
             ix, name, direction, *depth, *max_syms, *substr, *root_limit,
             PathFilter { in_: in_.as_deref(), not_in: not_in.as_deref(), def_in: def_in.as_deref() },
         ),
@@ -214,6 +239,9 @@ fn do_xrefs(
         let typed = if with_type {
             ix.type_of(*sym).map(str::to_string)
         } else { None };
+        let sig = if with_type {
+            ix.sig_of(*sym).map(str::to_string)
+        } else { None };
         let mut rows: Vec<XrefHit> = Vec::new();
         for (_, r, file, off) in ix.xrefs(*sym, role_lo, role_hi) {
             let path = ix.file_path(file).unwrap_or("?");
@@ -227,6 +255,7 @@ fn do_xrefs(
                     kind: kind_str(knd).to_string(),
                     lang: lang_str(lng).to_string(),
                     typed,
+                    sig,
                     rows,
                 });
                 break 'outer;
@@ -238,6 +267,7 @@ fn do_xrefs(
                 kind: kind_str(knd).to_string(),
                 lang: lang_str(lng).to_string(),
                 typed,
+                sig,
                 rows,
             });
         }
@@ -268,6 +298,70 @@ fn do_type(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
     let truncated = hits.len() >= limit;
     let total = hits.len();
     Reply::Type { hits, total, truncated }
+}
+
+/// `sig NAME` — a symbol's full rendered signature with parameter names.
+/// Resolves NAME → sym via the same exact / `--substr` path, then reads
+/// the `sig` section. Symbols with no rendered signature are dropped
+/// (honest emptiness), so the result holds only the syms that carry one.
+fn do_sig(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
+    let syms: Vec<u64> = if substr {
+        ix.syms_matching_substring(name, limit.max(SUBSTR_AGG_CAP))
+    } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
+    let mut hits: Vec<SigHit> = Vec::new();
+    for sym in &syms {
+        let Some(sg) = ix.sig_of(*sym) else { continue };
+        let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", 0, 0));
+        hits.push(SigHit {
+            name: sname.to_string(),
+            kind: kind_str(knd).to_string(),
+            lang: lang_str(lng).to_string(),
+            sig:  sg.to_string(),
+        });
+        if hits.len() >= limit { break; }
+    }
+    let truncated = hits.len() >= limit;
+    let total = hits.len();
+    Reply::Sig { hits, total, truncated }
+}
+
+/// `members NAME` — the direct members of a container (a class's fields
+/// and methods, a package's types). Resolves NAME → sym, then lists the
+/// `childrev` rows for that sym. The childrev table holds every
+/// `/kythe/edge/childof` edge, so we filter HERE by the container sym's
+/// kind: only a type / record / interface / package expands. That keeps
+/// function-local children (params/locals childof a function) out of the
+/// result without a separate ingest-time filter.
+fn do_members(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
+    let syms: Vec<u64> = if substr {
+        ix.syms_matching_substring(name, limit.max(SUBSTR_AGG_CAP))
+    } else if let Some(s) = ix.sym_for_name(name) { vec![s] } else { Vec::new() };
+    let is_container = |k: u8| matches!(k, kind::TYPE | kind::PACKAGE);
+    let mut members: Vec<MemberHit> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut container_name = name.to_string();
+    let mut truncated = false;
+    'outer: for sym in &syms {
+        let (cname, ckind, _) = ix.sym_meta(*sym).unwrap_or(("?", 0, 0));
+        // Only a real container lists members — never a function (whose
+        // childrev rows are its params/locals).
+        if !is_container(ckind) { continue; }
+        container_name = cname.to_string();
+        for child in ix.members(*sym) {
+            if !seen.insert(child) { continue; }
+            let (mname, mkind, mlang) = ix.sym_meta(child).unwrap_or(("?", 0, 0));
+            let sig = ix.sig_of(child).map(str::to_string);
+            members.push(MemberHit {
+                name: mname.to_string(),
+                kind: kind_str(mkind).to_string(),
+                lang: lang_str(mlang).to_string(),
+                sig,
+            });
+            if members.len() >= limit { truncated = true; break 'outer; }
+        }
+    }
+    let total = members.len();
+    Reply::Members { container: container_name, members, total, truncated }
 }
 
 fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
@@ -389,6 +483,93 @@ fn do_callgraph(
     // root entries which don't count as hits.
     let total = nodes.len().saturating_sub(roots.len());
     Reply::Callgraph { nodes, total, truncated }
+}
+
+/// One inheritance BFS — the inheritance-graph analogue of
+/// `do_callgraph`, sharing its BFS-forest shape verbatim. up walks
+/// supertypes (`inherits_of`: child→parent); down walks subtypes
+/// (`inherited_by`: parent→child, via the O(log n) `inhrev` section);
+/// both is the union. Each match seeds a root; downstream nodes are
+/// attributed to whichever root saw them first.
+#[allow(clippy::too_many_arguments)]
+fn do_inheritance(
+    ix: &Index, name: &str, direction: &str,
+    depth: usize, max_syms: usize,
+    substr: bool, root_limit: usize,
+    filt: PathFilter<'_>,
+) -> Reply {
+    let roots: Vec<u64> = if substr {
+        ix.syms_matching_substring(name, root_limit)
+    } else {
+        ix.sym_for_name(name).into_iter().collect()
+    };
+    // --def-in narrows the seed roots only (matches callgraph semantics).
+    let roots: Vec<u64> = match filt.def_in {
+        Some(s) if !s.is_empty() => roots.into_iter()
+            .filter(|r| ix.sym_def_path(*r).is_some_and(|p| p.contains(s)))
+            .collect(),
+        _ => roots,
+    };
+    let has_in_out = filt.has_in_out();
+    let pass = |s: u64| -> bool {
+        if !has_in_out { return true; }
+        filt.passes(ix.sym_def_path(s).unwrap_or(""))
+    };
+    let roots: Vec<u64> = roots.into_iter().filter(|r| pass(*r)).collect();
+    if roots.is_empty() {
+        return Reply::Inheritance { nodes: Vec::new(), total: 0, truncated: false };
+    }
+    let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
+        .unwrap_or_else(|| format!("<sym {:016x}>", s));
+    let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    let mut nodes: Vec<CallNode> = Vec::new();
+    let mut frontier: Vec<(u64, u32)> = Vec::new();
+    for &root in &roots {
+        if seen.contains_key(&root) { continue; }
+        let id = nodes.len() as u32;
+        seen.insert(root, id);
+        nodes.push(CallNode { id, parent: None, hop: 0,
+                              dir: "root".into(), name: name_of(root) });
+        frontier.push((root, id));
+    }
+    let go_up   = direction == "up"   || direction == "both";
+    let go_down = direction == "down" || direction == "both";
+    let mut truncated = false;
+    'depth: for hop in 1..=depth {
+        let mut next: Vec<(u64, u32)> = Vec::new();
+        for &(cur_sym, cur_id) in &frontier {
+            if go_up {
+                for parent in ix.inherits_of(cur_sym) {
+                    if !pass(parent) { continue; }
+                    if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(parent) {
+                        let id = nodes.len() as u32;
+                        v.insert(id);
+                        nodes.push(CallNode { id, parent: Some(cur_id), hop,
+                                              dir: "up".into(), name: name_of(parent) });
+                        next.push((parent, id));
+                        if nodes.len() >= max_syms { truncated = true; break 'depth; }
+                    }
+                }
+            }
+            if go_down {
+                for child in ix.inherited_by(cur_sym) {
+                    if !pass(child) { continue; }
+                    if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(child) {
+                        let id = nodes.len() as u32;
+                        v.insert(id);
+                        nodes.push(CallNode { id, parent: Some(cur_id), hop,
+                                              dir: "down".into(), name: name_of(child) });
+                        next.push((child, id));
+                        if nodes.len() >= max_syms { truncated = true; break 'depth; }
+                    }
+                }
+            }
+        }
+        if next.is_empty() { break; }
+        frontier = next;
+    }
+    let total = nodes.len().saturating_sub(roots.len());
+    Reply::Inheritance { nodes, total, truncated }
 }
 
 /// One request → one reply over a `BufRead` + `Write` pair. Shared by

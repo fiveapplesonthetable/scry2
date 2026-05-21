@@ -125,6 +125,32 @@ enum Cmd {
         #[arg(long, default_value = "16")] limit: usize,
     },
 
+    /// `sig NAME` — print a function's full signature WITH parameter
+    /// names (e.g. `void setEnabled(bool enabled)`). Rendered at ingest
+    /// from the function's parameter edges (each param's name + type) and
+    /// its return type. Non-functions, or functions with no recorded
+    /// parameter info, print nothing.
+    Sig {
+        name: String,
+        /// Match NAME as a substring (parallel scan) instead of exact FQN;
+        /// reports the signature of each matching function that has one.
+        #[arg(long)] substr: bool,
+        /// With --substr, cap how many matching symbols to report.
+        #[arg(long, default_value = "16")] limit: usize,
+    },
+
+    /// `members NAME` — list the direct members of a class / record /
+    /// interface / package (its fields, methods, nested types), each with
+    /// its kind and (for functions) signature. Resolved from
+    /// `/kythe/edge/childof`. Querying a non-container prints nothing.
+    Members {
+        name: String,
+        /// Match NAME as a substring (parallel scan) instead of exact FQN.
+        #[arg(long)] substr: bool,
+        /// Cap how many members to print.
+        #[arg(long, default_value = "16")] limit: usize,
+    },
+
     /// `ref NAME` — print every reference of a symbol.
     Ref {
         name: String,
@@ -209,6 +235,31 @@ enum Cmd {
         /// Root-level narrowing only (matches scry semantics):
         /// drop seed roots whose def-file path doesn't contain SUBSTR.
         /// Deeper levels are NOT narrowed.
+        #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
+    },
+
+    /// `inheritance NAME` — transitive walk of the inheritance graph.
+    /// up = supertypes (extends/implements, repeated), down = subtypes,
+    /// both = union. The inheritance-graph analogue of `callgraph`,
+    /// with the same id/parent/hop forest output.
+    Inheritance {
+        name: String,
+        #[arg(long, value_parser = ["up", "down", "both"], default_value = "up")]
+        direction: String,
+        #[arg(long, default_value = "3")] depth: usize,
+        #[arg(long, default_value = "200")] max_syms: usize,
+        /// Match `name` as a substring; every match seeds the BFS as a
+        /// separate root in the output forest.
+        #[arg(long)] substr: bool,
+        /// Cap roots when --substr is on. Default 16.
+        #[arg(long, default_value = "16")] root_limit: usize,
+        /// Restrict expansion: drop any discovered sym whose def-file
+        /// path doesn't contain SUBSTR. Applied at every BFS level.
+        #[arg(long = "in", value_name = "SUBSTR")] in_: Option<String>,
+        /// Symmetric to `--in`. Drop syms whose def-file path contains SUBSTR.
+        #[arg(long = "not-in", value_name = "SUBSTR")] not_in: Option<String>,
+        /// Root-level narrowing only: drop seed roots whose def-file path
+        /// doesn't contain SUBSTR.
         #[arg(long = "def-in", value_name = "SUBSTR")] def_in: Option<String>,
     },
 
@@ -375,6 +426,10 @@ fn main() -> Result<()> {
             => Request::Def { name, substr, limit, in_, not_in },
         Cmd::Type { name, substr, limit }
             => Request::Type { name, substr, limit },
+        Cmd::Sig { name, substr, limit }
+            => Request::Sig { name, substr, limit },
+        Cmd::Members { name, substr, limit }
+            => Request::Members { name, substr, limit },
         Cmd::Ref { name, substr, limit, max_hits, in_, not_in, def_in }
             => Request::Ref { name, substr, limit, max_hits, in_, not_in, def_in },
         Cmd::Callers { name, substr, limit, max_hits, in_, not_in, def_in }
@@ -387,6 +442,10 @@ fn main() -> Result<()> {
                          in_, not_in, def_in }
             => Request::Callgraph { name, direction, depth, max_syms, substr,
                                     root_limit, in_, not_in, def_in },
+        Cmd::Inheritance { name, direction, depth, max_syms, substr, root_limit,
+                           in_, not_in, def_in }
+            => Request::Inheritance { name, direction, depth, max_syms, substr,
+                                      root_limit, in_, not_in, def_in },
         _ => unreachable!(),
     };
     let reply: Reply = if let Some(sock) = cli.socket {
@@ -463,10 +522,11 @@ fn cmd_index(entries: &[PathBuf], out: &std::path::Path) -> Result<()> {
             kythe::ingest(f, &mut builder, &file_ids)?
         };
         eprintln!(
-            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} types={} completes={}",
+            "[index]   {label}: entries={} anchors={} xrefs={} inherits={} aliases={} calls={} types={} childof={} sigs={} completes={}",
             stats.entries, stats.anchors_flushed, stats.xrefs_emitted,
             stats.inherits_emitted, stats.aliases_emitted, stats.calls_emitted,
-            stats.types_emitted, stats.completes_bridges,
+            stats.types_emitted, stats.childof_emitted, stats.sigs_emitted,
+            stats.completes_bridges,
         );
         eprintln!(
             "[index]   {label}: diag bodies={} pending={} unresolved={}",

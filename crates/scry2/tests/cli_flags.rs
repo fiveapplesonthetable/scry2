@@ -77,6 +77,17 @@ fn make_index() -> (PathBuf, PathBuf) {
     b.add_xref(m_callee, role::CALL, 2, 600);  // call from MainChild
     b.add_xref(m_callee, role::CALL, 3, 600);  // call from TestChild
 
+    // Membership (childof): Parent.helper is a member of Parent; add a
+    // field too so `members foo.Parent` lists both.
+    let f_count = sym_of("foo.Parent.count");
+    b.upsert_sym(f_count, kind::FIELD, lang::JAVA, "foo.Parent.count");
+    b.add_xref(f_count, role::DECL, 1, 700);
+    b.add_childof(m_callee, parent);   // Parent.helper childof Parent
+    b.add_childof(f_count,  parent);   // Parent.count  childof Parent
+
+    // Signature (with param names) for one method.
+    b.add_sig(m_callee, "void helper(int flags)");
+
     b.finish(&s2db).unwrap();
     (dir, s2db)
 }
@@ -99,7 +110,7 @@ fn run(index: &std::path::Path, args: &[&str]) -> serde_json::Value {
 fn n_rows(v: &serde_json::Value) -> usize {
     // Different verbs put rows under different keys; we just count
     // members of the first non-null array we find.
-    for key in ["groups", "hits", "nodes"] {
+    for key in ["groups", "hits", "nodes", "members"] {
         if let Some(arr) = v.get(key).and_then(|x| x.as_array()) {
             // For `groups`, count the rows across all groups.
             if key == "groups" {
@@ -306,6 +317,89 @@ fn stat_reports_nonzero_counts() {
     assert!(v.get("xrefs").and_then(|x| x.as_u64()).unwrap() > 0);
     assert!(v.get("syms" ).and_then(|x| x.as_u64()).unwrap() > 0);
     assert!(v.get("files").and_then(|x| x.as_u64()).unwrap() > 0);
+}
+
+// -------- INHERITANCE ---------------------------------------------------
+
+#[test]
+fn inheritance_down_finds_subtypes() {
+    // Parent <- MainChild, Parent <- TestChild. `down` from Parent
+    // reaches both children.
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["inheritance", "foo.Parent", "--direction", "down"]);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("foo.MainChild"), "down reaches MainChild: {s}");
+    assert!(s.contains("foo.TestChild"), "down reaches TestChild: {s}");
+}
+
+#[test]
+fn inheritance_up_finds_supertypes() {
+    // `up` from MainChild reaches Parent.
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["inheritance", "foo.MainChild", "--direction", "up"]);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("foo.Parent"), "up reaches Parent: {s}");
+}
+
+#[test]
+fn inheritance_not_in_drops_test_subtree() {
+    // down from Parent, but --not-in tests/ prunes TestChild.
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["inheritance", "foo.Parent", "--direction", "down",
+                         "--not-in", "tests/"]);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("foo.MainChild"), "MainChild kept: {s}");
+    assert!(!s.contains("foo.TestChild"), "TestChild filtered: {s}");
+}
+
+// -------- MEMBERS -------------------------------------------------------
+
+#[test]
+fn members_lists_class_members() {
+    // foo.Parent has a method (helper) and a field (count) childof it.
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["members", "foo.Parent"]);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("foo.Parent.helper"), "lists method: {s}");
+    assert!(s.contains("foo.Parent.count"),  "lists field: {s}");
+    assert_eq!(n_rows(&v), 2, "exactly the two direct members: {v}");
+}
+
+#[test]
+fn members_of_non_container_is_empty() {
+    // Querying a function lists nothing (parent-kind filter).
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["members", "foo.Parent.helper"]);
+    assert_eq!(n_rows(&v), 0, "a function is not a container: {v}");
+}
+
+// -------- SIG -----------------------------------------------------------
+
+#[test]
+fn sig_shows_full_signature_with_param_names() {
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["sig", "foo.Parent.helper"]);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("void helper(int flags)"),
+        "sig carries param names: {s}");
+}
+
+#[test]
+fn sig_absent_is_empty() {
+    // A function we rendered no sig for prints nothing (honest emptiness).
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["sig", "foo.MainChild.run"]);
+    assert_eq!(n_rows(&v), 0, "no sig rendered → no rows: {v}");
+}
+
+#[test]
+fn def_surfaces_signature() {
+    // `def` output includes the signature when one exists.
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["def", "foo.Parent.helper"]);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("void helper(int flags)"),
+        "def carries the sig: {s}");
 }
 
 // -------- TILDE ---------------------------------------------------------

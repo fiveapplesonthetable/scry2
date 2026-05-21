@@ -280,6 +280,8 @@ mod tests {
         b.add_inherit(s_bar, s_foo);
         b.add_call(s_foo, s_bar, role::CALL);
         b.add_type(s_bar, "const Box<int> &");
+        b.add_childof(s_bar, s_foo);   // s_bar is a member of s_foo
+        b.add_sig(s_foo, "void foo(int x)");
 
         // Snapshot (non-consuming) — produces a usable .s2db.
         b.snapshot(&snap_path).unwrap();
@@ -304,6 +306,13 @@ mod tests {
         assert_eq!(r.type_of(s_bar), Some("const Box<int> &"),
             "resolved type survives the snapshot/resume round-trip");
         assert_eq!(r.type_of(s_foo), None, "no typed edge → None after resume");
+        assert_eq!(r.members(s_foo), vec![s_bar],
+            "membership survives the snapshot/resume round-trip");
+        assert_eq!(r.inherited_by(s_foo), vec![s_bar],
+            "inhrev survives the snapshot/resume round-trip");
+        assert_eq!(r.sig_of(s_foo), Some("void foo(int x)"),
+            "signature survives the snapshot/resume round-trip");
+        assert_eq!(r.sig_of(s_bar), None, "no sig → None after resume");
 
         let _ = std::fs::remove_file(&snap_path);
         let _ = std::fs::remove_file(&resumed_path);
@@ -602,6 +611,9 @@ mod tests {
         h0.add_call(a, b, role::CALL);
         h0.add_type(var, "const Box<int> &");          // var's resolved type
         h0.add_type(a, "");                            // empty: dropped by add_type
+        // childof: a (a class) has member var; sig for a present here.
+        h0.add_childof(var, a);                        // var childof class a
+        h0.add_sig(a, "");                             // empty: dropped
         h0.finish(&s0).unwrap();
 
         // shard1: a as UNK (must refine to shard0's FUNCTION), b defined,
@@ -618,6 +630,11 @@ mod tests {
         h1.add_type(a, "int *");                        // a's resolved type
         h1.add_type(b, "Widget");
         h1.add_type(var, "const Box<int> &");           // dup of shard0's type
+        // childof: dup of shard0's (a -> var) edge, plus b is a member of a.
+        h1.add_childof(var, a);                         // dup across shards
+        h1.add_childof(b, a);                           // b childof class a
+        h1.add_sig(a, "");                              // empty in shard1 too
+        h1.add_sig(b, "void b(int x)");                 // b's sig lands here
         h1.finish(&s1).unwrap();
 
         // shard2: c defined, inherit, dup of file 1 (same id -> same path),
@@ -631,6 +648,9 @@ mod tests {
         h2.add_inherit(b, iface);
         h2.add_call(b, c, role::CALL);
         h2.add_type(c, "java.util.List<java.lang.String>");
+        // childof: c is a member of a too; sig for c here.
+        h2.add_childof(c, a);                           // c childof class a
+        h2.add_sig(c, "List<String> c(String s)");
         h2.finish(&s2).unwrap();
 
         // remainder (in-memory delta, = `self`): d defined, file 4, a call,
@@ -642,6 +662,9 @@ mod tests {
         delta.add_xref(d, role::DEF, 4, 40);
         delta.add_call(c, d, role::CALL);
         delta.add_type(d, "void(int, int)");
+        // childof: d is a member of a; d's sig in the in-memory remainder.
+        delta.add_childof(d, a);
+        delta.add_sig(d, "void d(int, int)");
 
         let i0 = Index::open(&s0).unwrap();
         let i1 = Index::open(&s1).unwrap();
@@ -669,6 +692,13 @@ mod tests {
         r.add_type(c, "java.util.List<java.lang.String>");
         r.add_type(d, "void(int, int)");
         r.add_type(var, "const Box<int> &");
+        // childof union: a's members are var, b, c, d (dups collapse).
+        r.add_childof(var, a); r.add_childof(b, a);
+        r.add_childof(c, a);   r.add_childof(d, a);
+        // sig union: b, c, d carry sigs; a's were empty (dropped).
+        r.add_sig(b, "void b(int x)");
+        r.add_sig(c, "List<String> c(String s)");
+        r.add_sig(d, "void d(int, int)");
         r.finish(&reference).unwrap();
 
         let m  = Index::open(&merged).unwrap();
@@ -715,6 +745,34 @@ mod tests {
         // A sym with no typed edge returns None in both.
         assert_eq!(m.type_of(iface), None);
         assert_eq!(rf.type_of(iface), None);
+
+        // inhrev: the k-way merge must fold + reverse the inherits tables
+        // across shards exactly like finish, so `inherited_by` matches.
+        assert_eq!(m.n_inhrev(), rf.n_inhrev(), "inhrev count");
+        assert_eq!(m.n_inhrev(), m.n_inh(), "inhrev mirrors inh in merged");
+        assert_eq!(m.inherited_by(iface), rf.inherited_by(iface),
+            "inherited_by via inhrev diverges (b extends iface)");
+
+        // childrev: membership folded identically. a's members are the
+        // union {var, b, c, d}, deduped across shards + delta.
+        assert_eq!(m.n_childrev(), rf.n_childrev(), "childrev count");
+        let mem_m: std::collections::HashSet<u64> = m.members(a).into_iter().collect();
+        let mem_r: std::collections::HashSet<u64> = rf.members(a).into_iter().collect();
+        assert_eq!(mem_m, mem_r, "members(a) diverges between merge and finish");
+        assert_eq!(mem_m, std::collections::HashSet::from([var, b, c, d]),
+            "a's members are var + b + c + d");
+
+        // sig: the k-way merge must fold sig tables across shards + delta
+        // identically to finish, with non-empty-wins on a tied sym.
+        assert_eq!(m.n_sig(), rf.n_sig(), "sig count");
+        for sym in [a, b, c, d, var, iface] {
+            assert_eq!(m.sig_of(sym), rf.sig_of(sym), "sig_of diverges for {sym:x}");
+        }
+        assert_eq!(m.sig_of(b), Some("void b(int x)"));
+        assert_eq!(m.sig_of(c), Some("List<String> c(String s)"));
+        assert_eq!(m.sig_of(d), Some("void d(int, int)"));
+        assert_eq!(m.sig_of(a), None, "a's sigs were empty → no row");
+        assert_eq!(m.sig_of(iface), None, "no sig for iface");
 
         for p in [&s0, &s1, &s2, &merged, &reference] {
             let _ = std::fs::remove_file(p);
@@ -906,6 +964,232 @@ mod tests {
         assert_eq!(up, vec![s_foo], "bar called by foo");
         // Up: who calls foo? Nobody.
         assert!(ix.called_by(s_foo).is_empty(), "nobody calls foo");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inherited_by_via_inhrev_matches_full_scan() {
+        // A: the O(log n) `inherited_by` (binary search over the
+        // parent-sorted `inhrev` section) must return exactly the set a
+        // full linear scan over `inh` would. Build a small fixture where
+        // one parent has several children and a couple of unrelated edges
+        // sit around it, then compare against a reference scan.
+        let path = tmp("inhrev");
+        let mut b = IndexBuilder::new();
+        let p   = sym_of("Parent");
+        let c1  = sym_of("Child1");
+        let c2  = sym_of("Child2");
+        let c3  = sym_of("Child3");
+        let gp  = sym_of("Grandparent");
+        let other = sym_of("Other");
+        let other_c = sym_of("OtherChild");
+        for (s, n) in [(p,"Parent"),(c1,"Child1"),(c2,"Child2"),(c3,"Child3"),
+                       (gp,"Grandparent"),(other,"Other"),(other_c,"OtherChild")] {
+            b.upsert_sym(s, kind::TYPE, lang::JAVA, n);
+        }
+        b.add_inherit(c1, p);
+        b.add_inherit(c2, p);
+        b.add_inherit(c3, p);
+        b.add_inherit(p, gp);        // Parent itself inherits Grandparent
+        b.add_inherit(other_c, other); // unrelated edge
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // inhrev row count must equal inh row count (same edges, reversed).
+        assert_eq!(ix.n_inhrev(), ix.n_inh(), "inhrev mirrors inh row count");
+
+        // Reference: the old full-scan over (child, parent) pairs.
+        let full_scan = |parent: u64| -> std::collections::HashSet<u64> {
+            ix.iter_inherits()
+                .filter(|(_, par)| *par == parent)
+                .map(|(child, _)| child)
+                .collect()
+        };
+        for parent in [p, gp, other, c1] {
+            let via_inhrev: std::collections::HashSet<u64> =
+                ix.inherited_by(parent).into_iter().collect();
+            assert_eq!(via_inhrev, full_scan(parent),
+                "inherited_by({parent:x}) via inhrev != full scan");
+        }
+        // Concretely: Parent's subtypes are exactly {Child1, Child2, Child3}.
+        let subs: std::collections::HashSet<u64> =
+            ix.inherited_by(p).into_iter().collect();
+        assert_eq!(subs, std::collections::HashSet::from([c1, c2, c3]));
+        // `inherits(child)` (forward) still works off `inh`.
+        assert_eq!(ix.inherits_of(c1), vec![p]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inheritance_verb_walks_transitive_hierarchy() {
+        // B: hierarchy A <- B <- C (B extends A, C extends B).
+        // `inheritance C --direction up` reaches {B, A};
+        // `inheritance A --direction down` reaches {B, C}.
+        use server::{Request, dispatch};
+        use reply::Reply;
+        let path = tmp("inh-graph");
+        let mut b = IndexBuilder::new();
+        let a = sym_of("A");
+        let bb = sym_of("B");
+        let c = sym_of("C");
+        for (s, n) in [(a,"A"),(bb,"B"),(c,"C")] {
+            b.upsert_sym(s, kind::TYPE, lang::JAVA, n);
+        }
+        b.add_inherit(bb, a);   // B extends A
+        b.add_inherit(c, bb);   // C extends B
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+
+        // up from C → {B, A}
+        let r = dispatch(&ix, &Request::Inheritance {
+            name: "C".into(), direction: "up".into(), depth: 5, max_syms: 100,
+            substr: false, root_limit: 16, in_: None, not_in: None, def_in: None,
+        });
+        if let Reply::Inheritance { nodes, .. } = r {
+            let non_root: std::collections::HashSet<&str> = nodes.iter()
+                .filter(|n| n.parent.is_some()).map(|n| n.name.as_str()).collect();
+            assert_eq!(non_root, std::collections::HashSet::from(["A", "B"]),
+                "up from C reaches B and A");
+        } else { panic!("expected Reply::Inheritance") }
+
+        // down from A → {B, C}
+        let r = dispatch(&ix, &Request::Inheritance {
+            name: "A".into(), direction: "down".into(), depth: 5, max_syms: 100,
+            substr: false, root_limit: 16, in_: None, not_in: None, def_in: None,
+        });
+        if let Reply::Inheritance { nodes, .. } = r {
+            let non_root: std::collections::HashSet<&str> = nodes.iter()
+                .filter(|n| n.parent.is_some()).map(|n| n.name.as_str()).collect();
+            assert_eq!(non_root, std::collections::HashSet::from(["B", "C"]),
+                "down from A reaches B and C");
+        } else { panic!("expected Reply::Inheritance") }
+
+        // both from B → {A (up), C (down)}.
+        let r = dispatch(&ix, &Request::Inheritance {
+            name: "B".into(), direction: "both".into(), depth: 5, max_syms: 100,
+            substr: false, root_limit: 16, in_: None, not_in: None, def_in: None,
+        });
+        if let Reply::Inheritance { nodes, .. } = r {
+            let non_root: std::collections::HashSet<&str> = nodes.iter()
+                .filter(|n| n.parent.is_some()).map(|n| n.name.as_str()).collect();
+            assert_eq!(non_root, std::collections::HashSet::from(["A", "C"]),
+                "both from B reaches A (up) and C (down)");
+        } else { panic!("expected Reply::Inheritance") }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn members_lists_class_fields_and_methods() {
+        // C: a class with two methods + a field → `members` lists exactly
+        // those three. childof edges are stored reversed (parent, child);
+        // the `members` verb filters by the parent's kind so a function's
+        // own children (params/locals) never surface as class members.
+        use server::{Request, dispatch};
+        use reply::Reply;
+        let path = tmp("members");
+        let mut b = IndexBuilder::new();
+        let cls    = sym_of("Gadget");
+        let count  = sym_of("Gadget::count");
+        let m_set  = sym_of("Gadget::setEnabled");
+        let m_frob = sym_of("Gadget::frob");
+        let p_enabled = sym_of("Gadget::setEnabled::enabled");  // a param
+        b.upsert_sym(cls,    kind::TYPE,     lang::CXX, "Gadget");
+        b.upsert_sym(count,  kind::FIELD,    lang::CXX, "Gadget::count");
+        b.upsert_sym(m_set,  kind::FUNCTION, lang::CXX, "Gadget::setEnabled");
+        b.upsert_sym(m_frob, kind::FUNCTION, lang::CXX, "Gadget::frob");
+        b.upsert_sym(p_enabled, kind::VARIABLE, lang::CXX, "Gadget::setEnabled::enabled");
+        // childof: each member childof the class; the param childof the method.
+        b.add_childof(count,  cls);
+        b.add_childof(m_set,  cls);
+        b.add_childof(m_frob, cls);
+        b.add_childof(p_enabled, m_set);   // function-local — must NOT be a class member
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+
+        // Reader-level: members(class) returns the three direct members.
+        let direct: std::collections::HashSet<u64> =
+            ix.members(cls).into_iter().collect();
+        assert_eq!(direct, std::collections::HashSet::from([count, m_set, m_frob]),
+            "class members are its field + two methods, not the param");
+        // The method's childrev row holds the param (it IS stored), but the
+        // `members` verb won't expand a function (filtered by parent kind).
+        assert_eq!(ix.members(m_set), vec![p_enabled],
+            "childrev keeps the function→param edge");
+
+        // Verb-level: `members Gadget` lists exactly the three; querying a
+        // function lists nothing (parent-kind filter).
+        let r = dispatch(&ix, &Request::Members {
+            name: "Gadget".into(), substr: false, limit: 16,
+        });
+        if let Reply::Members { members, total, .. } = r {
+            let names: std::collections::HashSet<&str> =
+                members.iter().map(|m| m.name.as_str()).collect();
+            assert_eq!(names, std::collections::HashSet::from(
+                ["Gadget::count", "Gadget::setEnabled", "Gadget::frob"]));
+            assert_eq!(total, 3);
+        } else { panic!("expected Reply::Members") }
+
+        let r = dispatch(&ix, &Request::Members {
+            name: "Gadget::setEnabled".into(), substr: false, limit: 16,
+        });
+        if let Reply::Members { members, total, .. } = r {
+            assert_eq!(total, 0, "a function is not a container — no members");
+            assert!(members.is_empty());
+        } else { panic!("expected Reply::Members") }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sig_round_trips_through_finish_and_def() {
+        // D: a function's full signature (with param names) is stored in
+        // the `sig` section, surfaced by `sig NAME`, and shown on `def`.
+        // Honest emptiness: a function with no sig row, and a non-function,
+        // both return None.
+        use server::{Request, dispatch};
+        use reply::Reply;
+        let path = tmp("sig");
+        let mut b = IndexBuilder::new();
+        let frob = sym_of("Gadget::frob");
+        let plain = sym_of("Gadget::nosig");
+        let field = sym_of("Gadget::count");
+        b.upsert_sym(frob,  kind::FUNCTION, lang::CXX, "Gadget::frob");
+        b.upsert_sym(plain, kind::FUNCTION, lang::CXX, "Gadget::nosig");
+        b.upsert_sym(field, kind::FIELD,    lang::CXX, "Gadget::count");
+        b.upsert_file(1, "/g.cpp");
+        b.add_xref(frob, role::DECL, 1, 10);
+        // Verified verbatim against cxx_indexer output for
+        //   int Gadget::frob(Widget* w, int n)
+        b.add_sig(frob, "int frob(Widget * w, int n)");
+        b.add_sig(plain, "");   // empty → dropped by add_sig
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+
+        // Reader-level.
+        assert_eq!(ix.sig_of(frob), Some("int frob(Widget * w, int n)"));
+        assert_eq!(ix.sig_of(plain), None, "empty sig dropped (honest emptiness)");
+        assert_eq!(ix.sig_of(field), None, "non-rendered sym has no sig");
+        assert_eq!(ix.n_sig(), 1, "only the one non-empty sig stored");
+
+        // `sig NAME` verb.
+        let r = dispatch(&ix, &Request::Sig {
+            name: "Gadget::frob".into(), substr: false, limit: 16,
+        });
+        if let Reply::Sig { hits, total, .. } = r {
+            assert_eq!(total, 1);
+            assert_eq!(hits[0].sig, "int frob(Widget * w, int n)");
+            assert!(hits[0].sig.contains(" w") && hits[0].sig.contains(" n"),
+                "sig carries param names");
+        } else { panic!("expected Reply::Sig") }
+
+        // `def` surfaces the sig.
+        let r = dispatch(&ix, &Request::Def {
+            name: "Gadget::frob".into(), substr: false, limit: 16,
+            in_: None, not_in: None,
+        });
+        if let Reply::Xrefs { groups, .. } = r {
+            assert_eq!(groups[0].sig.as_deref(), Some("int frob(Widget * w, int n)"),
+                "def output carries the signature");
+        } else { panic!("expected Reply::Xrefs") }
         let _ = std::fs::remove_file(&path);
     }
 

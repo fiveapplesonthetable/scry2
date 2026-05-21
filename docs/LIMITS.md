@@ -48,8 +48,9 @@ own serving tables. See [VS_KYTHE.md](VS_KYTHE.md).
 
 A `sym` is `xxHash64` of the symbol's Kythe VName string
 (`kythe:<lang>:<corpus>#<root>#<path>#<signature>`). At AOSP scale
-(~5M syms over a 2^64 keyspace) the collision probability is ~2.7e-13 —
-astronomically rare, but not provably impossible.
+(~92M syms over a 2^64 keyspace) the expected number of collisions is
+~n^2/2^65 ~ 2e-4 — very unlikely (well under a 0.1% chance of any
+collision across the whole index), but not provably impossible.
 
 Name → sym lookup has two paths with different semantics:
 
@@ -72,20 +73,6 @@ the scan lowercases both the needle and each candidate before the
 substring check. Each call is bounded by its per-call cap (`--limit`),
 which also caps how many matching symbols flow into the `ref` /
 `callers --substr` aggregation, so a broad needle stays bounded.
-
-## `--inject-cu-arg` re-encode detects only argument changes
-
-`from-kzip --inject-cu-arg` mutates only `cu.argument` (it prepends a
-javac/clang arg to matching CUs). The kzip re-encode path
-(`extract_with` in `crates/scry2/src/kzip.rs`) detects mutation by
-snapshotting `cu.argument` before and after the transform: if the
-arguments are unchanged it keeps the raw proto bytes verbatim, otherwise
-it re-encodes the decoded CU. This is correct **as long as the only field
-a transform mutates is `cu.argument`**. A future transform that mutated
-other CU fields (`source_file`, `required_input`, `v_name`) would slip
-past the snapshot, and its change would be silently dropped because the
-raw proto would be kept. If such a transform is added, the detection must
-be widened — compare the whole CU, or always re-encode.
 
 ## `.s2db` is a trusted build output
 

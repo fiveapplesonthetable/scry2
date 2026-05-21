@@ -161,7 +161,14 @@ impl Index {
 
     // -- name → sym ----------------------------------------------------------
 
-    /// Binary search the alphabetical name index for an exact match.
+    /// Binary search the alphabetical name index for an exact match,
+    /// returning the FIRST landing only. A name can map to several syms —
+    /// overloads, per-jar copies of the same method, language-pair
+    /// variants — which sit contiguously in the (name, sym)-sorted index;
+    /// this returns whichever the binary search lands on (alphabetically
+    /// first by the tie-break on `sym`), which for an ambiguous name may be
+    /// a variant with no xrefs. Callers that need ALL syms of an exact
+    /// name (the def/ref/callers verbs do) must use [`Self::syms_for_name`].
     pub fn sym_for_name(&self, query: &str) -> Option<u64> {
         let names = self.names_slice();
         let n = self.hdr.names_n as usize;

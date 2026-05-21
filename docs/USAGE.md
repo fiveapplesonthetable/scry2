@@ -43,16 +43,80 @@ scry2 from-kzip \
 Restrict to a subset of languages with `--langs cxx,java`. Bump the
 JVM heap with `--jvm-heap 16g` if java_indexer OOMs on a fat CU.
 
-Output during build looks like:
+Output during build (all on stderr) looks like:
 
 ```
-[from-kzip] running cxx
-[from-kzip]   cxx: entries=1880842 anchors=276617 xrefs=220593 inherits=1998 aliases=0 calls=95884 (wall=3.0s, exit=Some(0))
-[from-kzip] running java
-[from-kzip]   java: entries=…
-[from-kzip] writing — xrefs=… syms=… files=… inhs=… calls=…
-[from-kzip] done in 8.42s → your.s2db (0.07 GB)
+[from-kzip] plan: 18342 CUs to index (5120 skipped: lang=…, path=…)
+[from-kzip]       from-kzip       index   12000/18342 ( 65.4%)  +812.3s
+[heartbeat] +840s done=12410/18342 (886.4/min) snap@=12000 partial=4.71G rss=18.2G indexers=22 delta_rows=83.5M
+[from-kzip] snapshot @ 14000/18342: shard 0007 (14000 shas durable, sinks drained=24/24, busy=0)
+[from-kzip] cxx: CUs=9211 (ok=9050 empty=120 failed=41) entries=… anchors=… xrefs=… inh=… alias=… calls=… types=…
+[from-kzip] java: CUs=8800 (ok=8700 empty=80 failed=20) entries=… …
+[from-kzip] jvm:  CUs=331  (ok=331 empty=0 failed=0) entries=… …
+[from-kzip] final merge: remainder (xrefs=…) + base(yes) + 7 shard(s) — single k-way pass
+[from-kzip] done in 1043.27s → your.s2db (5.10 GB)
 ```
+
+The per-CU **progress** line (`index N/TOTAL (P%)`) updates as workers
+finish CUs. A periodic **`[heartbeat]`** line (every 30 s) reports
+done/total, CU rate, the CU count of the last snapshot, the on-disk
+partial size, process RSS, the count of live indexer subprocesses, and
+the in-RAM `delta_rows`. **`snapshot @ N`** lines mark each delta drain
+to a shard. After all CUs finish, one **per-language summary** line per
+language (`cxx:`/`java:`/`jvm:`/…) reports `CUs=(ok empty failed)` and
+aggregate counts, followed by **`final merge`** and **`done in Ns`**.
+
+## `from-kzip` operational guide
+
+`from-kzip` reads one (possibly multi-language) kzip, routes each CU to
+the right Kythe indexer by its `v_name.language`, ingests every indexer's
+entry stream, and writes a single `.s2db`. The flags:
+
+| flag | what it does |
+|---|---|
+| `--kzip PATH` | the input kzip (required). |
+| `--kythe-root DIR` | the Kythe release dir; indexers are resolved under `DIR/indexers/` (`cxx_indexer`, `go_indexer`, `proto_indexer`, `textproto_indexer`, and the `java_indexer`/`jvm_indexer` jars). Required. |
+| `--langs cxx,java,jvm,go,proto,textproto` | restrict to a subset of languages. Routing is by the CU's language, not by file extension. |
+| `--jvm-heap 8g` | `-Xmx` for the JVM-based indexers; bump it if `java_indexer` OOMs on a fat CU. |
+| `--in SUBSTR` | scope to CUs whose primary source path contains ANY of these substrings (repeatable / comma-separated). `--not-in` is the inverse. |
+| `--workers N` | CUs indexed concurrently. Default is `num_cpus/2` (the JVM indexers carry a 200–300 MB working set, so the default avoids OOM on big runs). |
+| `--snapshot-every N` | drain the in-RAM delta to a shard after this many successful CUs. Default 2000; a coarse durability fallback. 0 disables. |
+| `--snapshot-rows N` | drain whenever the in-RAM delta reaches this many rows (xrefs+inherits+calls+aliases). **This is what bounds peak memory** — a large CU crosses the budget sooner and triggers an earlier drain, so the peak is deterministic regardless of how rows are distributed. Default 250M (≈ a 25 GB delta). 0 disables. Bound memory with this, not with worker count. |
+| `--inject-cu-arg PREFIX::ARG` | prepend `ARG` to the indexer argv of any CU whose primary path starts with `PREFIX` (the `::` is the separator). Repeatable. Example: `'libcore/ojluni/src/main/java/::--patch-module=java.base=libcore/ojluni/src/main/java'` so AOSP libcore ojluni files index against `java.base`. Skipped if the CU's argv already has the arg. |
+| `--resume` | continue a killed run from its on-disk partial state. |
+| `-o, --out PATH` | output `.s2db` (default `scry2.s2db`). |
+
+### On-disk artifacts during a run
+
+A run is checkpointed beside `--out`:
+
+* **`<out>.partial.shard.NNNN.s2db`** — delta shards. Each snapshot drains
+  the workers' in-RAM delta to a fresh numbered shard, so a kill loses at
+  most the rows ingested since the last drain.
+* **`<out>.partial.shas`** — the list of CU shas already folded into the
+  durable state, one per line. The invariant: a sha is never written
+  until its CU's rows are durable, so the shas file never names a CU whose
+  data is missing.
+
+On a clean finish all of these (plus the staging dir) are removed and
+only `<out>` remains.
+
+### Resume
+
+`--resume` loads the partial state, then re-runs only the CUs whose sha is
+**not** already in `<out>.partial.shas` — failed and empty CUs carry no
+sha, so they re-run too. The previously-written shards are re-merged in
+the final pass, so no already-ingested work is repeated. Without
+`--resume` an existing `--out` is rebuilt from scratch.
+
+### Final merge
+
+After every CU finishes, the run does **one k-way streaming pass** over
+(the in-RAM remainder delta + the base partial + every shard). Each source
+is mmap'd and read exactly once, so peak RAM is roughly one output blob
+rather than the whole union. The **trigram substring index is built once**
+over the final alpha-sorted names table at this point — it never
+complicates the per-CU ingest or the merge.
 
 ## Query verbs — by example
 

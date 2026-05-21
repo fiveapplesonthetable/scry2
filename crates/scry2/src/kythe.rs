@@ -725,36 +725,41 @@ fn emit_xref_resolved(
     stats.xrefs_emitted += 1;
 }
 
-/// Find the SHORTEST body anchor that contains `(file, off)` — the
-/// innermost enclosing function. O(log n) into the file's range, then
-/// O(matching-bodies) linear within (which is tiny in practice — a
-/// few nested lambdas at most).
+/// Find the innermost body anchor containing `(file, off)` — the
+/// enclosing function/lambda with the smallest span. O(log n + nesting):
+/// one binary search to the upper bound, then a backward scan that stops
+/// at the first container.
+///
+/// `body_anchors` is sorted by (file_id, start) ascending and Kythe body
+/// anchors are properly nested, so among the containers of a point the
+/// one with the LARGEST start is the most deeply nested == smallest span.
+/// Scanning backwards from the last anchor with (file_id == file &&
+/// start <= off), the first row that also satisfies `end > off` is that
+/// innermost container — return it immediately. Stop the scan once we
+/// leave the file's range (file_id != file or past file_start). This
+/// returns the same sym as a forward smallest-span scan for properly
+/// nested anchors.
 fn innermost_containing(
     body_anchors: &[(u32, u32, u32, u64)],
     file: u32,
     off: u32,
 ) -> Option<u64> {
-    // Binary-search the first row with file_id == `file` AND start >= 0.
-    // We want all rows with file_id == file and start <= off.
-    // body_anchors is sorted by (file_id, start) ascending.
-    let n = body_anchors.len();
-    let file_start = match body_anchors.binary_search_by_key(&(file, 0u32), |(f, s, _, _)| (*f, *s)) {
-        Ok(i) | Err(i) => i,
-    };
-    let mut best: Option<(u32, u64)> = None;  // (span_len, sym)
-    let mut i = file_start;
-    while i < n && body_anchors[i].0 == file {
-        let (_, start, end, sym) = body_anchors[i];
-        if start > off { break; }                  // sorted; rest start later
+    // Upper bound: index just past the last row with (file_id, start)
+    // <= (file, off). Everything in [file_start, upper) has file_id ==
+    // file && start <= off.
+    let upper = body_anchors.partition_point(|(f, s, _, _)| (*f, *s) <= (file, off));
+    // Lower bound for this file: first row with file_id == file.
+    let file_start = body_anchors.partition_point(|(f, _, _, _)| *f < file);
+    let mut i = upper;
+    while i > file_start {
+        i -= 1;
+        let (f, start, end, sym) = body_anchors[i];
+        debug_assert!(f == file && start <= off);
         if end > off {
-            let span = end - start;
-            if best.is_none_or(|(b_span, _)| span < b_span) {
-                best = Some((span, sym));
-            }
+            return Some(sym); // largest start among containers == innermost
         }
-        i += 1;
     }
-    best.map(|(_, sym)| sym)
+    None
 }
 
 fn edge_to_role(kind: &str) -> Option<u8> {
@@ -2584,5 +2589,128 @@ mod tests {
             "def sym's xref was remapped away");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- innermost_containing ----
+
+    /// Brute-force reference: the smallest-span body anchor in `file`
+    /// that contains `off`. Mirrors the pre-optimization forward scan.
+    fn innermost_brute(
+        anchors: &[(u32, u32, u32, u64)], file: u32, off: u32,
+    ) -> Option<u64> {
+        let mut best: Option<(u32, u64)> = None;
+        for &(f, start, end, sym) in anchors {
+            if f == file && start <= off && end > off {
+                let span = end - start;
+                if best.is_none_or(|(b, _)| span < b) {
+                    best = Some((span, sym));
+                }
+            }
+        }
+        best.map(|(_, sym)| sym)
+    }
+
+    #[test]
+    fn innermost_containing_nested_returns_inner() {
+        // Properly-nested outer [0,100) sym=1 and inner [40,60) sym=2,
+        // both in file 7. An offset inside the inner body returns inner.
+        let anchors = vec![(7u32, 0u32, 100u32, 1u64), (7, 40, 60, 2)];
+        assert_eq!(innermost_containing(&anchors, 7, 50), Some(2));
+    }
+
+    #[test]
+    fn innermost_containing_outer_only_returns_outer() {
+        // An offset inside the outer but outside the inner returns outer.
+        let anchors = vec![(7u32, 0u32, 100u32, 1u64), (7, 40, 60, 2)];
+        assert_eq!(innermost_containing(&anchors, 7, 10), Some(1));
+        assert_eq!(innermost_containing(&anchors, 7, 70), Some(1));
+    }
+
+    #[test]
+    fn innermost_containing_flat_siblings_returns_container() {
+        // Flat sibling bodies [0,10) sym=1 and [20,30) sym=2: an offset
+        // returns whichever sibling actually contains it, or None in the
+        // gap between them.
+        let anchors = vec![(3u32, 0u32, 10u32, 1u64), (3, 20, 30, 2)];
+        assert_eq!(innermost_containing(&anchors, 3, 5), Some(1));
+        assert_eq!(innermost_containing(&anchors, 3, 25), Some(2));
+        assert_eq!(innermost_containing(&anchors, 3, 15), None, "gap between siblings");
+    }
+
+    #[test]
+    fn innermost_containing_no_body_returns_none() {
+        let anchors = vec![(1u32, 0u32, 10u32, 1u64), (1, 20, 30, 2)];
+        // Past the last body.
+        assert_eq!(innermost_containing(&anchors, 1, 40), None);
+        // Wrong file entirely.
+        assert_eq!(innermost_containing(&anchors, 9, 5), None);
+        // Empty input.
+        assert_eq!(innermost_containing(&[], 1, 5), None);
+    }
+
+    #[test]
+    fn innermost_containing_picks_correct_file_at_boundary() {
+        // Two files share an offset range. file_start/upper bounds must
+        // keep the scan inside file 5 and not bleed into file 4 or 6.
+        let mut anchors = vec![
+            (4u32, 0u32, 100u32, 10u64),  // file 4 outer
+            (5,    0,    100,    20),      // file 5 outer
+            (5,    30,   70,     21),      // file 5 inner
+            (6,    0,    100,    30),      // file 6 outer
+        ];
+        anchors.sort();
+        assert_eq!(innermost_containing(&anchors, 5, 50), Some(21));
+        assert_eq!(innermost_containing(&anchors, 5, 10), Some(20));
+        assert_eq!(innermost_containing(&anchors, 4, 50), Some(10));
+        assert_eq!(innermost_containing(&anchors, 6, 50), Some(30));
+    }
+
+    #[test]
+    fn innermost_containing_agrees_with_brute_force_random() {
+        // Deterministic xorshift PRNG — no external crates. Generate
+        // many small, properly-nested fixtures and assert the optimized
+        // fn agrees with the brute-force smallest-span reference at every
+        // offset, for every file (including out-of-range files).
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..400 {
+            let n_files = 1 + (rng() % 3) as u32;
+            let mut anchors: Vec<(u32, u32, u32, u64)> = Vec::new();
+            let mut sym: u64 = 1;
+            for file in 0..n_files {
+                // Build a properly-nested stack of bodies in this file by
+                // shrinking [lo, hi) inward at each level.
+                let depth = (rng() % 5) as u32; // 0..=4 nested levels
+                let mut lo = (rng() % 20) as u32;
+                let mut hi = lo + 20 + (rng() % 60) as u32;
+                for _ in 0..depth {
+                    if hi <= lo + 2 { break; }
+                    anchors.push((file, lo, hi, sym));
+                    sym += 1;
+                    let half = u64::from((hi - lo) / 2).max(1);
+                    let shrink_l = 1 + (rng() % half) as u32;
+                    let shrink_r = 1 + (rng() % half) as u32;
+                    lo += shrink_l;
+                    hi = hi.saturating_sub(shrink_r);
+                }
+            }
+            anchors.sort();
+            // Query every file id 0..=n_files (n_files is intentionally
+            // out of range) across a sweep of offsets.
+            for file in 0..=n_files {
+                for off in 0..120u32 {
+                    assert_eq!(
+                        innermost_containing(&anchors, file, off),
+                        innermost_brute(&anchors, file, off),
+                        "mismatch file={file} off={off} anchors={anchors:?}",
+                    );
+                }
+            }
+        }
     }
 }

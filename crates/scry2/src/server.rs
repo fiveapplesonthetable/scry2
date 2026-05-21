@@ -205,11 +205,15 @@ pub fn dispatch(ix: &Index, req: &Request) -> Reply {
     }
 }
 
-/// Symbol-set cap for `ref`/`callers --substr`: gather edges across this
-/// many name matches before relying on `max_hits` to bound the output.
-/// Large enough that an ambiguous leaf (`clearCallingIdentity`) still
-/// reaches the definition that actually carries the edges.
-const SUBSTR_AGG_CAP: usize = 4096;
+/// Symbol-set cap for `ref`/`callers --substr`. The scan stops after this
+/// many name matches and edges are gathered only across them, so the cost
+/// is bounded no matter how broad the substring is — gathering callers of
+/// thousands of symbols is both slow (the 11-34s cliff) and meaningless.
+/// 64 still reaches the carrier for a realistically-ambiguous leaf
+/// (`clearCallingIdentity` → 12 variants); a broader match returns a fast
+/// partial with `truncated` set, signalling "narrow it / use exact FQN".
+/// `--limit N` above 64 raises the cap for callers who want more.
+const SUBSTR_AGG_CAP: usize = 64;
 
 #[allow(clippy::too_many_arguments)]
 fn do_xrefs(
@@ -366,13 +370,12 @@ fn do_members(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
 
 fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
           filt: PathFilter<'_>) -> Reply {
-    // super/sub relate TYPES; a substring also matches type-application
-    // syms (`const(T)`, `T&`) and same-named members. Keep only type-kind
-    // roots so the result isn't polluted by non-type matches.
+    // No kind filter: `inh` holds method `overrides` as well as type
+    // `extends`, so `super`/`sub` must work on a method (what it overrides /
+    // what overrides it) — not just a type. Filtering roots to kind==TYPE
+    // silently dropped every override query.
     let syms: Vec<u64> = if substr {
-        ix.syms_matching_substring(name, limit).into_iter()
-            .filter(|&s| ix.sym_meta(s).is_some_and(|(_, k, _)| k == kind::TYPE))
-            .collect()
+        ix.syms_matching_substring(name, limit)
     } else {
         ix.syms_for_name(name)
     };
@@ -504,12 +507,9 @@ fn do_inheritance(
     filt: PathFilter<'_>,
 ) -> Reply {
     let roots: Vec<u64> = if substr {
-        // A hierarchy roots on TYPES. A substring also matches the
-        // type-application syms (`const(T)`, `T&`, `T&&`) and same-named
-        // members/ctors/dtors; keep only type-kind syms as roots.
-        ix.syms_matching_substring(name, root_limit).into_iter()
-            .filter(|&s| ix.sym_meta(s).is_some_and(|(_, k, _)| k == kind::TYPE))
-            .collect()
+        // No kind filter: walking `inh`/`inhrev` covers method `overrides`
+        // as well as type `extends`, so a method root is legitimate.
+        ix.syms_matching_substring(name, root_limit)
     } else {
         ix.syms_for_name(name)
     };

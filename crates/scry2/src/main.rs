@@ -219,7 +219,9 @@ enum Cmd {
         #[arg(long, value_parser = ["up", "down", "both"], default_value = "up")]
         direction: String,
         #[arg(long, default_value = "3")] depth: usize,
-        #[arg(long, default_value = "200")] max_syms: usize,
+        /// Cap on total nodes in the forest. `--limit` is accepted as an
+        /// alias for consistency with def/ref/callers.
+        #[arg(long, visible_alias = "limit", default_value = "200")] max_syms: usize,
         /// Match `name` as a substring; every match seeds the BFS as
         /// a separate root in the output forest. parent=None marks
         /// each root; ids are unique across the whole reply.
@@ -247,7 +249,9 @@ enum Cmd {
         #[arg(long, value_parser = ["up", "down", "both"], default_value = "up")]
         direction: String,
         #[arg(long, default_value = "3")] depth: usize,
-        #[arg(long, default_value = "200")] max_syms: usize,
+        /// Cap on total nodes in the forest. `--limit` is accepted as an
+        /// alias for consistency with def/ref/callers.
+        #[arg(long, visible_alias = "limit", default_value = "200")] max_syms: usize,
         /// Match `name` as a substring; every match seeds the BFS as a
         /// separate root in the output forest.
         #[arg(long)] substr: bool,

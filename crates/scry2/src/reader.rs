@@ -419,6 +419,8 @@ impl Index {
     /// same edges as `inh`, reversed to (parent, child)), then walk the
     /// contiguous range. Mirrors `called_by` over `crev`.
     pub fn inherited_by(&self, parent: u64) -> Vec<u64> {
+        // O(log n) via the by-parent `inhrev` table (every index is v4 here;
+        // dev mode, no v3 fallback).
         let inhrev = self.inhrev_slice();
         let n = self.hdr.inhrev_n as usize;
         let p_be = parent.to_be_bytes();

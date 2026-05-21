@@ -425,29 +425,29 @@ fn tilde_expansion_on_index_path() {
 // Cleanup is best-effort via tmpdir naming; the test process owns the dir.
 
 #[test]
-fn inheritance_substr_roots_filter_to_types() {
-    // `--substr` resolves a substring to MANY syms; an inheritance/hierarchy
-    // query must root only on TYPES, not same-named functions or the
-    // type-application syms (`const(T)`, `T&`) a substring also matches.
+fn super_sub_work_on_method_overrides_not_just_types() {
+    // `inh` carries method `overrides` as well as type `extends`. Regression
+    // guard: super/sub must resolve a method's override edge — a kind filter
+    // that kept only TYPE roots silently dropped every override query.
     let tid: String = format!("{:?}", std::thread::current().id())
         .chars().filter(|c| c.is_ascii_digit()).collect();
-    let dir = std::env::temp_dir().join(format!("scry2-cli-inh-{}-{}", std::process::id(), tid));
+    let dir = std::env::temp_dir().join(format!("scry2-cli-ovr-{}-{}", std::process::id(), tid));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let s2db = dir.join("inh.s2db");
+    let s2db = dir.join("ovr.s2db");
     let mut b = IndexBuilder::new();
-    let base = sym_of("z.Shape");            // TYPE
-    let imp  = sym_of("z.ShapeImpl");        // TYPE, extends base
-    let func = sym_of("z.ShapeHelper.run");  // FUNCTION, also contains "Shape"
-    b.upsert_sym(base, kind::TYPE,     lang::JAVA, "z.Shape");
-    b.upsert_sym(imp,  kind::TYPE,     lang::JAVA, "z.ShapeImpl");
-    b.upsert_sym(func, kind::FUNCTION, lang::JAVA, "z.ShapeHelper.run");
-    b.add_inherit(imp, base);                // ShapeImpl extends Shape
+    let parent = sym_of("p.Base.run");   // FUNCTION, overridden
+    let child  = sym_of("p.Impl.run");   // FUNCTION, the override
+    b.upsert_sym(parent, kind::FUNCTION, lang::JAVA, "p.Base.run");
+    b.upsert_sym(child,  kind::FUNCTION, lang::JAVA, "p.Impl.run");
+    b.add_inherit(child, parent);        // Impl.run overrides Base.run
     b.finish(&s2db).unwrap();
-    let v = run(&s2db, &["inheritance", "Shape", "--substr", "--direction", "down"]);
-    let dump = v.to_string();
-    assert!(dump.contains("z.Shape"), "a type root should be present: {dump}");
-    assert!(!dump.contains("ShapeHelper"), "non-type leaked as a root: {dump}");
+    // super(child) → what it overrides (inherits_of → inh).
+    let up = run(&s2db, &["super", "p.Impl.run"]);
+    assert!(up.to_string().contains("p.Base.run"), "super on a method override missing: {up}");
+    // sub(parent) → what overrides it (inherited_by → inhrev).
+    let down = run(&s2db, &["sub", "p.Base.run"]);
+    assert!(down.to_string().contains("p.Impl.run"), "sub on a method override missing: {down}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

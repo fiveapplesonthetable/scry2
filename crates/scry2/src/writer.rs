@@ -451,15 +451,6 @@ impl IndexBuilder {
             w.write_all(&sym.to_be_bytes())?;
         }
 
-        // ---- 7b. Trigram index over the names just written. `by_name` is
-        // in its final on-disk order, so each row's index is its
-        // name-row-id. The name `(off, len)` slices point into the region
-        // of `blob` written by the syms+aliases passes, which is fully
-        // present now — `blob` only grows from here (files/typed/sig
-        // strings append after), never moves, so those offsets stay valid.
-        // We build the dict/postings bytes now (while `by_name` is alive)
-        // and write them to the file at the very end, after the blob.
-        let (trigram_dict, trigram_post) = build_trigram_index(&by_name, &blob);
         drop(by_name);
 
         // ---- 8. files (write + count + append paths to blob) ----
@@ -623,18 +614,6 @@ impl IndexBuilder {
         let blob_len = blob.len() as u64;
         drop(blob);
 
-        // ---- 12b. Trigram index (dict + postings), appended after the
-        // blob — same trailing placement as `finish`. The bytes were built
-        // above from the final names table; we only place + write them now.
-        let trigram_dict_off = pad_up(blob_off + blob_len);
-        let trigram_dict_n   = (trigram_dict.len() / TRIGRAM_LEN) as u64;
-        let trigram_post_off = pad_up(trigram_dict_off + trigram_dict.len() as u64);
-        let trigram_post_len = trigram_post.len() as u64;
-        seek_to(&mut w, trigram_dict_off)?;
-        w.write_all(&trigram_dict)?;
-        seek_to(&mut w, trigram_post_off)?;
-        w.write_all(&trigram_post)?;
-
         // ---- 13. Header (seek back to byte 0, write final counts) ----
         let hdr = Header {
             magic: MAGIC, version: VERSION,
@@ -650,19 +629,19 @@ impl IndexBuilder {
             childrev_off, childrev_n: n_childrev,
             sig_off,   sig_n:   n_sig,
             blob_off,  blob_len,
-            trigram_dict_off, trigram_dict_n,
-            trigram_post_off, trigram_post_len,
             ..Default::default()
         };
         seek_to(&mut w, 0)?;
         write_header(&mut w, &hdr)?;
 
-        let total = trigram_post_off + trigram_post_len;
+        let total = blob_off + blob_len;
         w.flush()?;
-        // Force the file to cover every declared (page-aligned) section,
-        // including empty trailing trigram sections — see the matching note
-        // in `finish`. Without this an index with no name >= 3 bytes ends
-        // before its own `trigram_post_off` and fails to reopen.
+        // Force the file to cover every declared (page-aligned) section.
+        // A trailing section can be empty (e.g. an index whose last
+        // sections wrote no bytes), in which case the final `write_all`
+        // materializes nothing past its offset and the file would end
+        // before that offset, failing `Index::open`'s bounds check. Set
+        // the length explicitly so the file always covers every section.
         w.get_mut().set_len(total).context("set_len")?;
         w.get_mut().sync_all().context("fsync")?;
         drop(w);
@@ -847,18 +826,6 @@ impl IndexBuilder {
         let sig_off   = pad_up(childrev_off + n_childrev * INH_LEN as u64);
         let blob_off  = pad_up(sig_off   + n_sig   * TYPE_LEN as u64);
 
-        // ---- 5b. Trigram index over the final alpha-sorted names table.
-        // Built here (post-sort, pre-write) because `by_name` is already
-        // in its final on-disk order, so each row's index IS its
-        // name-row-id. The two parts are appended after the blob (the
-        // existing trailing section), mirroring how every other section is
-        // tacked on at the end.
-        let (trigram_dict, trigram_post) = build_trigram_index(&by_name, &blob);
-        let trigram_dict_off = pad_up(blob_off + blob.len() as u64);
-        let trigram_dict_n   = (trigram_dict.len() / TRIGRAM_LEN) as u64;
-        let trigram_post_off = pad_up(trigram_dict_off + trigram_dict.len() as u64);
-        let trigram_post_len = trigram_post.len() as u64;
-
         // ---- 6. Write to a tempfile, then atomic rename ----
         // pid-suffixed so concurrent writers never collide on the tmp.
         let tmp_path: PathBuf = path.with_extension(format!("s2db.tmp.{}", std::process::id()));
@@ -880,8 +847,6 @@ impl IndexBuilder {
             childrev_off, childrev_n: n_childrev,
             sig_off,   sig_n:   n_sig,
             blob_off,  blob_len: blob.len() as u64,
-            trigram_dict_off, trigram_dict_n,
-            trigram_post_off, trigram_post_len,
             ..Default::default()
         };
         write_header(&mut w, &hdr)?;
@@ -974,21 +939,15 @@ impl IndexBuilder {
         seek_to(&mut w, blob_off)?;
         w.write_all(&blob)?;
 
-        // Trigram index: dict then postings, both appended after the blob.
-        seek_to(&mut w, trigram_dict_off)?;
-        w.write_all(&trigram_dict)?;
-        seek_to(&mut w, trigram_post_off)?;
-        w.write_all(&trigram_post)?;
-
-        let total = trigram_post_off + trigram_post_len;
+        let total = blob_off + blob.len() as u64;
         w.flush()?;
         // The header records page-aligned section offsets up to `total`.
-        // When the trailing trigram sections are empty (no name >= 3 bytes
-        // → empty dict + empty postings), the last `write_all` materializes
-        // no bytes past the blob, so the file would end before
-        // `trigram_post_off` and `Index::open`'s bounds check would reject
-        // its own header. Set the length explicitly so the file always
-        // covers every declared section, empty trailers included.
+        // When a trailing section is empty (e.g. a tiny index with no
+        // typed/sig rows), its `write_all` materializes no bytes past its
+        // offset, so the file could end before a later section's offset and
+        // `Index::open`'s bounds check would reject its own header. Set the
+        // length explicitly so the file always covers every declared
+        // section, empty trailers included.
         w.get_mut().set_len(total).context("set_len")?;
         w.get_mut().sync_all().context("fsync")?;
         drop(w);
@@ -1290,91 +1249,6 @@ where
         }
     }
     Iter { a: a.peekable(), b: b.peekable() }
-}
-
-/// Build the trigram substring index over the FINAL alpha-sorted names
-/// table. `by_name` is the names section as written — `(name_off,
-/// name_len, sym)` per row, in the exact order the rows hit disk — so a
-/// name-row-id IS the index into `by_name` (and into the on-disk names
-/// table). `blob` holds the name bytes those `(off, len)` slices point at.
-///
-/// Returns `(dict_bytes, postings_bytes)`, ready to append to the file:
-///   * `dict_bytes`  — TrigramRow rows sorted ascending by trigram.
-///   * `postings_bytes` — for each dict row, `post_count` u32 (LE)
-///     name-row-ids, ascending, concatenated in dict order.
-///
-/// Case-INSENSITIVE candidate filter: trigrams are extracted from each
-/// name's ASCII-lowercased bytes, so the index is a case-folded shortlist
-/// generator, NOT the final answer. The reader VERIFIES case per-query
-/// against the raw name bytes — so this one index serves both the
-/// case-sensitive default (`--substr`, verify raw bytes) and an opt-in
-/// case-insensitive search (`--substr --ignore-case`, verify lowercased),
-/// both at trigram speed. Names shorter than 3 bytes contribute no
-/// trigrams (and so are only reachable via the reader's <3-byte linear
-/// fallback).
-///
-/// Memory: this holds every posting list in RAM at once (a
-/// `HashMap<[u8;3], Vec<u32>>`, ~20 GB at AOSP scale). That is acceptable
-/// because it runs ONCE post-merge, after the merge's own large
-/// structures (the prior shards' iterators, the delta tables) are gone.
-/// Iterating `by_name` in increasing row-id order means every posting
-/// list is appended in ascending order, so no per-list sort is needed —
-/// only the dict's keys are sorted at the end.
-fn build_trigram_index(by_name: &[(u64, u16, u64)], blob: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    use std::collections::HashMap;
-    let mut posts: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
-    // A name longer than u32::MAX rows can't be addressed by a u32 id;
-    // the names table never approaches that (u32 ~= 4.3B, AOSP ~= 92M), so
-    // a row-id past u32 means a corrupt build — skip rather than wrap.
-    for (row_id, (off, len, _sym)) in by_name.iter().enumerate() {
-        if row_id > u32::MAX as usize { break; }
-        let row_id = row_id as u32;
-        let s = &blob[*off as usize..*off as usize + *len as usize];
-        if s.len() < 3 { continue; }
-        // ASCII-lowercase the name before windowing: the index is a
-        // case-INSENSITIVE candidate filter (the reader verifies case per
-        // query). Building lowercased trigrams is what lets one index back
-        // both a case-sensitive default and an opt-in `--ignore-case`.
-        let lower: Vec<u8> = s.iter().map(|b| b.to_ascii_lowercase()).collect();
-        // Slide a 3-byte window over the lowercased name bytes. Distinct
-        // trigrams only: a name like "aaaa" must append its row-id to "aaa"
-        // exactly once, else the posting list carries duplicate ids and the
-        // reader's intersection/verify does wasted work. `last` dedups the
-        // common case (consecutive identical windows) cheaply; a per-name
-        // HashSet would dominate build time.
-        let mut last: Option<[u8; 3]> = None;
-        for w in lower.windows(3) {
-            let tri = [w[0], w[1], w[2]];
-            if last == Some(tri) { continue; }
-            last = Some(tri);
-            let list = posts.entry(tri).or_default();
-            // Because row_id increases monotonically across the outer
-            // loop, a list's ids are already ascending; the only possible
-            // duplicate is the SAME row_id appended twice for a trigram
-            // that recurs non-consecutively in this name (e.g. "abXab" for
-            // "ab?"). Guard the tail to keep each list strictly ascending
-            // and duplicate-free.
-            if list.last() != Some(&row_id) { list.push(row_id); }
-        }
-    }
-    // Emit dict sorted by trigram + postings concatenated in dict order.
-    let mut keys: Vec<[u8; 3]> = posts.keys().copied().collect();
-    keys.sort_unstable();
-    let mut dict = Vec::with_capacity(keys.len() * TRIGRAM_LEN);
-    let mut postings = Vec::with_capacity(by_name.len() * 4);
-    for tri in &keys {
-        let list = &posts[tri];
-        let post_off = postings.len() as u64;
-        let post_count = list.len() as u32;
-        dict.extend_from_slice(tri);
-        dict.push(0u8); // _pad
-        dict.extend_from_slice(&post_off.to_be_bytes());
-        dict.extend_from_slice(&post_count.to_be_bytes());
-        for id in list {
-            postings.extend_from_slice(&id.to_le_bytes());
-        }
-    }
-    (dict, postings)
 }
 
 fn size_of_header() -> usize { std::mem::size_of::<Header>() }

@@ -38,7 +38,7 @@ impl Index {
         // query or the final merge's shard re-read. Checked arithmetic so
         // a corrupt header can't overflow into a spurious in-range end.
         let map_len = map.len() as u64;
-        let sections: [(&str, u64, u64, u64); 14] = [
+        let sections: [(&str, u64, u64, u64); 12] = [
             ("xrefs",    hdr.xrefs_off,    hdr.xrefs_n,    XREF_LEN as u64),
             ("syms",     hdr.syms_off,     hdr.syms_n,     SYM_LEN  as u64),
             ("names",    hdr.names_off,    hdr.names_n,    NAME_LEN as u64),
@@ -50,10 +50,6 @@ impl Index {
             ("childrev", hdr.childrev_off, hdr.childrev_n, INH_LEN  as u64),
             ("inhrev",   hdr.inhrev_off,   hdr.inhrev_n,   INH_LEN  as u64),
             ("sig",      hdr.sig_off,      hdr.sig_n,      TYPE_LEN as u64),
-            // Trigram dict counts rows (TRIGRAM_LEN each); postings is a
-            // flat byte run (stride 1) of LE u32 ids.
-            ("trigram_dict", hdr.trigram_dict_off, hdr.trigram_dict_n, TRIGRAM_LEN as u64),
-            ("trigram_post", hdr.trigram_post_off, hdr.trigram_post_len, 1),
             ("blob",     hdr.blob_off,     hdr.blob_len,   1),
         ];
         for (name, off, n, stride) in sections {
@@ -77,9 +73,6 @@ impl Index {
     pub fn n_inhrev(&self) -> u64 { self.hdr.inhrev_n }
     pub fn n_childrev(&self) -> u64 { self.hdr.childrev_n }
     pub fn n_sig(&self) -> u64 { self.hdr.sig_n }
-    /// Number of distinct trigrams in the v5 substring index (0 if the
-    /// names table was empty or had no name >= 3 bytes).
-    pub fn n_trigram_dict(&self) -> u64 { self.hdr.trigram_dict_n }
 
     // -- raw section slices --------------------------------------------------
 
@@ -136,16 +129,6 @@ impl Index {
     fn sig_slice(&self) -> &[u8] {
         let off = self.hdr.sig_off as usize;
         let len = self.hdr.sig_n as usize * TYPE_LEN;
-        &self.map[off..off + len]
-    }
-    fn trigram_dict_slice(&self) -> &[u8] {
-        let off = self.hdr.trigram_dict_off as usize;
-        let len = self.hdr.trigram_dict_n as usize * TRIGRAM_LEN;
-        &self.map[off..off + len]
-    }
-    fn trigram_post_slice(&self) -> &[u8] {
-        let off = self.hdr.trigram_post_off as usize;
-        let len = self.hdr.trigram_post_len as usize;
         &self.map[off..off + len]
     }
     fn blob(&self) -> &[u8] {
@@ -263,188 +246,35 @@ impl Index {
         out
     }
 
-    /// Read the name-row at `row_id` (an index into the alpha-sorted names
-    /// table) as `(blob_slice, sym)`. Row layout: name_off u64 BE,
-    /// name_len u16 BE, sym u64 BE. Used by the trigram path to verify a
-    /// candidate and recover its sym.
-    fn name_row<'a>(&self, names: &[u8], blob: &'a [u8], row_id: u32) -> (&'a [u8], u64) {
-        let row_off = row_id as usize * NAME_LEN;
-        let off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap()) as usize;
-        let len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap()) as usize;
-        let sym = u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap());
-        (&blob[off..off + len], sym)
-    }
-
-    /// Look up `tri` in the trigram dictionary (sorted ascending by the
-    /// 3-byte key), returning its `(post_off_bytes, post_count)` posting
-    /// slot, or None if absent. Binary search over the 3-byte key only.
-    fn trigram_lookup(&self, dict: &[u8], tri: [u8; 3]) -> Option<(usize, usize)> {
-        let n = self.hdr.trigram_dict_n as usize;
-        let (mut lo, mut hi) = (0usize, n);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let row = mid * TRIGRAM_LEN;
-            let key: [u8; 3] = dict[row..row + 3].try_into().unwrap();
-            match key.cmp(&tri) {
-                std::cmp::Ordering::Less    => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal   => {
-                    // Layout: trigram[3] + _pad[1] + post_off u64 BE + post_count u32 BE.
-                    let post_off = u64::from_be_bytes(dict[row + 4..row + 12].try_into().unwrap()) as usize;
-                    let post_count = u32::from_be_bytes(dict[row + 12..row + 16].try_into().unwrap()) as usize;
-                    return Some((post_off, post_count));
-                }
-            }
-        }
-        None
-    }
-
-    /// Read a trigram's posting list (LE u32 name-row-ids, ascending) at
-    /// `(post_off_bytes, post_count)` into a Vec.
-    fn trigram_postings(&self, post: &[u8], post_off: usize, post_count: usize) -> Vec<u32> {
-        let mut out = Vec::with_capacity(post_count);
-        for i in 0..post_count {
-            let b = post_off + i * 4;
-            out.push(u32::from_le_bytes(post[b..b + 4].try_into().unwrap()));
-        }
-        out
-    }
-
     /// Return all syms whose qualified name contains `needle` as a
     /// CASE-SENSITIVE substring, up to `limit`. The default `--substr`
-    /// path — see `syms_matching_substring_impl` for the mechanism. For an
-    /// opt-in case-insensitive search use `syms_matching_substring_ci`.
+    /// path — a parallel linear scan over the names table. For an opt-in
+    /// case-insensitive search use `syms_matching_substring_ci`.
     pub fn syms_matching_substring(&self, needle: &str, limit: usize) -> Vec<u64> {
-        self.syms_matching_substring_impl(needle, limit, /*ignore_case=*/false)
+        self.syms_matching_substring_linear(needle.as_bytes(), limit, /*ignore_case=*/false)
     }
 
     /// Return all syms whose qualified name contains `needle` as a
     /// CASE-INSENSITIVE (ASCII-folded) substring, up to `limit`. The opt-in
-    /// `--substr --ignore-case` path. Runs at the same trigram speed as the
-    /// case-sensitive default — the index is a case-folded candidate filter
-    /// either way; only the per-candidate verify differs.
+    /// `--substr --ignore-case` path. Same parallel linear scan as the
+    /// case-sensitive default; only the per-row verify differs (the needle
+    /// and each candidate are ASCII-lowercased before the substring check).
     pub fn syms_matching_substring_ci(&self, needle: &str, limit: usize) -> Vec<u64> {
-        self.syms_matching_substring_impl(needle, limit, /*ignore_case=*/true)
+        self.syms_matching_substring_linear(needle.as_bytes(), limit, /*ignore_case=*/true)
     }
 
-    /// Shared substring engine for the case-sensitive default and the
-    /// opt-in case-insensitive search. The trigram index is a CASE-FOLDED
-    /// candidate filter (it was built from each name's lowercased bytes);
-    /// `ignore_case` decides only how each surviving candidate is VERIFIED.
-    ///
-    /// Fast path (the common case): when the v5 trigram index is present
-    /// and `needle` has at least 3 bytes, intersect the posting lists of
-    /// the needle's distinct LOWERCASED trigrams (the dict is lowercased).
-    /// The intersection is a NECESSARY but not sufficient condition — a
-    /// name can hold all of the needle's trigrams without holding the
-    /// needle contiguously (e.g. "abcZZbcd" has both "abc" and "bcd" but
-    /// not "abcd") — so each surviving candidate is verified with a real
-    /// substring check before its sym is collected: case-sensitive on the
-    /// RAW bytes when `!ignore_case`, case-folded when `ignore_case`. This
-    /// turns a ~92M-row linear scan into a few small list intersections
-    /// plus a handful of verifications: sub-millisecond on realistic
-    /// substrings, regardless of the case mode.
-    ///
-    /// Fallback path: a needle shorter than 3 bytes has no trigram, and an
-    /// index built before v5 (or with an empty names table) has no dict —
-    /// in both cases we keep the parallel linear scan, so behaviour is
-    /// never worse than before.
-    ///
-    /// Result semantics match the prior linear scan: the same set of syms
-    /// (deduped), capped at `limit`. Order may differ — the trigram path
-    /// visits candidates in name-row-id order of the smallest posting
-    /// list, not whole-table order — which the callers already tolerate.
-    fn syms_matching_substring_impl(&self, needle: &str, limit: usize, ignore_case: bool) -> Vec<u64> {
-        let n = self.hdr.names_n as usize;
-        let nb = needle.as_bytes();
-        if nb.is_empty() || n == 0 || limit == 0 { return Vec::new(); }
-
-        // Trigram fast path: 3+ byte needle AND a non-empty dict.
-        if nb.len() >= 3 && self.hdr.trigram_dict_n > 0 {
-            return self.syms_matching_substring_trigram(needle, limit, ignore_case);
-        }
-        self.syms_matching_substring_linear(nb, limit, ignore_case)
-    }
-
-    /// Trigram-accelerated substring search. See `syms_matching_substring_impl`.
-    fn syms_matching_substring_trigram(&self, needle: &str, limit: usize, ignore_case: bool) -> Vec<u64> {
-        let names = self.names_slice();
-        let blob = self.blob();
-        let dict = self.trigram_dict_slice();
-        let post = self.trigram_post_slice();
-
-        // Distinct trigrams of the needle, ALWAYS lowercased to match the
-        // case-folded build side (the dict holds lowercased trigrams). A
-        // trigram absent from the dict means NO name contains it (in any
-        // case), so no name can contain the needle → empty result.
-        let lower_needle: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
-        let mut tris: Vec<[u8; 3]> = lower_needle.windows(3)
-            .map(|w| [w[0], w[1], w[2]]).collect();
-        tris.sort_unstable();
-        tris.dedup();
-
-        // Gather each trigram's posting list. Bail to empty the moment any
-        // trigram is missing (necessary condition fails for every name).
-        let mut lists: Vec<Vec<u32>> = Vec::with_capacity(tris.len());
-        for tri in tris {
-            match self.trigram_lookup(dict, tri) {
-                Some((off, count)) => lists.push(self.trigram_postings(post, off, count)),
-                None => return Vec::new(),
-            }
-        }
-        if lists.is_empty() {
-            // Shouldn't happen (needle.len() >= 3 yields >= 1 window), but
-            // be safe rather than index an empty Vec below.
-            return self.syms_matching_substring_linear(needle.as_bytes(), limit, ignore_case);
-        }
-
-        // k-way sorted intersection, smallest list first so we probe the
-        // fewest candidates. Each list is ascending and duplicate-free, so
-        // the intersection is a simple "present in every other list" check
-        // via binary search.
-        lists.sort_unstable_by_key(|l| l.len());
-        let (smallest, rest) = lists.split_first().unwrap();
-
-        // Substring verify: trigram intersection is necessary-not-sufficient
-        // (a name can hold every needle trigram without the contiguous
-        // needle), so confirm each candidate actually contains it. The
-        // verify decides case: case-sensitive search of the RAW needle in
-        // the RAW name when `!ignore_case`; case-folded search of the
-        // lowercased needle in the lowercased candidate when `ignore_case`.
-        let verify_needle: &[u8] = if ignore_case { &lower_needle } else { needle.as_bytes() };
-        let nfind = memchr::memmem::Finder::new(verify_needle);
-        let mut out = Vec::with_capacity(limit.min(64));
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for &cand in smallest {
-            // Candidate must appear in every other (larger) posting list.
-            let in_all = rest.iter().all(|l| l.binary_search(&cand).is_ok());
-            if !in_all { continue; }
-            let (name, sym) = self.name_row(names, blob, cand);
-            let hit = if ignore_case {
-                let lower_name: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
-                nfind.find(&lower_name).is_some()
-            } else {
-                nfind.find(name).is_some()
-            };
-            if hit && seen.insert(sym) {
-                out.push(sym);
-                if out.len() >= limit { break; }
-            }
-        }
-        out
-    }
-
-    /// Parallel linear scan over the whole name table — the fallback when
-    /// the needle is shorter than a trigram or no trigram index exists.
-    /// The verify mirrors the trigram path: case-sensitive on the raw bytes
-    /// when `!ignore_case`, case-folded when `ignore_case`. Splits the
-    /// table across cores; each thread keeps the first `limit` matches in
-    /// its contiguous range and the parts are concatenated in row order
-    /// then truncated, so the result is the first-`limit` set a serial scan
-    /// would return.
+    /// Parallel linear scan over the whole name table — the single
+    /// `--substr` path. The verify is case-sensitive on the raw bytes when
+    /// `!ignore_case`, case-folded (needle + candidate ASCII-lowercased)
+    /// when `ignore_case`. Splits the table across cores; each thread keeps
+    /// the first `limit` matches in its contiguous range and the parts are
+    /// concatenated in row order then truncated, so the result is the
+    /// first-`limit` set a serial scan would return. The caller's
+    /// per-call cap (`limit`) bounds the work that survives into the
+    /// `ref`/`callers --substr` aggregation.
     fn syms_matching_substring_linear(&self, nb: &[u8], limit: usize, ignore_case: bool) -> Vec<u64> {
         let n = self.hdr.names_n as usize;
-        if nb.is_empty() || n == 0 { return Vec::new(); }
+        if nb.is_empty() || n == 0 || limit == 0 { return Vec::new(); }
         let names = self.names_slice();
         let blob = self.blob();
         // The finder holds the needle as searched: lowercased when folding

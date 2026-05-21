@@ -35,18 +35,15 @@
 use std::mem::size_of;
 
 pub const MAGIC: [u8; 8]   = *b"S2DBv2\0\0";
-/// v5 adds the trigram substring index (two appended sections: a
-/// trigram dictionary and a postings blob). Its offsets are carved from
-/// the header's former `_reserved` bytes. Dev mode is strict: there is
-/// NO backward compat — `Index::open` accepts exactly version 5 (a v5
-/// reader rejects a v4 file). This is intentional: the trigram path is
-/// load-bearing for `--substr` latency and an index without it would
-/// silently fall back to the slow linear scan, which we don't want to
-/// ship unnoticed.
-pub const VERSION: u32     = 5;
+/// v4 is the comprehension-layer format: xrefs/syms/names/files plus the
+/// inheritance, callgraph, type, membership and signature sections. Dev
+/// mode is strict: there is NO backward compat — `Index::open` accepts
+/// exactly version 4. `--substr` is served by a parallel linear scan over
+/// the names table, so no auxiliary substring section is on disk.
+pub const VERSION: u32     = 4;
 /// Lowest on-disk version this reader understands. Equal to VERSION:
-/// strict single-version, no v3/v4 fallback.
-pub const MIN_VERSION: u32 = 5;
+/// strict single-version, no older-format fallback.
+pub const MIN_VERSION: u32 = 4;
 pub const PAGE: usize      = 4096;
 
 /// File header — first 256 bytes. Numbers count rows, *not* bytes.
@@ -81,7 +78,7 @@ pub struct Header {
     pub blob_off:     u64,
     pub blob_len:     u64,
 
-    // ---- v4 comprehension layer (zero in a v3 file) ----
+    // ---- comprehension layer ----
     pub typed_off:    u64,    // (sym, type-string blob ref) sorted by sym — resolved type of a sym
     pub typed_n:      u64,
     pub childrev_off: u64,    // (parent, child) reverse childof — `members NAME`
@@ -91,21 +88,7 @@ pub struct Header {
     pub sig_off:      u64,    // (sym, signature blob ref) sorted by sym — full rendered signature
     pub sig_n:        u64,
 
-    // ---- v5 trigram substring index ----
-    // Built ONCE post-merge over the final alpha-sorted names table, so it
-    // never complicates the k-way merge. Two parts:
-    //   trigram_dict: array of TrigramRow (TRIGRAM_LEN bytes) sorted
-    //     ascending by the 3-byte trigram, binary-searchable. `_off` is a
-    //     byte offset, `_n` a ROW count.
-    //   trigram_post: a flat blob of u32 (LE) name-row-ids. `_off` is a
-    //     byte offset, `_len` a BYTE length. Each dict row points at a
-    //     contiguous, ascending run of `postings_count` ids within it.
-    pub trigram_dict_off: u64,
-    pub trigram_dict_n:   u64,   // row count (TrigramRow rows)
-    pub trigram_post_off: u64,
-    pub trigram_post_len: u64,   // byte length of the postings blob
-
-    pub _reserved:    [u8; 256 - 8 - 4 - 4 - 8*28],
+    pub _reserved:    [u8; 256 - 8 - 4 - 4 - 8*24],
 }
 
 impl Default for Header {
@@ -124,9 +107,7 @@ impl Default for Header {
             childrev_off: 0, childrev_n: 0,
             inhrev_off: 0, inhrev_n: 0,
             sig_off:   0, sig_n:   0,
-            trigram_dict_off: 0, trigram_dict_n: 0,
-            trigram_post_off: 0, trigram_post_len: 0,
-            _reserved: [0; 256 - 8 - 4 - 4 - 8*28],
+            _reserved: [0; 256 - 8 - 4 - 4 - 8*24],
         }
     }
 }
@@ -259,27 +240,6 @@ pub struct TypeRow {
 }
 pub const TYPE_LEN: usize = 18;
 const _: () = assert!(size_of::<TypeRow>() == TYPE_LEN);
-
-/// One trigram-dictionary row. The `trigram` is the binary-search key —
-/// it sits first and the dictionary is sorted ascending by it, so a
-/// search compares only these 3 bytes. `post_off` is the BYTE offset of
-/// this trigram's posting list within the postings blob, `post_count`
-/// the number of u32 ids in that list (the list is `post_count * 4`
-/// bytes). One explicit pad byte keeps the row a clean 16 bytes; it is
-/// written as zero and never read. Postings ids are stored little-endian
-/// (a flat `u32` array, host-cheap to read), distinct from the BE-packed
-/// keyed tables — they are not memcmp-sorted, just an ascending numeric
-/// run per list.
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TrigramRow {
-    pub trigram:    [u8; 3],   // the 3 lowercased bytes (search key)
-    pub _pad:       u8,        // zero; pads the row to 16 bytes
-    pub post_off:   [u8; 8],   // BE byte offset into the postings blob
-    pub post_count: [u8; 4],   // BE count of u32 ids in this list
-}
-pub const TRIGRAM_LEN: usize = 16;
-const _: () = assert!(size_of::<TrigramRow>() == TRIGRAM_LEN);
 
 /// Page-align a byte offset up to the next 4 KB boundary.
 #[inline] pub fn pad_up(n: u64) -> u64 {

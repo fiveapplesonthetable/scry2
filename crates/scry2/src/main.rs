@@ -104,7 +104,7 @@ enum Cmd {
         #[arg(long)] substr: bool,
         /// With --substr, fold ASCII case so NAME matches regardless of
         /// case. Default is case-SENSITIVE (code identifiers are
-        /// case-significant). Both modes run at trigram speed.
+        /// case-significant). Both modes run the same parallel linear scan.
         #[arg(short = 'i', long = "ignore-case")] ignore_case: bool,
         /// With --substr, cap how many matching definitions to print.
         #[arg(long, default_value = "16")] limit: usize,
@@ -163,7 +163,7 @@ enum Cmd {
         /// Prefer an exact FQN for hot paths — use `names NAME` to find it.
         #[arg(long)] substr: bool,
         /// With --substr, fold ASCII case so NAME matches regardless of
-        /// case. Default is case-SENSITIVE. Both modes run at trigram speed.
+        /// case. Default is case-SENSITIVE. Both run the same parallel scan.
         #[arg(short = 'i', long = "ignore-case")] ignore_case: bool,
         /// With --substr, cap how many matching symbols to aggregate over.
         #[arg(long, default_value = "16")] limit: usize,
@@ -185,7 +185,7 @@ enum Cmd {
         /// --limit). Prefer an exact FQN — use `names NAME` to find it.
         #[arg(long)] substr: bool,
         /// With --substr, fold ASCII case so NAME matches regardless of
-        /// case. Default is case-SENSITIVE. Both modes run at trigram speed.
+        /// case. Default is case-SENSITIVE. Both run the same parallel scan.
         #[arg(short = 'i', long = "ignore-case")] ignore_case: bool,
         /// With --substr, cap how many matching symbols to aggregate over.
         #[arg(long, default_value = "16")] limit: usize,

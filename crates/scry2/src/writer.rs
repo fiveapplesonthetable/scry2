@@ -1303,14 +1303,11 @@ where
 ///   * `postings_bytes` — for each dict row, `post_count` u32 (LE)
 ///     name-row-ids, ascending, concatenated in dict order.
 ///
-/// Case-insensitivity is by design: we lowercase each name's bytes before
-/// extracting trigrams (and the reader lowercases the needle), so
-/// `--substr` is case-insensitive. Lowercasing is byte-wise ASCII
-/// (`u8::to_ascii_lowercase`): cheap, and substring matching on code
-/// identifiers is overwhelmingly ASCII; non-ASCII bytes pass through
-/// unchanged, which keeps build and query consistent. Names shorter than
-/// 3 bytes contribute no trigrams (and so are only reachable via the
-/// reader's <3-byte linear fallback).
+/// Case-sensitive: trigrams are the name's raw bytes and the reader uses
+/// the needle's raw bytes, so `--substr` matches case exactly, like the
+/// original linear scan (code identifiers are case-significant). Names
+/// shorter than 3 bytes contribute no trigrams (and so are only reachable
+/// via the reader's <3-byte linear fallback).
 ///
 /// Memory: this holds every posting list in RAM at once (a
 /// `HashMap<[u8;3], Vec<u32>>`, ~20 GB at AOSP scale). That is acceptable
@@ -1330,15 +1327,14 @@ fn build_trigram_index(by_name: &[(u64, u16, u64)], blob: &[u8]) -> (Vec<u8>, Ve
         let row_id = row_id as u32;
         let s = &blob[*off as usize..*off as usize + *len as usize];
         if s.len() < 3 { continue; }
-        // Lowercase into a small reusable buffer, then slide a 3-byte
-        // window. Distinct trigrams only: a name like "aaaa" must append
-        // its row-id to "aaa" exactly once, else the posting list carries
-        // duplicate ids and the reader's intersection/verify does wasted
-        // work. `last` dedups the common case (consecutive identical
-        // windows) cheaply; a per-name HashSet would dominate build time.
-        let lower: Vec<u8> = s.iter().map(|b| b.to_ascii_lowercase()).collect();
+        // Slide a 3-byte window over the raw name bytes. Distinct trigrams
+        // only: a name like "aaaa" must append its row-id to "aaa" exactly
+        // once, else the posting list carries duplicate ids and the
+        // reader's intersection/verify does wasted work. `last` dedups the
+        // common case (consecutive identical windows) cheaply; a per-name
+        // HashSet would dominate build time.
         let mut last: Option<[u8; 3]> = None;
-        for w in lower.windows(3) {
+        for w in s.windows(3) {
             let tri = [w[0], w[1], w[2]];
             if last == Some(tri) { continue; }
             last = Some(tri);

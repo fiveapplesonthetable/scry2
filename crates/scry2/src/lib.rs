@@ -1481,9 +1481,9 @@ mod tests {
 
     /// Substring matching is case-INSENSITIVE on both the trigram path
     /// (3+ chars) and the linear fallback (<3 chars). The build lowercases
-    /// names, the query lowercases the needle.
+    /// the needle's raw bytes, like the original linear scan.
     #[test]
-    fn trigram_case_insensitive() {
+    fn trigram_case_sensitive() {
         let path = tmp("trigram_case");
         let mut b = IndexBuilder::new();
         let s = sym_of("com.Example.HandleRequest");
@@ -1491,11 +1491,12 @@ mod tests {
         b.finish(&path).unwrap();
 
         let ix = Index::open(&path).unwrap();
-        // Trigram path: differing case still matches.
-        assert_eq!(ix.syms_matching_substring("handlerequest", 16), vec![s]);
-        assert_eq!(ix.syms_matching_substring("EXAMPLE", 16), vec![s]);
-        // Mixed-case needle against differing-case name.
-        assert_eq!(ix.syms_matching_substring("hAnDlE", 16), vec![s]);
+        // Exact-case substrings match (code identifiers are case-significant).
+        assert_eq!(ix.syms_matching_substring("HandleRequest", 16), vec![s]);
+        assert_eq!(ix.syms_matching_substring("Example", 16), vec![s]);
+        // Wrong case does NOT match — preserves the original (no case-fold).
+        assert!(ix.syms_matching_substring("handlerequest", 16).is_empty());
+        assert!(ix.syms_matching_substring("EXAMPLE", 16).is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

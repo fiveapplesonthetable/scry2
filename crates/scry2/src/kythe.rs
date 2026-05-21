@@ -575,7 +575,7 @@ fn process_entry(
             }
             if let (true, Some(start)) = (a.is_anchor, a.start) {
                 let file_id = file_ids.intern(&a.path);
-                emit_xref_resolved(target_sym, &e.target, role_byte, file_id, start,
+                emit_xref_resolved(&e.target, role_byte, file_id, start,
                                    xrefs, builder, stats);
                 if role_byte == role::REF || role_byte == role::CALL {
                     call_sites.push((file_id, start, target_sym, role_byte));
@@ -672,7 +672,6 @@ fn process_entry(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn flush_ready(
     a: &mut AnchorAccum,
     body_anchors: &mut Vec<(u32, u32, u32, u64)>,
@@ -689,7 +688,7 @@ fn flush_ready(
     let pend  = std::mem::take(&mut a.pending);
     for (target, role_byte) in pend {
         let target_sym = sym_of(&target.to_symbol_string());
-        emit_xref_resolved(target_sym, &target, role_byte, file_id, start, xrefs, builder, stats);
+        emit_xref_resolved(&target, role_byte, file_id, start, xrefs, builder, stats);
         if role_byte == role::REF || role_byte == role::CALL {
             call_sites.push((file_id, start, target_sym, role_byte));
         }
@@ -706,9 +705,7 @@ fn flush_ready(
     stats.anchors_flushed += 1;
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_xref_resolved(
-    sym: u64,
     target: &VName,
     role_byte: u8,
     file_id: u32,
@@ -719,6 +716,7 @@ fn emit_xref_resolved(
 ) {
     if target.is_empty() { return; }
     let sym_str = target.to_symbol_string();
+    let sym = sym_of(&sym_str);
     // Sym metadata streams straight in (not bridged): the def node keeps
     // its own name/kind row. The xref row is buffered so the per-CU
     // completes bridge can remap its sym to the decl at finalize.

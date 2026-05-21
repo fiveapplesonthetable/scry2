@@ -345,12 +345,12 @@ impl Index {
         let dict = self.trigram_dict_slice();
         let post = self.trigram_post_slice();
 
-        // Distinct lowercased trigrams of the needle. Lowercasing matches
-        // the build side (case-insensitive search). A trigram absent from
+        // Distinct trigrams of the needle (case-sensitive, matching the
+        // build side and the original linear scan). A trigram absent from
         // the dict means NO name contains it, so no name can contain the
         // needle → empty result.
-        let lneedle: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
-        let mut tris: Vec<[u8; 3]> = lneedle.windows(3)
+        let nb = needle.as_bytes();
+        let mut tris: Vec<[u8; 3]> = nb.windows(3)
             .map(|w| [w[0], w[1], w[2]]).collect();
         tris.sort_unstable();
         tris.dedup();
@@ -377,10 +377,10 @@ impl Index {
         lists.sort_unstable_by_key(|l| l.len());
         let (smallest, rest) = lists.split_first().unwrap();
 
-        // Case-insensitive substring verify: lowercase the candidate's
-        // bytes and search for the lowercased needle. Trigram intersection
-        // is necessary-not-sufficient, so this filters the false positives.
-        let nfind = memchr::memmem::Finder::new(&lneedle);
+        // Substring verify: trigram intersection is necessary-not-sufficient
+        // (a name can hold every needle trigram without the contiguous
+        // needle), so confirm each candidate actually contains it.
+        let nfind = memchr::memmem::Finder::new(nb);
         let mut out = Vec::with_capacity(limit.min(64));
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for &cand in smallest {
@@ -388,8 +388,7 @@ impl Index {
             let in_all = rest.iter().all(|l| l.binary_search(&cand).is_ok());
             if !in_all { continue; }
             let (name, sym) = self.name_row(names, blob, cand);
-            let lname: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
-            if nfind.find(&lname).is_some() && seen.insert(sym) {
+            if nfind.find(name).is_some() && seen.insert(sym) {
                 out.push(sym);
                 if out.len() >= limit { break; }
             }
@@ -399,17 +398,15 @@ impl Index {
 
     /// Parallel linear scan over the whole name table — the fallback when
     /// the needle is shorter than a trigram or no trigram index exists.
-    /// Matches case-INSENSITIVELY to agree with the trigram path. Splits
-    /// the table across cores; each thread keeps the first `limit` matches
-    /// in its contiguous range and the parts are concatenated in row order
-    /// then truncated, so the result is the first-`limit` set a serial
-    /// scan would return.
+    /// Case-sensitive, matching the trigram path. Splits the table across
+    /// cores; each thread keeps the first `limit` matches in its contiguous
+    /// range and the parts are concatenated in row order then truncated, so
+    /// the result is the first-`limit` set a serial scan would return.
     fn syms_matching_substring_linear(&self, nb: &[u8], limit: usize) -> Vec<u64> {
         let n = self.hdr.names_n as usize;
         if nb.is_empty() || n == 0 { return Vec::new(); }
         let names = self.names_slice();
         let blob = self.blob();
-        let lneedle: Vec<u8> = nb.iter().map(|b| b.to_ascii_lowercase()).collect();
         let threads = std::thread::available_parallelism()
             .map(|p| p.get()).unwrap_or(1).clamp(1, n);
         let chunk = n.div_ceil(threads);
@@ -419,17 +416,14 @@ impl Index {
                 let lo = t * chunk;
                 let hi = ((t + 1) * chunk).min(n);
                 if lo >= hi { continue; }
-                let lneedle = &lneedle;
                 handles.push(s.spawn(move || {
-                    let finder = memchr::memmem::Finder::new(lneedle.as_slice());
+                    let finder = memchr::memmem::Finder::new(nb);
                     let mut local = Vec::new();
                     for i in lo..hi {
                         let row_off = i * NAME_LEN;
                         let off = u64::from_be_bytes(names[row_off..row_off + 8].try_into().unwrap()) as usize;
                         let len = u16::from_be_bytes(names[row_off + 8..row_off + 10].try_into().unwrap()) as usize;
-                        let lname: Vec<u8> = blob[off..off + len].iter()
-                            .map(|b| b.to_ascii_lowercase()).collect();
-                        if finder.find(&lname).is_some() {
+                        if finder.find(&blob[off..off + len]).is_some() {
                             local.push(u64::from_be_bytes(names[row_off + 10..row_off + 18].try_into().unwrap()));
                             if local.len() >= limit { break; }
                         }

@@ -1076,17 +1076,18 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     let delta_rows = std::sync::atomic::AtomicU64::new(0);
     let delta_rows_ref = &delta_rows;
 
-    // Hand the plan out via a shared atomic cursor — a work-stealing
-    // queue. Each worker pulls the next unclaimed CU index with one
-    // `fetch_add`; a worker that finishes a slow CU immediately grabs
-    // the next available one instead of idling. Mixed cxx/java/jvm CU
-    // costs are very non-uniform, so a static stripe (worker t handles
-    // t, t+N, 2t+N, …) would leave cores idle behind a worker stuck on
-    // a slow CU. The set of CUs processed is identical to the static
-    // partition; only the order in which they're claimed differs.
+    // Split the plan into N work shards by a static index stripe:
+    // worker `w_id` processes plan indices w_id, w_id + N, w_id + 2N, …
+    // (`i += n_workers`). This is deliberate, not just simpler than a
+    // work-stealing queue: at full AOSP scale the work-stealing cursor
+    // saturated all workers so they outran the single snapshotter
+    // thread — the per-worker sinks backed up, the in-RAM delta grew to
+    // ~1.8 B rows / ~105 GB RSS, and the box thrashed into swap
+    // (throughput halved). The static stripe paces naturally with the
+    // snapshotter and plateaus at ~78 GB, so it bounds peak memory at
+    // scale even though a worker can briefly idle behind a slow CU in
+    // its stripe. The set of CUs processed is identical either way.
     let n_workers = workers_n;
-    let cursor = std::sync::atomic::AtomicUsize::new(0);
-    let cursor_ref = &cursor;
     let plan_ref = &plan;
     let partial_s2db_path_ref = &partial_s2db_path;
     let partial_shas_path_ref = &partial_shas_path;
@@ -1182,12 +1183,10 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             let partial_shas_path = partial_shas_path_ref;
             let out_path = args.out;
             let next_shard = next_shard_ref;
-            let cursor = cursor_ref;
             handles.push(s.spawn(move || -> Result<()> {
                 let mut extractor = kzip::SubKzipWriter::open(kzip_path)?;
-                loop {
-                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= plan_len { break; }
+                let mut i = w_id;
+                while i < plan_len {
                     // Register this CU as in-flight, then re-check the
                     // snapshot gate — order matters. If we checked first
                     // and incremented second, a snapshot starting in the
@@ -1259,6 +1258,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                         if stats.fail_tails.len() < MAX_FAIL_TAILS {
                             stats.fail_tails.push(format!("sha={} extract: {e:#}", unit.sha));
                         }
+                        i += n_workers;
                         continue;
                     }
                     // A missing indexer binary is a per-CU failure, not a
@@ -1277,6 +1277,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                             if stats.fail_tails.len() < MAX_FAIL_TAILS {
                                 stats.fail_tails.push(format!("sha={} indexer: {e:#}", unit.sha));
                             }
+                            i += n_workers;
                             continue;
                         }
                     };
@@ -1289,6 +1290,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                             if stats.fail_tails.len() < MAX_FAIL_TAILS {
                                 stats.fail_tails.push(format!("sha={} spawn: {e:#}", unit.sha));
                             }
+                            i += n_workers;
                             continue;
                         }
                     };
@@ -1599,6 +1601,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                             // _writer_guard releases here.
                         }
                     }
+                    i += n_workers;
                 }
                 Ok(())
             }));

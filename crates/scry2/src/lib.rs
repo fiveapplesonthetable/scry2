@@ -1539,9 +1539,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The DEFAULT `--substr` path is CASE-SENSITIVE: the parallel linear
-    /// scan verifies the raw bytes, so wrong-case needles return nothing.
-    /// This is the regression guard for the default behaviour.
+    /// The DEFAULT `--substr` path is CASE-SENSITIVE: the trigram filter is
+    /// case-folded, but the per-candidate verify checks the raw bytes, so
+    /// wrong-case needles return nothing. This is the regression guard for
+    /// the default behaviour.
     #[test]
     fn substr_case_sensitive() {
         let path = tmp("substr_case");
@@ -1561,8 +1562,9 @@ mod tests {
     }
 
     /// The opt-in `syms_matching_substring_ci` folds ASCII case while the
-    /// DEFAULT `syms_matching_substring` stays case-sensitive — the same
-    /// linear scan serves both, only the per-row verify differs.
+    /// DEFAULT `syms_matching_substring` stays case-sensitive — one
+    /// case-folded trigram index serves both, only the per-candidate verify
+    /// differs.
     #[test]
     fn substr_ignore_case() {
         let path = tmp("substr_ci");
@@ -1577,6 +1579,233 @@ mod tests {
         assert_eq!(ix.syms_matching_substring_ci("EXAMPLE", 16), vec![s]);
         // The default stays case-sensitive: the lowercased needle misses.
         assert!(ix.syms_matching_substring("handlerequest", 16).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The trigram index must be PRESENT after a finish() write (header
+    /// field non-zero) and a query through it must return exactly the
+    /// linear-scan answer on the same data. The decoy name "abcZZbcd"
+    /// shares the trigrams "abc" and "bcd" with the needle "abcd" but does
+    /// NOT contain "abcd" contiguously — it exercises the verify step that
+    /// drops trigram false positives.
+    #[test]
+    fn trigram_index_present_and_matches() {
+        let path = tmp("trigram_present");
+        let mut b = IndexBuilder::new();
+        // "abcd" appears in s_hit; the decoy holds abc+bcd but not abcd.
+        let s_hit   = sym_of("module.abcdef");
+        let s_decoy = sym_of("module.abcZZbcd");
+        let s_other = sym_of("module.zzzzzzz");
+        b.upsert_sym(s_hit,   kind::FUNCTION, lang::CXX, "module.abcdef");
+        b.upsert_sym(s_decoy, kind::FUNCTION, lang::CXX, "module.abcZZbcd");
+        b.upsert_sym(s_other, kind::FUNCTION, lang::CXX, "module.zzzzzzz");
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // Header carries a non-empty trigram dict.
+        assert!(ix.n_trigram_dict() > 0, "trigram section present after finish");
+
+        // 3+ char substring via the trigram path. Only the real hit, never
+        // the decoy.
+        let hits = ix.syms_matching_substring("abcd", 16);
+        assert_eq!(hits, vec![s_hit],
+            "trigram false-positive decoy 'abcZZbcd' must NOT match needle 'abcd'");
+
+        // A trigram that no name carries returns empty (the intersection
+        // short-circuits on the missing trigram).
+        assert!(ix.syms_matching_substring("qqq", 16).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A needle shorter than 3 bytes has no trigram, so the query must
+    /// fall back to the linear scan and still return the right syms.
+    #[test]
+    fn trigram_short_needle_falls_back() {
+        let path = tmp("trigram_short");
+        let mut b = IndexBuilder::new();
+        let s_xy = sym_of("foo.xy");
+        let s_z  = sym_of("foo.zz");
+        b.upsert_sym(s_xy, kind::FUNCTION, lang::CXX, "foo.xy");
+        b.upsert_sym(s_z,  kind::FUNCTION, lang::CXX, "foo.zz");
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        // 2-char needle: fallback path. "xy" matches only foo.xy.
+        let hits = ix.syms_matching_substring("xy", 16);
+        assert_eq!(hits, vec![s_xy]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The posting compression must round-trip: encoding an ascending list
+    /// of name-row-ids as LEB128 gap-deltas and decoding it back (the
+    /// running-sum walk the reader uses) must reproduce the exact same ids.
+    /// Covers `write_varint`/`varint_len`/`read_varint` together, including
+    /// multi-byte varints, a zero-based first delta, and large gaps that
+    /// span 1–5 varint bytes.
+    #[test]
+    fn varint_postings_round_trip() {
+        use format::{write_varint, varint_len, read_varint};
+
+        // Single-value varint round-trip across the byte-length boundaries.
+        for v in [0u32, 1, 127, 128, 300, 16_383, 16_384, 2_097_151,
+                  2_097_152, u32::MAX] {
+            let mut buf = Vec::new();
+            write_varint(&mut buf, v);
+            assert_eq!(buf.len(), varint_len(v), "varint_len matches encoded length for {v}");
+            let (got, used) = read_varint(&buf, 0);
+            assert_eq!((got, used), (v, buf.len()), "single varint round-trip for {v}");
+        }
+
+        // A realistic ascending posting list: dense small gaps plus a few
+        // big jumps. Encode as gap-deltas (first id is the delta from 0),
+        // then decode with a running cumulative sum and compare.
+        let ids: Vec<u32> = vec![0, 1, 2, 3, 5, 8, 200, 201, 70_000, 70_001,
+                                 4_000_000, 4_000_002, u32::MAX - 1, u32::MAX];
+        let mut blob = Vec::new();
+        let mut prev = 0u32;
+        for (i, &id) in ids.iter().enumerate() {
+            let delta = if i == 0 { id } else { id - prev };
+            write_varint(&mut blob, delta);
+            prev = id;
+        }
+
+        // Decode the whole run (mirrors reader::trigram_postings).
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        let mut acc = 0u32;
+        let mut first = true;
+        while pos < blob.len() {
+            let (delta, used) = read_varint(&blob, pos);
+            pos += used;
+            acc = if first { delta } else { acc + delta };
+            first = false;
+            out.push(acc);
+        }
+        assert_eq!(out, ids, "gap-delta varint posting list must round-trip exactly");
+    }
+
+    /// Block-skip posting format must round-trip across MANY blocks. We give
+    /// a single shared trigram (the canonical `kythe` prefix) to far more
+    /// than `TRIGRAM_BLOCK` (128) names, so its posting list spans several
+    /// blocks and several skip-table entries. A substring query on that
+    /// shared prefix must return EVERY one of those names — proving the
+    /// multi-block skip-table + per-block gap-delta decode reconstructs the
+    /// full ascending id list with nothing dropped at a block boundary.
+    #[test]
+    fn block_skip_round_trips_across_blocks() {
+        let path = tmp("block_skip");
+        let mut b = IndexBuilder::new();
+        // 400 names sharing the "kythe" prefix → ~3 blocks of postings for
+        // each of the trigrams "kyt","yth","the","he.". Names are zero-padded
+        // so the alpha sort (hence name-row-id order) is well-defined.
+        let n = 400usize;
+        let mut want: Vec<u64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = format!("kythe.sym{i:04}");
+            let s = sym_of(&name);
+            b.upsert_sym(s, kind::FUNCTION, lang::CXX, &name);
+            want.push(s);
+        }
+        // A decoy that holds the prefix trigrams' bytes scrambled but NOT the
+        // contiguous "kythe." substring, to confirm the verify still fires.
+        let decoy = sym_of("ky.th.e.scrambled");
+        b.upsert_sym(decoy, kind::FUNCTION, lang::CXX, "ky.th.e.scrambled");
+        b.finish(&path).unwrap();
+
+        let ix = Index::open(&path).unwrap();
+        let mut hits = ix.syms_matching_substring("kythe.", n + 10);
+        hits.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(hits, want,
+            "every kythe-prefixed name must survive the multi-block skip decode");
+        assert!(!hits.contains(&decoy), "decoy must not match the contiguous needle");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Galloping (skip-list) intersection must equal the full-set answer on a
+    /// random fixture with HEAVILY SKEWED list sizes — the core correctness
+    /// claim. We build a corpus where one needle trigram is near-UNIVERSAL
+    /// (a huge, many-block posting list) and another is RARE (a tiny list,
+    /// the driver). The query must drive off the tiny list, probe the huge
+    /// list via its skip-table, and return EXACTLY the names that contain the
+    /// needle contiguously — identical to a brute-force scan. A fixed RNG
+    /// seed keeps it reproducible.
+    #[test]
+    fn galloping_equals_full_intersection_skewed() {
+        use rand::{Rng, SeedableRng};
+        use rand::rngs::StdRng;
+
+        let path = tmp("gallop_skewed");
+        let mut b = IndexBuilder::new();
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+
+        // 5000 names. EVERY name carries the near-universal token "common"
+        // (so "com","omm","mmo","mon" are huge multi-block lists). A small,
+        // random subset additionally carries a rare token "zqx<k>", and an
+        // even smaller subset carries the exact needle substring "common.zqx".
+        let total = 5000usize;
+        let mut names: Vec<String> = Vec::with_capacity(total);
+        for i in 0..total {
+            // ~3% of names get the rare "zqx" token; of those, half place it
+            // immediately after "common." to actually contain the needle.
+            let has_rare = rng.gen_ratio(3, 100);
+            let contiguous = has_rare && rng.gen_ratio(1, 2);
+            let name = if contiguous {
+                // contains "common.zqx" contiguously → a true needle hit
+                format!("pkg{i:05}.common.zqx{i}.field")
+            } else if has_rare {
+                // holds "common" and "zqx" but NOT contiguously → decoy
+                format!("zqx{i}.pkg{i:05}.common.other")
+            } else {
+                format!("pkg{i:05}.common.value{i}")
+            };
+            names.push(name);
+        }
+        let syms: Vec<u64> = names.iter().map(|n| {
+            let s = sym_of(n);
+            b.upsert_sym(s, kind::FUNCTION, lang::CXX, n);
+            s
+        }).collect();
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+
+        // Needle "common.zqx": "com/omm/mmo/mon/on./n.z/.zq/zqx" — "com"&co.
+        // are universal (huge lists), "zqx" is rare (the driver). Galloping
+        // must probe the huge lists only at the few driver candidates.
+        let needle = "common.zqx";
+        let mut got = ix.syms_matching_substring(needle, total + 10);
+        got.sort_unstable();
+        got.dedup();
+
+        // Brute-force reference: every name containing the needle (the
+        // default path is case-sensitive; the fixture is all lowercase).
+        let mut want: Vec<u64> = names.iter().enumerate()
+            .filter(|(_, n)| n.contains(needle))
+            .map(|(i, _)| syms[i])
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+
+        assert_eq!(got, want,
+            "galloping intersection must equal the brute-force set on skewed lists");
+        // Sanity: the fixture actually produced a non-trivial hit set, so the
+        // test exercises the verify and the skip-probe rather than trivially
+        // passing on empty sets.
+        assert!(!want.is_empty(), "fixture must yield at least one true hit");
+
+        // Also confirm equivalence to the linear fallback on a needle whose
+        // trigrams are ALL universal (the worst case galloping can't dodge):
+        // "common" itself. Result must still be exactly the full set.
+        let mut got_uni = ix.syms_matching_substring("common", total + 10);
+        got_uni.sort_unstable();
+        let mut want_uni: Vec<u64> = names.iter().enumerate()
+            .filter(|(_, n)| n.contains("common"))
+            .map(|(i, _)| syms[i])
+            .collect();
+        want_uni.sort_unstable();
+        want_uni.dedup();
+        assert_eq!(got_uni, want_uni,
+            "all-universal needle must still equal the brute-force set");
         let _ = std::fs::remove_file(&path);
     }
 }

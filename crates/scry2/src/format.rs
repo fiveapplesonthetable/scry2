@@ -35,15 +35,41 @@
 use std::mem::size_of;
 
 pub const MAGIC: [u8; 8]   = *b"S2DBv2\0\0";
-/// v4 is the comprehension-layer format: xrefs/syms/names/files plus the
-/// inheritance, callgraph, type, membership and signature sections. Dev
-/// mode is strict: there is NO backward compat — `Index::open` accepts
-/// exactly version 4. `--substr` is served by a parallel linear scan over
-/// the names table, so no auxiliary substring section is on disk.
-pub const VERSION: u32     = 4;
+/// v6 is the comprehension layer (xrefs/syms/names/files plus the
+/// inheritance, callgraph, type, membership and signature sections) PLUS
+/// the trigram substring index that accelerates `--substr`. The trigram
+/// index is two appended sections: a dictionary and a postings blob, whose
+/// offsets are carved from the header's former `_reserved` bytes.
+///
+/// Each trigram's postings are BLOCK-SKIP COMPRESSED. The ids are the
+/// ascending name-row-ids that contain the (lowercased) trigram; they are
+/// split into fixed blocks of `TRIGRAM_BLOCK` ids, each block stores its
+/// own LEB128 gap-delta varints (dense lists collapse to ~1 byte per id,
+/// far below a raw `u32`), and a per-trigram skip-table holds one
+/// `(max_id, block_byte_offset)` entry per block so a membership probe can
+/// binary-search to the one block that could hold a given id and decode
+/// ONLY that block. The dict row carries the posting `count`, so the query
+/// can pick the most-selective driver trigram WITHOUT decoding anything.
+///
+/// Dev mode is strict: there is NO backward compat — `Index::open` accepts
+/// exactly version 6 (a v6 reader rejects a v4 file). This is intentional:
+/// the trigram path is load-bearing for `--substr` latency and an index
+/// without it would silently fall back to the slow linear scan, which we
+/// don't want to ship unnoticed.
+pub const VERSION: u32     = 6;
 /// Lowest on-disk version this reader understands. Equal to VERSION:
 /// strict single-version, no older-format fallback.
-pub const MIN_VERSION: u32 = 4;
+pub const MIN_VERSION: u32 = 6;
+
+/// Postings block size: each trigram's ascending name-row-ids are split
+/// into blocks of this many ids. The skip-table carries one entry per
+/// block, so a membership probe binary-searches the skip-table for the
+/// block whose `max_id >= candidate`, then decodes only that one block
+/// (at most `TRIGRAM_BLOCK` varints). Smaller blocks = finer skipping but
+/// a larger skip-table (more overhead bytes); 128 keeps the skip-table
+/// under ~1.6% of a dense list while bounding a probe's decode to 128
+/// varints.
+pub const TRIGRAM_BLOCK: usize = 128;
 pub const PAGE: usize      = 4096;
 
 /// File header — first 256 bytes. Numbers count rows, *not* bytes.
@@ -88,7 +114,22 @@ pub struct Header {
     pub sig_off:      u64,    // (sym, signature blob ref) sorted by sym — full rendered signature
     pub sig_n:        u64,
 
-    pub _reserved:    [u8; 256 - 8 - 4 - 4 - 8*24],
+    // ---- trigram substring index ----
+    // Built ONCE post-merge over the final alpha-sorted names table, so it
+    // never complicates the k-way merge. Two parts:
+    //   trigram_dict: array of TrigramRow (TRIGRAM_LEN bytes) sorted
+    //     ascending by the 3-byte trigram, binary-searchable. `_off` is a
+    //     byte offset, `_n` a ROW count.
+    //   trigram_post: a varint blob of LEB128 gap-delta block-skip regions.
+    //     `_off` is a byte offset, `_len` a BYTE length. Each dict row
+    //     points at a contiguous region (`post_off`, `post_len` bytes)
+    //     decoding to that trigram's ascending name-row-ids.
+    pub trigram_dict_off: u64,
+    pub trigram_dict_n:   u64,   // row count (TrigramRow rows)
+    pub trigram_post_off: u64,
+    pub trigram_post_len: u64,   // byte length of the postings blob
+
+    pub _reserved:    [u8; 256 - 8 - 4 - 4 - 8*28],
 }
 
 impl Default for Header {
@@ -107,7 +148,9 @@ impl Default for Header {
             childrev_off: 0, childrev_n: 0,
             inhrev_off: 0, inhrev_n: 0,
             sig_off:   0, sig_n:   0,
-            _reserved: [0; 256 - 8 - 4 - 4 - 8*24],
+            trigram_dict_off: 0, trigram_dict_n: 0,
+            trigram_post_off: 0, trigram_post_len: 0,
+            _reserved: [0; 256 - 8 - 4 - 4 - 8*28],
         }
     }
 }
@@ -240,6 +283,95 @@ pub struct TypeRow {
 }
 pub const TYPE_LEN: usize = 18;
 const _: () = assert!(size_of::<TypeRow>() == TYPE_LEN);
+
+/// One trigram-dictionary row. The `trigram` is the binary-search key —
+/// it sits first and the dictionary is sorted ascending by it, so a
+/// search compares only these 3 bytes. `post_off` is the BYTE offset of
+/// this trigram's posting REGION within the postings blob, `post_len` the
+/// BYTE length of that whole region (skip-table + packed blocks). `count`
+/// is the number of postings (ascending name-row-ids) in the list, used
+/// to pick the most-selective driver trigram WITHOUT decoding anything.
+/// One explicit pad byte keeps the row a clean 20 bytes; it is written as
+/// zero and never read.
+///
+/// Postings are BLOCK-SKIP COMPRESSED. Each trigram's region is laid out as:
+///
+/// ```text
+///   [ skip-table: n_blocks * SKIP_ENTRY bytes ]
+///   [ packed blocks: gap-delta varints        ]
+/// ```
+///
+/// where `n_blocks = ceil(count / TRIGRAM_BLOCK)`. Each skip entry is
+/// `max_id` (u32 BE — the LAST/largest id in that block) followed by
+/// `block_off` (u32 BE — the byte offset where that block's varints start,
+/// RELATIVE to the start of this trigram's region). Within a block the ids
+/// are LEB128 gap-deltas: the block's first id is stored as-is (delta from
+/// 0), each later id in the block is the varint of `id - prev_in_block`.
+/// Dense lists (consecutive ids) collapse to ~1 byte per posting, far
+/// below the 4 bytes a raw `u32` array costs. A membership probe
+/// binary-searches the skip-table for the first block whose `max_id >=
+/// candidate`, decodes ONLY that block, and checks for the id — so a probe
+/// costs O(log n_blocks + TRIGRAM_BLOCK) regardless of total list size.
+/// The ids are not memcmp-sorted — just an ascending numeric run per
+/// block — so they are stored as a varint stream, distinct from the
+/// BE-packed keyed tables; the skip entries ARE BE so a future memcmp pass
+/// could use them, but the reader parses them numerically.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrigramRow {
+    pub trigram:    [u8; 3],   // the 3 lowercased bytes (search key)
+    pub _pad:       u8,        // zero; pads the row to 20 bytes
+    pub post_off:   [u8; 8],   // BE byte offset of this trigram's region
+    pub post_len:   [u8; 4],   // BE byte length of the whole region
+    pub count:      [u8; 4],   // BE posting count (drives selectivity choice)
+}
+pub const TRIGRAM_LEN: usize = 20;
+const _: () = assert!(size_of::<TrigramRow>() == TRIGRAM_LEN);
+
+/// One skip-table entry: the block's `max_id` (largest/last id in the
+/// block) and the byte offset (relative to the trigram's region start)
+/// where the block's gap-delta varints begin. Both u32 BE. 8 bytes.
+pub const SKIP_ENTRY: usize = 8;
+
+/// Append `v` to `out` as an unsigned LEB128 varint (7 data bits per
+/// byte, high bit = "more bytes follow"). Used to encode trigram posting
+/// gap-deltas. A u32 takes 1–5 bytes; the dense gaps a trigram posting
+/// list produces are almost always 1–2.
+#[inline]
+pub fn write_varint(out: &mut Vec<u8>, mut v: u32) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Number of bytes `v` occupies as an unsigned LEB128 varint. Used by the
+/// build's first (counting) pass to size each trigram's region without
+/// materializing the bytes.
+#[inline]
+pub fn varint_len(mut v: u32) -> usize {
+    let mut n = 1;
+    while v >= 0x80 { v >>= 7; n += 1; }
+    n
+}
+
+/// Decode one unsigned LEB128 varint from `buf` starting at `pos`,
+/// returning `(value, bytes_consumed)`. The inverse of `write_varint`.
+#[inline]
+pub fn read_varint(buf: &[u8], pos: usize) -> (u32, usize) {
+    let mut v: u32 = 0;
+    let mut shift = 0u32;
+    let mut i = pos;
+    loop {
+        let b = buf[i];
+        v |= ((b & 0x7f) as u32) << shift;
+        i += 1;
+        if b & 0x80 == 0 { break; }
+        shift += 7;
+    }
+    (v, i - pos)
+}
 
 /// Page-align a byte offset up to the next 4 KB boundary.
 #[inline] pub fn pad_up(n: u64) -> u64 {

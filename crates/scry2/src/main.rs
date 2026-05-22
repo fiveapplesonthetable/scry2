@@ -1682,8 +1682,62 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             .with_context(|| format!("open shard {}", src.display()))?);
     }
     let sources: Vec<&scry2::reader::Index> = source_ix.iter().collect();
-    final_delta.write_merged_snapshot(&sources, &acc_path)
-        .with_context(|| "final merge: remainder + base + shards (k-way)")?;
+
+    // Time-based heartbeat for the final merge. The k-way pass folds every
+    // shard in long gather sub-phases (the alias gather, the by-name sort)
+    // that produce no per-section line, so without this the merge looks hung
+    // between two adjacent section lines. A side thread logs the merge's
+    // vitals every ~20 s, reading the in-progress output tmp's size and our
+    // RSS from /proc. Mirrors the indexing heartbeat: an AtomicBool stop flag
+    // polled on a short interval so the scope collapses promptly, and a clean
+    // join (the thread returns on the flag, never panics) — no leaked thread.
+    // Logging only; it never touches the merge's data.
+    let merge_tmp_path = acc_path
+        .with_extension(format!("s2db.tmp.{}", std::process::id()));
+    let merge_start = Instant::now();
+    let merge_hb_stop = std::sync::atomic::AtomicBool::new(false);
+    let merge_hb_stop_ref = &merge_hb_stop;
+    let merge_tmp_ref = &merge_tmp_path;
+    let merged_total = std::thread::scope(|s| -> Result<u64> {
+        s.spawn(move || {
+            use std::sync::atomic::Ordering;
+            const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+            const POLL_INTERVAL:      std::time::Duration = std::time::Duration::from_millis(250);
+            loop {
+                let deadline = std::time::Instant::now() + HEARTBEAT_INTERVAL;
+                while std::time::Instant::now() < deadline {
+                    if merge_hb_stop_ref.load(Ordering::Relaxed) { return; }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                if merge_hb_stop_ref.load(Ordering::Relaxed) { return; }
+                let out_gb = std::fs::metadata(merge_tmp_ref)
+                    .map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
+                let rss_gb = {
+                    let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                    st.lines()
+                        .find(|l| l.starts_with("VmRSS:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|kb| kb.parse::<u64>().ok())
+                        .map(|kb| kb as f64 / 1024.0 / 1024.0)
+                        .unwrap_or(0.0)
+                };
+                eprintln!(
+                    "[from-kzip] merge heartbeat: +{:.0}s, output {:.2}G, rss {:.1}G",
+                    merge_start.elapsed().as_secs_f64(), out_gb, rss_gb,
+                );
+            }
+        });
+        let res = final_delta.write_merged_snapshot_progress(&sources, &acc_path)
+            .with_context(|| "final merge: remainder + base + shards (k-way)");
+        // Merge done (ok OR err) — stop the heartbeat before returning so the
+        // scope collapses without waiting out the 20 s sleep cycle and the
+        // thread never logs after the merge has failed. std::thread::scope
+        // joins the spawned thread on every exit path, so storing here is
+        // sufficient for a clean stop+join with no leaked thread.
+        merge_hb_stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+        res
+    })?;
+    let _ = merged_total;
     drop(source_ix);
 
     std::fs::rename(&acc_path, args.out)

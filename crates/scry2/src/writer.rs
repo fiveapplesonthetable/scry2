@@ -306,10 +306,52 @@ impl IndexBuilder {
     /// drained, so the caller should drop it after this returns.
     /// Returns total bytes written to `output`.
     pub fn write_merged_snapshot(
-        mut self,
+        self,
         sources: &[&crate::reader::Index],
         output: &Path,
     ) -> Result<u64> {
+        self.write_merged_snapshot_inner(sources, output, false)
+    }
+
+    /// Identical to [`write_merged_snapshot`] but emits per-section
+    /// progress lines to stderr (`[from-kzip] merge: <section> ...`) as
+    /// each section is written. Logging only — the produced `.s2db` is
+    /// byte-for-byte identical to [`write_merged_snapshot`]. Used by
+    /// `from-kzip`'s long final merge, which folds hundreds-to-thousands
+    /// of shards and would otherwise look hung between the start and
+    /// `done in` lines. Tests and the rolling snapshot path call the
+    /// silent variant so their stderr stays clean.
+    pub fn write_merged_snapshot_progress(
+        self,
+        sources: &[&crate::reader::Index],
+        output: &Path,
+    ) -> Result<u64> {
+        self.write_merged_snapshot_inner(sources, output, true)
+    }
+
+    fn write_merged_snapshot_inner(
+        mut self,
+        sources: &[&crate::reader::Index],
+        output: &Path,
+        log_progress: bool,
+    ) -> Result<u64> {
+        // Total declared sections, in write order: xrefs, syms, names,
+        // files, inh, inhrev, calls, crev, typed, childrev, sig, blob.
+        // Used only to render the `<k>/<total>` term in progress lines.
+        const N_SECTIONS: usize = 12;
+        // Emit one `[from-kzip] merge: ...` line per section as it lands.
+        // `bytes` is the running output offset (end of the section just
+        // written), so the user sees the file growing. Logging only — no
+        // effect on the bytes written.
+        let mut k_section: usize = 0;
+        let mut log_section = |name: &str, n_rows: u64, bytes: u64| {
+            if !log_progress { return; }
+            k_section += 1;
+            eprintln!(
+                "[from-kzip] merge: {name} {n_rows} rows ({k_section}/{N_SECTIONS} sections, {:.2}G)",
+                bytes as f64 / 1e9,
+            );
+        };
         // ---- 1. Sort delta tables in place ----
         self.xrefs.sort_unstable();
         self.xrefs.dedup();
@@ -402,6 +444,7 @@ impl IndexBuilder {
                 n_xrefs += 1;
             }
         }
+        log_section("xrefs", n_xrefs, xrefs_off + n_xrefs * XREF_LEN as u64);
 
         // ---- 5. syms (write + count + accumulate names blob/by_name) ----
         let syms_off = pad_up(xrefs_off + n_xrefs * XREF_LEN as u64);
@@ -428,6 +471,7 @@ impl IndexBuilder {
                 n_syms += 1;
             }
         }
+        log_section("syms", n_syms, syms_off + n_syms * SYM_LEN as u64);
 
         // ---- 6. aliases (no dedicated section — they fold into
         //      the alphabetical name index) ----
@@ -466,6 +510,7 @@ impl IndexBuilder {
             w.write_all(&len.to_be_bytes())?;
             w.write_all(&sym.to_be_bytes())?;
         }
+        log_section("names", n_names, names_off + n_names * NAME_LEN as u64);
 
         drop(by_name);
 
@@ -489,6 +534,7 @@ impl IndexBuilder {
                 n_files += 1;
             }
         }
+        log_section("files", n_files, files_off + n_files * FILE_LEN as u64);
 
         // ---- 9. inherits (write + collect for the reverse index) ----
         let inh_off = pad_up(files_off + n_files * FILE_LEN as u64);
@@ -506,6 +552,7 @@ impl IndexBuilder {
             }
         }
         let n_inh = merged_inh.len() as u64;
+        log_section("inh", n_inh, inh_off + n_inh * INH_LEN as u64);
 
         // ---- 9b. inhrev (by-parent): the SAME edges as `inh`, reversed
         //      to (parent, child) and re-sorted, so `inherited_by(parent)`
@@ -521,6 +568,7 @@ impl IndexBuilder {
             w.write_all(&c.to_be_bytes())?;
         }
         let n_inhrev = inh_rev.len() as u64;
+        log_section("inhrev", n_inhrev, inhrev_off + n_inhrev * INH_LEN as u64);
         drop(inh_rev);
 
         // ---- 10. calls (write + collect for the reverse index) ----
@@ -540,6 +588,7 @@ impl IndexBuilder {
             }
         }
         let n_calls = merged_calls.len() as u64;
+        log_section("calls", n_calls, calls_off + n_calls * CALL_LEN as u64);
 
         // ---- 11. crev (by-callee) ----
         let crev_off = pad_up(calls_off + n_calls * CALL_LEN as u64);
@@ -554,6 +603,7 @@ impl IndexBuilder {
             w.write_all(&[*role])?;
         }
         drop(calls_rev);
+        log_section("crev", n_calls, crev_off + n_calls * CALL_LEN as u64);
 
         // ---- 11b. typed (write + count; strings appended to blob) ----
         // Fold every source's sym-sorted typed table plus the delta into
@@ -579,6 +629,7 @@ impl IndexBuilder {
                 n_typed += 1;
             }
         }
+        log_section("typed", n_typed, typed_off + n_typed * TYPE_LEN as u64);
 
         // ---- 11c. childrev (by-parent membership): fold every source's
         //      (parent, child) childrev table plus the delta. Both halves
@@ -598,6 +649,7 @@ impl IndexBuilder {
                 n_childrev += 1;
             }
         }
+        log_section("childrev", n_childrev, childrev_off + n_childrev * INH_LEN as u64);
 
         // ---- 11d. sig (sym → full signature string) ----
         // Same TypeRow shape + sym-keyed non-empty-wins fold as `typed`;
@@ -622,12 +674,17 @@ impl IndexBuilder {
                 n_sig += 1;
             }
         }
+        log_section("sig", n_sig, sig_off + n_sig * TYPE_LEN as u64);
 
         // ---- 12. blob ----
         let blob_off = pad_up(sig_off + n_sig * TYPE_LEN as u64);
         seek_to(&mut w, blob_off)?;
         w.write_all(&blob)?;
         let blob_len = blob.len() as u64;
+        // The blob holds no fixed-width rows; report its byte length as the
+        // count so the final per-section line still shows the section landing
+        // and the total output size.
+        log_section("blob", blob_len, blob_off + blob_len);
         drop(blob);
 
         // ---- 13. Header (seek back to byte 0, write final counts) ----

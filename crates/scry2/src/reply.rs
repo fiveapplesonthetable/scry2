@@ -89,11 +89,25 @@ pub struct CallNode {
     /// by `parent`). For the root, `dir` is "root".
     pub dir:    String,
     pub name:   String,
+    /// The node's definition site as `path@off`, when the index has a
+    /// DECL/DEF for it. The inheritance forest sets this so each hop
+    /// shows a concrete location next to its (often ticket-shaped) name;
+    /// the callgraph forest leaves it None. Omitted from JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub def: Option<String>,
 }
 
-/// One inheritance hit — produced by `super` / `sub`.
+/// One inheritance hit — produced by `super` / `sub`. `name` is the
+/// related sym's stored name (an FQN alias when one was emitted, else
+/// the raw Kythe ticket); `def` is its definition site as `path@off`
+/// when the index has a DECL/DEF, giving a concrete locator even when
+/// `name` is a bare ticket.
 #[derive(Serialize, Deserialize, Debug)]
-pub struct InhHit { pub name: String }
+pub struct InhHit {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub def: Option<String>,
+}
 
 /// Top-level reply envelope. Tag = command, payload depends on it.
 #[derive(Serialize, Deserialize, Debug)]
@@ -145,6 +159,14 @@ pub fn lang_str(l: u8) -> &'static str {
     }
 }
 
+/// The cap-reached note printed (to stderr) when a result is truncated.
+/// `shown` is how many rows actually printed. Spells out that the count
+/// is capped, not the whole truth, so `--limit`-bounded results aren't
+/// silently mistaken for complete ones.
+fn cap_note(shown: usize) -> String {
+    format!("(showing {shown}; --limit cap reached, more exist — raise --limit)")
+}
+
 /// Print a Reply to stdout in either human or JSON form. `truncated`
 /// notes appear on stderr in both modes so a `| jq` pipeline still
 /// sees clean JSON on stdout.
@@ -174,7 +196,7 @@ pub fn emit(reply: &Reply, as_json: bool) {
                     println!("  {} {}@{}", r.role, r.file, r.off);
                 }
             }
-            if *truncated { eprintln!("(truncated)"); }
+            if *truncated { eprintln!("{}", cap_note(*total)); }
             eprintln!("hits={total}");
         }
         Reply::Type { hits, total, truncated } => {
@@ -182,7 +204,7 @@ pub fn emit(reply: &Reply, as_json: bool) {
                 println!("# {}  [{}/{}]", h.name, h.kind, h.lang);
                 println!("  {}", h.typed);
             }
-            if *truncated { eprintln!("(truncated)"); }
+            if *truncated { eprintln!("{}", cap_note(*total)); }
             eprintln!("hits={total}");
         }
         Reply::Sig { hits, total, truncated } => {
@@ -190,7 +212,7 @@ pub fn emit(reply: &Reply, as_json: bool) {
                 println!("# {}  [{}/{}]", h.name, h.kind, h.lang);
                 println!("  {}", h.sig);
             }
-            if *truncated { eprintln!("(truncated)"); }
+            if *truncated { eprintln!("{}", cap_note(*total)); }
             eprintln!("hits={total}");
         }
         Reply::Members { container, members, total, truncated } => {
@@ -201,20 +223,32 @@ pub fn emit(reply: &Reply, as_json: bool) {
                     None    => println!("  {} [{}/{}]", m.name, m.kind, m.lang),
                 }
             }
-            if *truncated { eprintln!("(truncated)"); }
+            if *truncated { eprintln!("{}", cap_note(*total)); }
             eprintln!("members={total}");
         }
         Reply::Inheritance { nodes, total, truncated } => {
             for n in nodes {
                 let p = n.parent.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-                println!("  id={:<3} parent={:<3} hop={} {:<4} {}",
-                         n.id, p, n.hop, n.dir, n.name);
+                match &n.def {
+                    Some(loc) => println!("  id={:<3} parent={:<3} hop={} {:<4} {}  {}",
+                                          n.id, p, n.hop, n.dir, n.name, loc),
+                    None      => println!("  id={:<3} parent={:<3} hop={} {:<4} {}",
+                                          n.id, p, n.hop, n.dir, n.name),
+                }
             }
-            if *truncated { eprintln!("(inheritance truncated)"); }
+            if *truncated {
+                eprintln!("(showing {}; --max-syms cap reached, more exist — raise --max-syms)",
+                          nodes.len());
+            }
             eprintln!("hits={total}");
         }
         Reply::Inh { hits, total } => {
-            for h in hits { println!("{}", h.name); }
+            for h in hits {
+                match &h.def {
+                    Some(loc) => println!("{}  {}", h.name, loc),
+                    None      => println!("{}", h.name),
+                }
+            }
             eprintln!("hits={total}");
         }
         Reply::Callgraph { nodes, total, truncated } => {

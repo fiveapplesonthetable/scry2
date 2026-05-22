@@ -224,8 +224,32 @@ pub fn ingest_tolerant<R: Read>(
     for (sym, role, file, offset) in &state.xrefs {
         builder.add_xref(remap(*sym), *role, *file, *offset);
     }
+    // -- Aliases → name index, AND promote each sym's DISPLAY name.
+    //
+    // `add_alias` feeds the discovery index (FQN → sym lookup); that is
+    // unchanged. Separately, a sym's display name was seeded to its raw
+    // Kythe ticket at `upsert_sym` time. Now that the whole CU's aliases
+    // are known, pick the cleanest human FQN among a sym's aliases and set
+    // it as the display name so `members`/`super`/`def` render a readable
+    // FQN instead of `kythe:...#<hash>`. The chosen alias is keyed on the
+    // SAME remapped sym the alias/name index uses, so `def FQN` resolves
+    // to a sym whose own metadata also shows that FQN. `set_sym_name`'s
+    // `prefers_name` makes the pick order-independent (an FQN beats the
+    // ticket, shortest/lex-smallest among FQNs), so it does not matter
+    // that aliases arrive in stream order. A sym with no alias keeps its
+    // ticket.
+    let mut best_name: HashMap<u64, &str> = HashMap::new();
     for (sym, alias) in &state.aliases {
-        builder.add_alias(remap(*sym), alias);
+        let rs = remap(*sym);
+        builder.add_alias(rs, alias);
+        best_name.entry(rs)
+            .and_modify(|cur| {
+                if crate::writer::prefers_name(cur, alias) { *cur = alias.as_str(); }
+            })
+            .or_insert(alias.as_str());
+    }
+    for (sym, name) in &best_name {
+        builder.set_sym_name(*sym, name);
     }
     for (child, parent) in &state.inherits {
         // Both endpoints can be a bridged def VName.
@@ -623,9 +647,11 @@ fn process_entry(
                 if a.path.is_empty() { a.path = e.source.path.clone(); }
                 flush_ready(a, body_anchors, call_sites, xrefs, builder, file_ids, stats);
             } else {
-                // Symbol node. Register name (= source_key for now —
-                // FQN normalization via `named` edges is a follow-up)
-                // + kind + lang.
+                // Symbol node. Seed name = source_key (the raw Kythe
+                // ticket) + kind + lang. CU finalize promotes the name to
+                // the cleanest human FQN among the sym's `named`-edge /
+                // MarkedSource aliases via `builder.set_sym_name`; a sym
+                // with no alias keeps the ticket.
                 let k = node_kind_byte(value);
                 let l = e.source.lang_byte();
                 builder.upsert_sym(sym_of(&source_key), k, l, &source_key);
@@ -646,6 +672,20 @@ fn process_entry(
                         types.builtin_op.insert(source_key.clone(), op.to_string());
                     }
                 }
+            }
+        }
+        // `/kythe/subkind` refines a node's kind. java_indexer emits class
+        // fields as node kind `variable` with subkind `field`; without this
+        // they'd be left VARIABLE and the writer's variable-kind alias
+        // suppression (meant for C++ parameters/locals) would strip their
+        // FQN. Promote `field`/`constant` subkinds to FIELD so the field's
+        // `/kythe/edge/named` alias survives and `members` renders it as a
+        // field. Fact order is irrelevant: `mark_field` overwrites
+        // VARIABLE/UNK, and the kind=variable upsert never downgrades FIELD.
+        "/kythe/subkind" => {
+            let value = std::str::from_utf8(&e.fact_value).unwrap_or("");
+            if value == "field" || value == "constant" {
+                builder.mark_field(sym_of(&source_key));
             }
         }
         "/kythe/loc/start" => {
@@ -1161,10 +1201,6 @@ fn render_signature<'a>(
     side: &'a TypeSide,
     typed_of: &HashMap<&'a str, &'a str>,
 ) -> Option<String> {
-    // Parameter syms in ordinal order. No params → nothing to add.
-    let params = side.params.get(fn_key)?;
-    if params.is_empty() { return None; }
-
     // Function short name from its own MarkedSource (may be absent).
     let fn_name = side.code.get(fn_key)
         .and_then(|c| parse_marked_source_fqn(c))
@@ -1181,6 +1217,25 @@ fn render_signature<'a>(
             full[..cut].trim_end().to_string()
         })
         .filter(|s| !s.is_empty());
+
+    // Parameter syms in ordinal order. A function with NO param edges
+    // still gets a sig — `<ret> name()` — when it has BOTH a return type
+    // and a name (`int64_t clearCallingIdentity()`, a constructor's
+    // `S S()`). That's the value-add over `typed`, which carries only the
+    // type-only `<ret>()`. We require the return type (not just the name)
+    // so synthetic zero-param nodes with no type — e.g. the JVM `<clinit>`
+    // static initializer — don't leak in as bogus signatures. With no
+    // params and no return type there is nothing useful to add → honest
+    // emptiness, no row.
+    let params = match side.params.get(fn_key) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return match (&ret_type, &fn_name) {
+                (Some(r), Some(n)) if !n.is_empty() => Some(format!("{r} {n}()")),
+                _ => None,
+            };
+        }
+    };
 
     // Each parameter: `<type> <name>` when both render, else whichever
     // is present. A param that yields neither is rendered as `?`.
@@ -2012,12 +2067,54 @@ mod tests {
     }
 
     #[test]
-    fn render_signature_honest_emptiness_no_params() {
-        // A function with no param edges adds nothing over the type-only
-        // `typed` section, so no sig row is produced.
+    fn render_signature_no_params_name_only_is_empty() {
+        // A zero-param function with a name but NO return type adds nothing
+        // useful over `typed` and risks surfacing synthetic nodes (JVM
+        // `<clinit>`), so it produces no row. `g`'s MarkedSource names it
+        // `frob`, but with no typed edge there is no return type.
         let mut side = TypeSide::default();
         side.functions.push("g".into());
         side.code.insert("g".into(), FROB_FN_CODE.to_vec());
+        let g = CuTypeGraph { side: &side };
+        let typed_of: HashMap<&str, &str> = HashMap::new();
+        assert_eq!(render_signature(&g, "g", &side, &typed_of), None);
+    }
+
+    #[test]
+    fn render_signature_no_params_with_return_type() {
+        // The clearCallingIdentity case: a zero-param function with a
+        // return-type typed edge renders `<ret> name()`. The function's
+        // own typed edge is a `fn` tapp `int64_t()`; we take the `<ret>`
+        // part and prepend the name.
+        let mut side = TypeSide::default();
+        side.functions.push("cci".into());
+        // Name `frob` via the shared FROB_FN_CODE MarkedSource.
+        side.code.insert("cci".into(), FROB_FN_CODE.to_vec());
+        // typed edge → `fn` tapp with just a return leaf (no args).
+        side.edges.push(("cci".into(), "fn_t".into()));
+        side.kind.insert("fn_t".into(), "tapp".into());
+        side.builtin_op.insert("fn_op".into(), "fn".into());
+        side.kind.insert("fn_op".into(), "tbuiltin".into());
+        let mut fnp = std::collections::BTreeMap::new();
+        fnp.insert(0u32, "fn_op".to_string());   // head = fn
+        fnp.insert(1u32, "int".to_string());     // ret  = int
+        side.params.insert("fn_t".into(), fnp);
+        side.kind.insert("int".into(), "tbuiltin".into());
+        side.code.insert("int".into(), INT_CODE.to_vec());
+
+        let g = CuTypeGraph { side: &side };
+        let typed_of: HashMap<&str, &str> = side.edges.iter()
+            .map(|(s, t)| (s.as_str(), t.as_str())).collect();
+        assert_eq!(render_signature(&g, "cci", &side, &typed_of).as_deref(),
+                   Some("int frob()"));
+    }
+
+    #[test]
+    fn render_signature_no_params_no_name_no_type_is_empty() {
+        // With NEITHER a name NOR a return type, a zero-param function adds
+        // nothing over `typed` → honest emptiness, no row.
+        let mut side = TypeSide::default();
+        side.functions.push("g".into());
         let g = CuTypeGraph { side: &side };
         let typed_of: HashMap<&str, &str> = HashMap::new();
         assert_eq!(render_signature(&g, "g", &side, &typed_of), None);
@@ -2082,9 +2179,12 @@ mod tests {
         let mut builder = IndexBuilder::new();
         let fids = FileIdAllocator::default();
         let stats = ingest(ENTRIES, &mut builder, &fids).unwrap();
-        // Both methods produced a sig row (return + named params).
-        assert_eq!(stats.sigs_emitted, 2,
-            "both Java methods render a full named signature");
+        // Both methods render a full named signature; the zero-param
+        // default constructor `S()` now renders `S S()` too (return type +
+        // name). The synthetic `<clinit>` static initializer has no return
+        // type, so it stays out (honest emptiness).
+        assert_eq!(stats.sigs_emitted, 3,
+            "two methods + the constructor render; <clinit> excluded");
         fids.drain_into(&mut builder);
 
         // Round-trip through the on-disk format so we exercise `sig_of`
@@ -2114,13 +2214,63 @@ mod tests {
             Some("java.util.List<java.lang.String> pick(int idx, java.lang.String key)"),
             "generic return tapp + builtin and record param types + names");
 
-        // The sig section holds exactly these two rows.
+        // The sig section holds exactly these three rows: the two methods
+        // plus the zero-param constructor `S S()`.
         let rows: std::collections::BTreeSet<&str> =
             idx.iter_sig().map(|(_, s)| s).collect();
-        assert_eq!(rows.len(), 2, "exactly the two method sigs");
+        assert_eq!(rows.len(), 3, "the two method sigs plus the constructor");
         assert!(rows.contains("void setEnabled(boolean enabled)"));
         assert!(rows.contains(
             "java.util.List<java.lang.String> pick(int idx, java.lang.String key)"));
+        assert!(rows.contains("S S()"),
+            "zero-param constructor renders `<ret> name()`");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CU-finalize FQN normalization, end-to-end on the SAME real
+    /// java_indexer fixture. After ingest, a method sym's DISPLAY name
+    /// (what `sym_meta` returns and `members`/`super`/`def` render) must be
+    /// the readable FQN promoted from its `/kythe/edge/named` alias — NOT
+    /// the raw Kythe ticket the streaming `upsert_sym` seeded. Discovery
+    /// (FQN → sym via `sym_for_name`) must keep working unchanged, and the
+    /// resolved sym's metadata name must match the FQN it was found by.
+    #[test]
+    fn ingest_promotes_sym_display_name_to_fqn() {
+        use crate::reader::Index;
+        const ENTRIES: &[u8] =
+            include_bytes!("../tests/fixtures/java_sig_S.entries");
+
+        let mut builder = IndexBuilder::new();
+        let fids = FileIdAllocator::default();
+        ingest(ENTRIES, &mut builder, &fids).unwrap();
+        fids.drain_into(&mut builder);
+
+        let tid = format!("{:?}", std::thread::current().id());
+        let tid_num: String = tid.chars().filter(|c| c.is_ascii_digit()).collect();
+        let dir = std::env::temp_dir().join(format!(
+            "scry2-fqn-norm-{}-{}", std::process::id(), tid_num));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s2db = dir.join("fqn_norm.s2db");
+        builder.finish(&s2db).unwrap();
+        let idx = Index::open(&s2db).unwrap();
+
+        // Discovery still works: the descriptor-stripped FQN resolves.
+        let set_sym = idx.sym_for_name("S.setEnabled")
+            .expect("S.setEnabled resolves (discovery unbroken)");
+        // The sym's DISPLAY name is now the readable FQN, not a ticket.
+        let (name, _, _) = idx.sym_meta(set_sym).unwrap();
+        assert!(!name.starts_with("kythe:"),
+            "display name must not be a raw ticket, got {name:?}");
+        assert_eq!(name, "S.setEnabled",
+            "display name promoted to the cleanest (descriptor-stripped) FQN");
+
+        let pick_sym = idx.sym_for_name("S.pick")
+            .expect("S.pick resolves (discovery unbroken)");
+        let (pname, _, _) = idx.sym_meta(pick_sym).unwrap();
+        assert!(!pname.starts_with("kythe:"),
+            "pick display name must not be a raw ticket, got {pname:?}");
+        assert_eq!(pname, "S.pick");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2587,6 +2737,75 @@ mod tests {
         // The DEF sym has NO xrefs of its own — they all moved to DECL.
         assert_eq!(idx.xrefs(def_sym, role::DECL, role::DEF).count(), 0,
             "def sym's xref was remapped away");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Java field node — kind `variable` with subkind `field` — keeps its
+    /// FQN alias (so `def`/`names` find it) and its type, and renders as
+    /// FIELD. Without the subkind→FIELD promotion the writer's variable-kind
+    /// alias suppression (which exists to drop C++ parameter aliases) would
+    /// strip the field's `/kythe/edge/named` FQN, leaving it unqueryable.
+    #[test]
+    fn java_field_subkind_keeps_alias_and_type() {
+        use crate::reader::Index;
+        use crate::format::kind as kbyte;
+
+        // VName proto: 1=signature, 2=corpus, 4=path, 5=language.
+        fn java_vname(sig: &[u8], path: &[u8]) -> Vec<u8> {
+            let mut v = Vec::new();
+            ld(1, sig, &mut v);
+            ld(2, b"test", &mut v);
+            ld(4, path, &mut v);
+            ld(5, b"java", &mut v);
+            v
+        }
+
+        let field_vn = java_vname(b"#field", b"S.java");
+        let type_vn  = java_vname(b"java.lang.String", b"");  // the field's type node
+        // `named` edge target whose signature is the field FQN.
+        let mut name_vn = Vec::new();
+        ld(1, b"S.value", &mut name_vn);
+        // Declaration anchor binding the field.
+        let anchor_vn = java_vname(b"#a", b"S.java");
+
+        let mut stream = Vec::new();
+        // Field node: kind=variable THEN subkind=field (java_indexer order).
+        push_entry(&mut stream, entry(&field_vn, b"", b"", b"/kythe/node/kind", b"variable"));
+        push_entry(&mut stream, entry(&field_vn, b"", b"", b"/kythe/subkind", b"field"));
+        // FQN alias + typed edge to the type node.
+        push_entry(&mut stream, entry(&field_vn, b"/kythe/edge/named", &name_vn, b"/", b""));
+        push_entry(&mut stream, entry(&field_vn, b"/kythe/edge/typed", &type_vn, b"/", b""));
+        // The type node renders its name from a record kind + MarkedSource.
+        push_entry(&mut stream, entry(&type_vn, b"", b"", b"/kythe/node/kind", b"record"));
+        // MarkedSource (FQN `java.lang.String`) so render_type yields a name.
+        push_entry(&mut stream, entry(&type_vn, b"", b"", b"/kythe/code", STRING_CODE));
+        // Anchor binds the field (a DECL location).
+        push_entry(&mut stream, entry(&anchor_vn, b"", b"", b"/kythe/node/kind", b"anchor"));
+        push_entry(&mut stream, entry(&anchor_vn, b"", b"", b"/kythe/loc/start", b"42"));
+        push_entry(&mut stream, entry(&anchor_vn, b"/kythe/edge/defines/binding", &field_vn, b"/", b""));
+
+        let mut builder = IndexBuilder::new();
+        let fids = FileIdAllocator::default();
+        ingest(&stream[..], &mut builder, &fids).unwrap();
+        fids.drain_into(&mut builder);
+
+        let dir = std::env::temp_dir().join(format!(
+            "scry2-jfield-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s2db = dir.join("jfield.s2db");
+        builder.finish(&s2db).unwrap();
+        let idx = Index::open(&s2db).unwrap();
+
+        // The FQN alias survived → `def`/`names` resolve the field.
+        let field_sym = idx.sym_for_name("S.value")
+            .expect("field FQN alias survives subkind→FIELD promotion");
+        // The sym renders as FIELD, not VARIABLE.
+        let (_, k, _) = idx.sym_meta(field_sym).expect("field sym present");
+        assert_eq!(k, kbyte::FIELD, "variable+subkind=field promoted to FIELD");
+        // The field's type was captured.
+        assert_eq!(idx.type_of(field_sym), Some("java.lang.String"),
+            "field keeps its typed edge");
 
         std::fs::remove_dir_all(&dir).ok();
     }

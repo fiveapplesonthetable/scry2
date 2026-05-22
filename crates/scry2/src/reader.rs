@@ -734,6 +734,21 @@ impl Index {
         None
     }
 
+    /// The definition location of `sym` as `(file_id, offset)`, preferring
+    /// a DEF row over a DECL row (so a real definition wins over a forward
+    /// declaration). Returns None when the sym has neither. Used by the
+    /// inheritance verbs to give every related sym a concrete `path@off`
+    /// locator instead of a bare ticket. The DECL/DEF range is small and
+    /// already binary-searched, so scanning it to pick the DEF is cheap.
+    pub fn sym_def_loc(&self, sym: u64) -> Option<(u32, u32)> {
+        let mut decl: Option<(u32, u32)> = None;
+        for (_, r, file, off) in self.xrefs(sym, role::DECL, role::DEF) {
+            if r == role::DEF { return Some((file, off)); }
+            if r == role::DECL && decl.is_none() { decl = Some((file, off)); }
+        }
+        decl
+    }
+
     // -- inheritance ---------------------------------------------------------
 
     /// `inherits(child)` returns each parent. (super)

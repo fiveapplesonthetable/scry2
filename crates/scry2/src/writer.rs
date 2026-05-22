@@ -55,17 +55,52 @@ impl IndexBuilder {
         self.xrefs.push((sym, role, file, offset));
     }
 
-    /// Record a symbol's metadata. Later calls override earlier ones —
+    /// Record a symbol's metadata. Later calls refine earlier ones —
     /// the indexer may see a symbol via a `defines/binding` edge before
     /// the node-kind fact arrives, so the kind/lang refines over time.
+    ///
+    /// The display NAME is chosen by [`prefers_name`], not first-wins: a
+    /// human FQN learned from a `named` edge / MarkedSource (set via
+    /// [`set_sym_name`]) must beat the raw Kythe ticket this method seeds,
+    /// and the choice between two names is order-independent so a sym fed
+    /// the same two candidates in either CU/shard order ends up identical.
+    /// A ticket can never overwrite an FQN.
     pub fn upsert_sym(&mut self, sym: u64, kind: u8, lang: u8, name: &str) {
         self.syms.entry(sym)
             .and_modify(|e| {
                 if e.0 == kind::UNK { e.0 = kind; }
                 if e.1 == lang::UNK { e.1 = lang; }
-                if e.2.is_empty()   { e.2 = name.to_string(); }
+                if prefers_name(&e.2, name) { e.2 = name.to_string(); }
             })
             .or_insert_with(|| (kind, lang, name.to_string()));
+    }
+
+    /// Set `sym`'s human display name to `name`, applying the same
+    /// order-independent [`prefers_name`] preference as [`upsert_sym`].
+    /// Called at CU finalize once the sym's `named`-edge / MarkedSource
+    /// FQNs are known, so a sym whose `upsert_sym` seeded the raw Kythe
+    /// ticket gets promoted to the readable FQN. Kind/lang are untouched;
+    /// a sym with no metadata row yet gets one seeded at UNK so the name
+    /// survives a later kind/lang refine.
+    pub fn set_sym_name(&mut self, sym: u64, name: &str) {
+        if name.is_empty() { return; }
+        self.syms.entry(sym)
+            .and_modify(|e| { if prefers_name(&e.2, name) { e.2 = name.to_string(); } })
+            .or_insert_with(|| (kind::UNK, lang::UNK, name.to_string()));
+    }
+
+    /// Promote `sym` to FIELD kind, learned from a `/kythe/subkind=field`
+    /// fact. java_indexer emits class fields as node kind `variable` with
+    /// subkind `field`; left as VARIABLE they'd be swept up by the
+    /// variable-kind alias suppression (which exists to drop C++ parameter
+    /// aliases), losing the field's FQN. Marking them FIELD keeps the FQN
+    /// and renders them as `field` in `members`. Overwrites VARIABLE/UNK;
+    /// the later kind=variable upsert won't downgrade FIELD (upsert only
+    /// sets kind when it is still UNK), so fact order doesn't matter.
+    pub fn mark_field(&mut self, sym: u64) {
+        self.syms.entry(sym)
+            .and_modify(|e| e.0 = kind::FIELD)
+            .or_insert((kind::FIELD, lang::UNK, String::new()));
     }
 
     /// Record file_id → absolute path mapping. Caller picks the file_id
@@ -183,7 +218,11 @@ impl IndexBuilder {
                     let e = o.get_mut();
                     if e.0 == kind::UNK { e.0 = kind; }
                     if e.1 == lang::UNK { e.1 = lang; }
-                    if e.2.is_empty()   { e.2 = name; }
+                    // Name: order-independent preference, not first-wins —
+                    // an FQN from one shard must beat a ticket from another
+                    // (and vice-versa) regardless of which sink drains
+                    // first. Matches `upsert_sym` / `merge_syms_refine`.
+                    if prefers_name(&e.2, &name) { e.2 = name; }
                 }
                 Entry::Vacant(v) => { v.insert((kind, lang, name)); }
             }
@@ -1179,11 +1218,44 @@ where
     acc
 }
 
+/// True for a raw Kythe VName ticket — the symbol string
+/// [`crate::kythe::VName::to_symbol_string`] produces, which always begins
+/// with the `kythe:` scheme. A human FQN learned from a `named` edge /
+/// MarkedSource never starts with this, so it is the cheap "is this still
+/// a ticket?" test the display-name preference branches on.
+fn is_ticket_name(name: &str) -> bool {
+    name.starts_with("kythe:")
+}
+
+/// Order-independent choice between the current display name `cur` and a
+/// candidate `cand` for the SAME sym. Returns true iff `cand` should
+/// replace `cur`. The total order is: a non-empty name beats empty; a
+/// human FQN (non-ticket) beats a raw Kythe ticket and a ticket NEVER
+/// overwrites an FQN; within the same class (both FQNs or both tickets)
+/// the shorter string wins, ties broken by lexicographically smaller.
+///
+/// Being a pure function of the two strings, the winner is the same
+/// regardless of which CU/shard supplied which name — so per-CU
+/// `upsert_sym`, builder `merge_from`, and the final k-way
+/// `merge_syms_refine` all converge on one deterministic display name.
+pub(crate) fn prefers_name(cur: &str, cand: &str) -> bool {
+    if cand.is_empty() { return false; }
+    if cur.is_empty()  { return true; }
+    match (is_ticket_name(cur), is_ticket_name(cand)) {
+        (true, false) => true,   // FQN beats ticket
+        (false, true) => false,  // ticket never beats FQN
+        // Same class: shorter wins, then lexicographically smaller.
+        _ => (cand.len(), cand) < (cur.len(), cur),
+    }
+}
+
 /// Merge two sym streams (each sorted by sym id), refining on tied ids.
-/// Yields `(sym, kind, lang, name)`. On a tie, a known kind/lang/name
-/// from either side wins over the other's UNK/empty — mirroring
-/// `upsert_sym`/`merge_from`, so a sym referenced as UNK in one shard
-/// and defined in another ends up defined regardless of merge order.
+/// Yields `(sym, kind, lang, name)`. On a tie, a known kind/lang from
+/// either side wins over the other's UNK, and the display name is chosen
+/// by [`prefers_name`] (FQN over ticket, then shortest/lex) — mirroring
+/// `upsert_sym`/`merge_from`, so a sym referenced (ticket) in one shard
+/// and defined-with-FQN in another ends up with the FQN regardless of
+/// merge order.
 fn merge_syms_refine<'a, A, B>(a: A, b: B) -> impl Iterator<Item = (u64, u8, u8, &'a str)>
 where
     A: Iterator<Item = (u64, u8, u8, &'a str)>,
@@ -1215,7 +1287,9 @@ where
                             let (_,  bk, bl, bn) = self.b.next().unwrap();
                             let kind = if ak != kind::UNK { ak } else { bk };
                             let lang = if al != lang::UNK { al } else { bl };
-                            let name = if !an.is_empty()  { an } else { bn };
+                            // FQN beats ticket, then shortest/lex — same
+                            // order-independent rule as `upsert_sym`.
+                            let name = if prefers_name(an, bn) { bn } else { an };
                             Some((sym, kind, lang, name))
                         }
                     }

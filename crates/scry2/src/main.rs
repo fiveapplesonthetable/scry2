@@ -98,9 +98,10 @@ enum Cmd {
     /// `def NAME` — print the definition site(s) of a symbol.
     Def {
         name: String,
-        /// Match NAME as a substring of the qualified name (a parallel
-        /// scan of the whole name table). Omit for an exact-FQN lookup,
-        /// which is a binary search.
+        /// Match NAME as a substring of the qualified symbol ticket
+        /// (paths/enclosing identifiers included), via a parallel scan of
+        /// the whole name table. Omit for an exact-FQN lookup, which is a
+        /// binary search.
         #[arg(long)] substr: bool,
         /// With --substr, fold ASCII case so NAME matches regardless of
         /// case. Default is case-SENSITIVE (code identifiers are

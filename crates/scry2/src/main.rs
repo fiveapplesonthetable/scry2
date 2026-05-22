@@ -384,7 +384,8 @@ enum Cmd {
         /// disables the count trigger.
         #[arg(long = "snapshot-every", default_value_t = 2000)] snapshot_every: usize,
         /// Snapshot whenever the in-RAM delta reaches this many rows
-        /// (xrefs+inherits+calls+aliases), independent of CU count.
+        /// (xrefs+inherits+calls+aliases+typed+childof+sig — every
+        /// append-only delta table), independent of CU count.
         /// This is what bounds peak memory: large CUs cross the
         /// budget sooner and trigger an earlier snapshot, so the peak
         /// is deterministic regardless of how rows are distributed
@@ -1537,10 +1538,16 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                                             let taken_builder = std::mem::take(&mut sink.builder);
                                             let taken_shas    = std::mem::take(&mut sink.pending_shas);
                                             drop(sink);
-                                            drained_rows += (taken_builder.n_xrefs()
-                                                + taken_builder.n_inh()
-                                                + taken_builder.n_calls()
-                                                + taken_builder.n_aliases()) as u64;
+                                            // Subtract the SAME table set the
+                                            // worker added via `dedup_tables()`
+                                            // (xrefs+inh+calls+aliases+typed+
+                                            // childof+sig). Counting fewer
+                                            // tables here than the add leaks the
+                                            // difference into the gauge on every
+                                            // CU, drifting `delta_rows` up
+                                            // monotonically — the 12x-over-cap
+                                            // reading and the v4-only regression.
+                                            drained_rows += taken_builder.delta_row_count() as u64;
                                             acc.builder.merge_from(taken_builder);
                                             drained_shas.extend(taken_shas);
                                             drained_n += 1;

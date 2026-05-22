@@ -137,6 +137,40 @@ mod tests {
     }
 
     #[test]
+    fn delta_gauge_add_and_sub_count_identical_tables() {
+        // Regression: the `from-kzip` row-budget gauge adds a CU's
+        // `dedup_tables()` count and subtracts a drained sink's
+        // `delta_row_count()`. If those two cover different table sets,
+        // the gauge drifts monotonically (the v4 typed/childof/sig
+        // tables were added to `dedup_tables` but the drain's subtraction
+        // counted only xrefs+inh+calls+aliases, so 3 tables' rows were
+        // never subtracted — `delta_rows` ran ~12x over its cap). Assert
+        // the two are equal AND that every append-only table contributes,
+        // so adding a future table to one path without the other fails here.
+        let mut b = IndexBuilder::new();
+        let s1 = sym_of("kythe:c++:test###a");
+        let s2 = sym_of("kythe:c++:test###b");
+        b.add_xref(s1, role::DECL, 1, 10);
+        b.add_inherit(s1, s2);
+        b.add_call(s1, s2, role::CALL);
+        b.add_alias(s1, "ns::a");
+        b.add_type(s1, "const int &");      // v4: typed
+        b.add_childof(s2, s1);              // v4: childrev
+        b.add_sig(s1, "void a(int x)");    // v4: sig
+        // syms/files are keyed maps, excluded from the delta gauge.
+        b.upsert_sym(s1, kind::FUNCTION, lang::CXX, "a");
+        b.upsert_file(1, "/a.cpp");
+
+        let added = b.dedup_tables();      // the worker's "add" value
+        let to_sub = b.delta_row_count();  // the snapshotter's "sub" value
+        assert_eq!(added, to_sub,
+            "dedup_tables (add) and delta_row_count (sub) must cover identical tables");
+        // 7 append-only tables, one distinct row each.
+        assert_eq!(added, 7,
+            "every append-only table (incl v4 typed/childof/sig) must be counted");
+    }
+
+    #[test]
     fn merge_from_first_wins_on_sym_metadata() {
         // Two workers see the same sym; the first one's kind/lang/name
         // wins, matching `upsert_sym`'s in-builder semantics.

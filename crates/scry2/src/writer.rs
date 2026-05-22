@@ -136,6 +136,22 @@ impl IndexBuilder {
     pub fn n_childof(&self) -> usize { self.childof.len() }
     pub fn n_sig(&self)   -> usize { self.sig.len() }
 
+    /// Total append-only row count across EVERY delta table — the same
+    /// set, in the same order, that [`dedup_tables`] returns after
+    /// collapsing duplicates. This is the unit the `from-kzip`
+    /// `delta_rows` budget gauge is denominated in: workers add a CU's
+    /// `dedup_tables()` count, the snapshotter subtracts a drained
+    /// sink's `delta_row_count()`. The two MUST cover identical tables
+    /// or the gauge drifts monotonically (an add-only table never gets
+    /// subtracted), so both are defined here in one place. The keyed
+    /// maps (`syms`, `files`) are excluded from both — they're not
+    /// append-only and don't grow the delta proportionally.
+    pub fn delta_row_count(&self) -> usize {
+        self.xrefs.len() + self.inherits.len() + self.calls.len()
+            + self.aliases.len() + self.typed.len()
+            + self.childof.len() + self.sig.len()
+    }
+
     /// Move every row from `other` into `self`, leaving `other`
     /// empty. The mirror of [`populate_from_index`] but in-memory
     /// and zero-copy on the per-row vectors. Used by `from-kzip`
@@ -197,8 +213,10 @@ impl IndexBuilder {
     /// driver of from-kzip's in-memory delta. Calling this on each CU
     /// before merging keeps the sink proportional to distinct facts.
     ///
-    /// Returns the number of rows remaining after dedup (xrefs +
-    /// inherits + calls + aliases), for buffer accounting.
+    /// Returns the number of rows remaining after dedup, across every
+    /// append-only delta table (see [`delta_row_count`]), for buffer
+    /// accounting. The `from-kzip` gauge subtracts the matching
+    /// `delta_row_count()` on drain, so both sides cover identical tables.
     pub fn dedup_tables(&mut self) -> usize {
         self.xrefs.sort_unstable();
         self.xrefs.dedup();
@@ -214,9 +232,7 @@ impl IndexBuilder {
         self.childof.dedup();
         self.sig.sort_unstable();
         self.sig.dedup();
-        self.xrefs.len() + self.inherits.len() + self.calls.len()
-            + self.aliases.len() + self.typed.len()
-            + self.childof.len() + self.sig.len()
+        self.delta_row_count()
     }
 
     /// Snapshot the current accumulated state to `path` without

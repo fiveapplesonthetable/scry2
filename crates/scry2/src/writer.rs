@@ -68,6 +68,20 @@ impl IndexBuilder {
             .or_insert_with(|| (kind, lang, name.to_string()));
     }
 
+    /// Promote `sym` to FIELD kind, learned from a `/kythe/subkind=field`
+    /// fact. java_indexer emits class fields as node kind `variable` with
+    /// subkind `field`; left as VARIABLE they'd be swept up by the
+    /// variable-kind alias suppression (which exists to drop C++ parameter
+    /// aliases), losing the field's FQN. Marking them FIELD keeps the FQN
+    /// and renders them as `field` in `members`. Overwrites VARIABLE/UNK;
+    /// the later kind=variable upsert won't downgrade FIELD (upsert only
+    /// sets kind when it is still UNK), so fact order doesn't matter.
+    pub fn mark_field(&mut self, sym: u64) {
+        self.syms.entry(sym)
+            .and_modify(|e| e.0 = kind::FIELD)
+            .or_insert((kind::FIELD, lang::UNK, String::new()));
+    }
+
     /// Record file_id → absolute path mapping. Caller picks the file_id
     /// (typically a small monotonically-increasing u32 keyed off the
     /// path's first-occurrence order).

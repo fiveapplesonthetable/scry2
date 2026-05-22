@@ -648,6 +648,20 @@ fn process_entry(
                 }
             }
         }
+        // `/kythe/subkind` refines a node's kind. java_indexer emits class
+        // fields as node kind `variable` with subkind `field`; without this
+        // they'd be left VARIABLE and the writer's variable-kind alias
+        // suppression (meant for C++ parameters/locals) would strip their
+        // FQN. Promote `field`/`constant` subkinds to FIELD so the field's
+        // `/kythe/edge/named` alias survives and `members` renders it as a
+        // field. Fact order is irrelevant: `mark_field` overwrites
+        // VARIABLE/UNK, and the kind=variable upsert never downgrades FIELD.
+        "/kythe/subkind" => {
+            let value = std::str::from_utf8(&e.fact_value).unwrap_or("");
+            if value == "field" || value == "constant" {
+                builder.mark_field(sym_of(&source_key));
+            }
+        }
         "/kythe/loc/start" => {
             if let Some(v) = parse_ascii_u32(&e.fact_value) {
                 let a = anchors.entry(source_key.clone()).or_default();
@@ -2650,6 +2664,75 @@ mod tests {
         // The DEF sym has NO xrefs of its own — they all moved to DECL.
         assert_eq!(idx.xrefs(def_sym, role::DECL, role::DEF).count(), 0,
             "def sym's xref was remapped away");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Java field node — kind `variable` with subkind `field` — keeps its
+    /// FQN alias (so `def`/`names` find it) and its type, and renders as
+    /// FIELD. Without the subkind→FIELD promotion the writer's variable-kind
+    /// alias suppression (which exists to drop C++ parameter aliases) would
+    /// strip the field's `/kythe/edge/named` FQN, leaving it unqueryable.
+    #[test]
+    fn java_field_subkind_keeps_alias_and_type() {
+        use crate::reader::Index;
+        use crate::format::kind as kbyte;
+
+        // VName proto: 1=signature, 2=corpus, 4=path, 5=language.
+        fn java_vname(sig: &[u8], path: &[u8]) -> Vec<u8> {
+            let mut v = Vec::new();
+            ld(1, sig, &mut v);
+            ld(2, b"test", &mut v);
+            ld(4, path, &mut v);
+            ld(5, b"java", &mut v);
+            v
+        }
+
+        let field_vn = java_vname(b"#field", b"S.java");
+        let type_vn  = java_vname(b"java.lang.String", b"");  // the field's type node
+        // `named` edge target whose signature is the field FQN.
+        let mut name_vn = Vec::new();
+        ld(1, b"S.value", &mut name_vn);
+        // Declaration anchor binding the field.
+        let anchor_vn = java_vname(b"#a", b"S.java");
+
+        let mut stream = Vec::new();
+        // Field node: kind=variable THEN subkind=field (java_indexer order).
+        push_entry(&mut stream, entry(&field_vn, b"", b"", b"/kythe/node/kind", b"variable"));
+        push_entry(&mut stream, entry(&field_vn, b"", b"", b"/kythe/subkind", b"field"));
+        // FQN alias + typed edge to the type node.
+        push_entry(&mut stream, entry(&field_vn, b"/kythe/edge/named", &name_vn, b"/", b""));
+        push_entry(&mut stream, entry(&field_vn, b"/kythe/edge/typed", &type_vn, b"/", b""));
+        // The type node renders its name from a record kind + MarkedSource.
+        push_entry(&mut stream, entry(&type_vn, b"", b"", b"/kythe/node/kind", b"record"));
+        // MarkedSource (FQN `java.lang.String`) so render_type yields a name.
+        push_entry(&mut stream, entry(&type_vn, b"", b"", b"/kythe/code", STRING_CODE));
+        // Anchor binds the field (a DECL location).
+        push_entry(&mut stream, entry(&anchor_vn, b"", b"", b"/kythe/node/kind", b"anchor"));
+        push_entry(&mut stream, entry(&anchor_vn, b"", b"", b"/kythe/loc/start", b"42"));
+        push_entry(&mut stream, entry(&anchor_vn, b"/kythe/edge/defines/binding", &field_vn, b"/", b""));
+
+        let mut builder = IndexBuilder::new();
+        let fids = FileIdAllocator::default();
+        ingest(&stream[..], &mut builder, &fids).unwrap();
+        fids.drain_into(&mut builder);
+
+        let dir = std::env::temp_dir().join(format!(
+            "scry2-jfield-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s2db = dir.join("jfield.s2db");
+        builder.finish(&s2db).unwrap();
+        let idx = Index::open(&s2db).unwrap();
+
+        // The FQN alias survived → `def`/`names` resolve the field.
+        let field_sym = idx.sym_for_name("S.value")
+            .expect("field FQN alias survives subkind→FIELD promotion");
+        // The sym renders as FIELD, not VARIABLE.
+        let (_, k, _) = idx.sym_meta(field_sym).expect("field sym present");
+        assert_eq!(k, kbyte::FIELD, "variable+subkind=field promoted to FIELD");
+        // The field's type was captured.
+        assert_eq!(idx.type_of(field_sym), Some("java.lang.String"),
+            "field keeps its typed edge");
 
         std::fs::remove_dir_all(&dir).ok();
     }

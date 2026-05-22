@@ -1161,10 +1161,6 @@ fn render_signature<'a>(
     side: &'a TypeSide,
     typed_of: &HashMap<&'a str, &'a str>,
 ) -> Option<String> {
-    // Parameter syms in ordinal order. No params → nothing to add.
-    let params = side.params.get(fn_key)?;
-    if params.is_empty() { return None; }
-
     // Function short name from its own MarkedSource (may be absent).
     let fn_name = side.code.get(fn_key)
         .and_then(|c| parse_marked_source_fqn(c))
@@ -1181,6 +1177,25 @@ fn render_signature<'a>(
             full[..cut].trim_end().to_string()
         })
         .filter(|s| !s.is_empty());
+
+    // Parameter syms in ordinal order. A function with NO param edges
+    // still gets a sig — `<ret> name()` — when it has BOTH a return type
+    // and a name (`int64_t clearCallingIdentity()`, a constructor's
+    // `S S()`). That's the value-add over `typed`, which carries only the
+    // type-only `<ret>()`. We require the return type (not just the name)
+    // so synthetic zero-param nodes with no type — e.g. the JVM `<clinit>`
+    // static initializer — don't leak in as bogus signatures. With no
+    // params and no return type there is nothing useful to add → honest
+    // emptiness, no row.
+    let params = match side.params.get(fn_key) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return match (&ret_type, &fn_name) {
+                (Some(r), Some(n)) if !n.is_empty() => Some(format!("{r} {n}()")),
+                _ => None,
+            };
+        }
+    };
 
     // Each parameter: `<type> <name>` when both render, else whichever
     // is present. A param that yields neither is rendered as `?`.
@@ -2012,12 +2027,54 @@ mod tests {
     }
 
     #[test]
-    fn render_signature_honest_emptiness_no_params() {
-        // A function with no param edges adds nothing over the type-only
-        // `typed` section, so no sig row is produced.
+    fn render_signature_no_params_name_only_is_empty() {
+        // A zero-param function with a name but NO return type adds nothing
+        // useful over `typed` and risks surfacing synthetic nodes (JVM
+        // `<clinit>`), so it produces no row. `g`'s MarkedSource names it
+        // `frob`, but with no typed edge there is no return type.
         let mut side = TypeSide::default();
         side.functions.push("g".into());
         side.code.insert("g".into(), FROB_FN_CODE.to_vec());
+        let g = CuTypeGraph { side: &side };
+        let typed_of: HashMap<&str, &str> = HashMap::new();
+        assert_eq!(render_signature(&g, "g", &side, &typed_of), None);
+    }
+
+    #[test]
+    fn render_signature_no_params_with_return_type() {
+        // The clearCallingIdentity case: a zero-param function with a
+        // return-type typed edge renders `<ret> name()`. The function's
+        // own typed edge is a `fn` tapp `int64_t()`; we take the `<ret>`
+        // part and prepend the name.
+        let mut side = TypeSide::default();
+        side.functions.push("cci".into());
+        // Name `frob` via the shared FROB_FN_CODE MarkedSource.
+        side.code.insert("cci".into(), FROB_FN_CODE.to_vec());
+        // typed edge → `fn` tapp with just a return leaf (no args).
+        side.edges.push(("cci".into(), "fn_t".into()));
+        side.kind.insert("fn_t".into(), "tapp".into());
+        side.builtin_op.insert("fn_op".into(), "fn".into());
+        side.kind.insert("fn_op".into(), "tbuiltin".into());
+        let mut fnp = std::collections::BTreeMap::new();
+        fnp.insert(0u32, "fn_op".to_string());   // head = fn
+        fnp.insert(1u32, "int".to_string());     // ret  = int
+        side.params.insert("fn_t".into(), fnp);
+        side.kind.insert("int".into(), "tbuiltin".into());
+        side.code.insert("int".into(), INT_CODE.to_vec());
+
+        let g = CuTypeGraph { side: &side };
+        let typed_of: HashMap<&str, &str> = side.edges.iter()
+            .map(|(s, t)| (s.as_str(), t.as_str())).collect();
+        assert_eq!(render_signature(&g, "cci", &side, &typed_of).as_deref(),
+                   Some("int frob()"));
+    }
+
+    #[test]
+    fn render_signature_no_params_no_name_no_type_is_empty() {
+        // With NEITHER a name NOR a return type, a zero-param function adds
+        // nothing over `typed` → honest emptiness, no row.
+        let mut side = TypeSide::default();
+        side.functions.push("g".into());
         let g = CuTypeGraph { side: &side };
         let typed_of: HashMap<&str, &str> = HashMap::new();
         assert_eq!(render_signature(&g, "g", &side, &typed_of), None);
@@ -2082,9 +2139,12 @@ mod tests {
         let mut builder = IndexBuilder::new();
         let fids = FileIdAllocator::default();
         let stats = ingest(ENTRIES, &mut builder, &fids).unwrap();
-        // Both methods produced a sig row (return + named params).
-        assert_eq!(stats.sigs_emitted, 2,
-            "both Java methods render a full named signature");
+        // Both methods render a full named signature; the zero-param
+        // default constructor `S()` now renders `S S()` too (return type +
+        // name). The synthetic `<clinit>` static initializer has no return
+        // type, so it stays out (honest emptiness).
+        assert_eq!(stats.sigs_emitted, 3,
+            "two methods + the constructor render; <clinit> excluded");
         fids.drain_into(&mut builder);
 
         // Round-trip through the on-disk format so we exercise `sig_of`
@@ -2114,13 +2174,16 @@ mod tests {
             Some("java.util.List<java.lang.String> pick(int idx, java.lang.String key)"),
             "generic return tapp + builtin and record param types + names");
 
-        // The sig section holds exactly these two rows.
+        // The sig section holds exactly these three rows: the two methods
+        // plus the zero-param constructor `S S()`.
         let rows: std::collections::BTreeSet<&str> =
             idx.iter_sig().map(|(_, s)| s).collect();
-        assert_eq!(rows.len(), 2, "exactly the two method sigs");
+        assert_eq!(rows.len(), 3, "the two method sigs plus the constructor");
         assert!(rows.contains("void setEnabled(boolean enabled)"));
         assert!(rows.contains(
             "java.util.List<java.lang.String> pick(int idx, java.lang.String key)"));
+        assert!(rows.contains("S S()"),
+            "zero-param constructor renders `<ret> name()`");
 
         std::fs::remove_dir_all(&dir).ok();
     }

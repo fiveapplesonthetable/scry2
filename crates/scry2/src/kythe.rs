@@ -224,8 +224,32 @@ pub fn ingest_tolerant<R: Read>(
     for (sym, role, file, offset) in &state.xrefs {
         builder.add_xref(remap(*sym), *role, *file, *offset);
     }
+    // -- Aliases → name index, AND promote each sym's DISPLAY name.
+    //
+    // `add_alias` feeds the discovery index (FQN → sym lookup); that is
+    // unchanged. Separately, a sym's display name was seeded to its raw
+    // Kythe ticket at `upsert_sym` time. Now that the whole CU's aliases
+    // are known, pick the cleanest human FQN among a sym's aliases and set
+    // it as the display name so `members`/`super`/`def` render a readable
+    // FQN instead of `kythe:...#<hash>`. The chosen alias is keyed on the
+    // SAME remapped sym the alias/name index uses, so `def FQN` resolves
+    // to a sym whose own metadata also shows that FQN. `set_sym_name`'s
+    // `prefers_name` makes the pick order-independent (an FQN beats the
+    // ticket, shortest/lex-smallest among FQNs), so it does not matter
+    // that aliases arrive in stream order. A sym with no alias keeps its
+    // ticket.
+    let mut best_name: HashMap<u64, &str> = HashMap::new();
     for (sym, alias) in &state.aliases {
-        builder.add_alias(remap(*sym), alias);
+        let rs = remap(*sym);
+        builder.add_alias(rs, alias);
+        best_name.entry(rs)
+            .and_modify(|cur| {
+                if crate::writer::prefers_name(cur, alias) { *cur = alias.as_str(); }
+            })
+            .or_insert(alias.as_str());
+    }
+    for (sym, name) in &best_name {
+        builder.set_sym_name(*sym, name);
     }
     for (child, parent) in &state.inherits {
         // Both endpoints can be a bridged def VName.
@@ -623,9 +647,11 @@ fn process_entry(
                 if a.path.is_empty() { a.path = e.source.path.clone(); }
                 flush_ready(a, body_anchors, call_sites, xrefs, builder, file_ids, stats);
             } else {
-                // Symbol node. Register name (= source_key for now —
-                // FQN normalization via `named` edges is a follow-up)
-                // + kind + lang.
+                // Symbol node. Seed name = source_key (the raw Kythe
+                // ticket) + kind + lang. CU finalize promotes the name to
+                // the cleanest human FQN among the sym's `named`-edge /
+                // MarkedSource aliases via `builder.set_sym_name`; a sym
+                // with no alias keeps the ticket.
                 let k = node_kind_byte(value);
                 let l = e.source.lang_byte();
                 builder.upsert_sym(sym_of(&source_key), k, l, &source_key);
@@ -2198,6 +2224,53 @@ mod tests {
             "java.util.List<java.lang.String> pick(int idx, java.lang.String key)"));
         assert!(rows.contains("S S()"),
             "zero-param constructor renders `<ret> name()`");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CU-finalize FQN normalization, end-to-end on the SAME real
+    /// java_indexer fixture. After ingest, a method sym's DISPLAY name
+    /// (what `sym_meta` returns and `members`/`super`/`def` render) must be
+    /// the readable FQN promoted from its `/kythe/edge/named` alias — NOT
+    /// the raw Kythe ticket the streaming `upsert_sym` seeded. Discovery
+    /// (FQN → sym via `sym_for_name`) must keep working unchanged, and the
+    /// resolved sym's metadata name must match the FQN it was found by.
+    #[test]
+    fn ingest_promotes_sym_display_name_to_fqn() {
+        use crate::reader::Index;
+        const ENTRIES: &[u8] =
+            include_bytes!("../tests/fixtures/java_sig_S.entries");
+
+        let mut builder = IndexBuilder::new();
+        let fids = FileIdAllocator::default();
+        ingest(ENTRIES, &mut builder, &fids).unwrap();
+        fids.drain_into(&mut builder);
+
+        let tid = format!("{:?}", std::thread::current().id());
+        let tid_num: String = tid.chars().filter(|c| c.is_ascii_digit()).collect();
+        let dir = std::env::temp_dir().join(format!(
+            "scry2-fqn-norm-{}-{}", std::process::id(), tid_num));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s2db = dir.join("fqn_norm.s2db");
+        builder.finish(&s2db).unwrap();
+        let idx = Index::open(&s2db).unwrap();
+
+        // Discovery still works: the descriptor-stripped FQN resolves.
+        let set_sym = idx.sym_for_name("S.setEnabled")
+            .expect("S.setEnabled resolves (discovery unbroken)");
+        // The sym's DISPLAY name is now the readable FQN, not a ticket.
+        let (name, _, _) = idx.sym_meta(set_sym).unwrap();
+        assert!(!name.starts_with("kythe:"),
+            "display name must not be a raw ticket, got {name:?}");
+        assert_eq!(name, "S.setEnabled",
+            "display name promoted to the cleanest (descriptor-stripped) FQN");
+
+        let pick_sym = idx.sym_for_name("S.pick")
+            .expect("S.pick resolves (discovery unbroken)");
+        let (pname, _, _) = idx.sym_meta(pick_sym).unwrap();
+        assert!(!pname.starts_with("kythe:"),
+            "pick display name must not be a raw ticket, got {pname:?}");
+        assert_eq!(pname, "S.pick");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -172,8 +172,12 @@ mod tests {
 
     #[test]
     fn merge_from_first_wins_on_sym_metadata() {
-        // Two workers see the same sym; the first one's kind/lang/name
-        // wins, matching `upsert_sym`'s in-builder semantics.
+        // Two workers see the same sym. kind/lang refine from UNK; the
+        // display name is chosen by the order-independent `prefers_name`
+        // preference (FQN over ticket, then shortest/lex). Here both names
+        // are equal-length non-tickets, so the lexicographically smaller
+        // ("first" < "second") wins regardless of merge order — matching
+        // `upsert_sym`'s in-builder semantics.
         let path = tmp("merge-first");
         let s = sym_of("kythe:c++:test###same");
         let mut a = IndexBuilder::new();
@@ -234,6 +238,92 @@ mod tests {
             assert_eq!(l, lang::CXX, "unk_first={unk_first}");
             assert_eq!(name, "ns::fn", "unk_first={unk_first}");
             let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn fqn_beats_ticket_across_two_upserts_either_order() {
+        // A sym is first seeded with its raw Kythe ticket (the streaming
+        // `upsert_sym` at node-kind time), then promoted to its human FQN
+        // by the CU-finalize `set_sym_name`. The FQN MUST win — and a later
+        // ticket upsert MUST NOT clobber it back. Both orders are tested so
+        // the preference is order-independent, not just first-wins.
+        let s = sym_of("kythe:java:android###Bundle#EMPTY");
+        let ticket = "kythe:java:android###Bundle#EMPTY";
+        let fqn = "android.os.Bundle.EMPTY";
+
+        // ticket first, then FQN promotion.
+        let path = tmp("fqn-after-ticket");
+        let mut b = IndexBuilder::new();
+        b.upsert_sym(s, kind::FIELD, lang::JAVA, ticket);
+        b.set_sym_name(s, fqn);
+        b.add_xref(s, role::DECL, 1, 1);
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+        assert_eq!(ix.sym_meta(s).unwrap().0, fqn,
+            "FQN promotion must replace the seeded ticket");
+        let _ = std::fs::remove_file(&path);
+
+        // FQN first, then a ticket upsert — the ticket must NOT overwrite.
+        let path = tmp("ticket-after-fqn");
+        let mut b = IndexBuilder::new();
+        b.set_sym_name(s, fqn);
+        b.upsert_sym(s, kind::FIELD, lang::JAVA, ticket);
+        b.add_xref(s, role::DECL, 1, 1);
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+        assert_eq!(ix.sym_meta(s).unwrap().0, fqn,
+            "a ticket upsert must never clobber an established FQN");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn merge_two_shards_fqn_wins_over_ticket_either_order() {
+        // The def CU (FQN) and a ref-only CU (ticket) for the same sym can
+        // land in different shards. The cross-shard final k-way merge
+        // (`write_merged_snapshot` → `merge_syms_refine`) must end with the
+        // FQN regardless of which shard is listed first.
+        let s = sym_of("kythe:java:android###TextView");
+        let ticket = "kythe:java:android###TextView";
+        let fqn = "android.widget.TextView";
+
+        for fqn_first in [true, false] {
+            let shard_fqn = tmp(if fqn_first { "shard-fqn-a" } else { "shard-fqn-b" });
+            let shard_tkt = tmp(if fqn_first { "shard-tkt-a" } else { "shard-tkt-b" });
+            let merged    = tmp(if fqn_first { "shard-m-a" } else { "shard-m-b" });
+
+            // Shard carrying the FQN (the def CU after finalize promotion).
+            let mut bf = IndexBuilder::new();
+            bf.upsert_sym(s, kind::TYPE, lang::JAVA, ticket);
+            bf.set_sym_name(s, fqn);
+            bf.add_xref(s, role::DEF, 1, 10);
+            bf.finish(&shard_fqn).unwrap();
+
+            // Shard carrying only the ticket (a ref-only CU; no alias).
+            let mut bt = IndexBuilder::new();
+            bt.upsert_sym(s, kind::UNK, lang::JAVA, ticket);
+            bt.add_xref(s, role::REF, 1, 20);
+            bt.finish(&shard_tkt).unwrap();
+
+            let i_fqn = Index::open(&shard_fqn).unwrap();
+            let i_tkt = Index::open(&shard_tkt).unwrap();
+            let sources = if fqn_first {
+                vec![&i_fqn, &i_tkt]
+            } else {
+                vec![&i_tkt, &i_fqn]
+            };
+            IndexBuilder::new().write_merged_snapshot(&sources, &merged).unwrap();
+            drop((i_fqn, i_tkt));
+
+            let m = Index::open(&merged).unwrap();
+            assert_eq!(m.sym_meta(s).unwrap().0, fqn,
+                "cross-shard merge must keep the FQN (fqn_first={fqn_first})");
+            // Kind must still refine to TYPE from the FQN shard.
+            assert_eq!(m.sym_meta(s).unwrap().1, kind::TYPE,
+                "kind still refines across shards (fqn_first={fqn_first})");
+            for p in [&shard_fqn, &shard_tkt, &merged] {
+                let _ = std::fs::remove_file(p);
+            }
         }
     }
 

@@ -298,9 +298,14 @@ fn do_type(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
         ix.syms_matching_substring(name, limit.max(SUBSTR_AGG_CAP))
     } else { ix.syms_for_name(name) };
     let mut hits: Vec<TypeHit> = Vec::new();
+    // Dedup by the rendered (name, typed): stub-jar copies are distinct
+    // syms that render identically. Genuine distinct types survive.
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for sym in &syms {
         let Some(ty) = ix.type_of(*sym) else { continue };
         let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", 0, 0));
+        if !seen.insert((logical_key(sname).to_string(), ty.to_string())) { continue; }
         hits.push(TypeHit {
             name: sname.to_string(),
             kind: kind_str(knd).to_string(),
@@ -323,9 +328,15 @@ fn do_sig(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
         ix.syms_matching_substring(name, limit.max(SUBSTR_AGG_CAP))
     } else { ix.syms_for_name(name) };
     let mut hits: Vec<SigHit> = Vec::new();
+    // Dedup by the rendered (name, sig): the stub-jar copies of a method
+    // resolve to distinct syms with byte-identical signatures. Genuine
+    // overloads differ in `sig` and so survive.
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for sym in &syms {
         let Some(sg) = ix.sig_of(*sym) else { continue };
         let (sname, knd, lng) = ix.sym_meta(*sym).unwrap_or(("?", 0, 0));
+        if !seen.insert((logical_key(sname).to_string(), sg.to_string())) { continue; }
         hits.push(SigHit {
             name: sname.to_string(),
             kind: kind_str(knd).to_string(),
@@ -353,6 +364,12 @@ fn do_members(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
     let is_container = |k: u8| matches!(k, kind::TYPE | kind::PACKAGE);
     let mut members: Vec<MemberHit> = Vec::new();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Dedup by the RENDERED (name, kind, sig), not just the child sym: a
+    // container resolved across several stub-jar copies yields distinct
+    // child syms that render identically. Genuine overloads differ in
+    // their rendered signature and so survive.
+    let mut rendered: std::collections::HashSet<(String, String, Option<String>)> =
+        std::collections::HashSet::new();
     let mut container_name = name.to_string();
     let mut truncated = false;
     'outer: for sym in &syms {
@@ -365,6 +382,8 @@ fn do_members(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
             if !seen.insert(child) { continue; }
             let (mname, mkind, mlang) = ix.sym_meta(child).unwrap_or(("?", 0, 0));
             let sig = ix.sig_of(child).map(str::to_string);
+            let key = (logical_key(mname).to_string(), kind_str(mkind).to_string(), sig.clone());
+            if !rendered.insert(key) { continue; }
             members.push(MemberHit {
                 name: mname.to_string(),
                 kind: kind_str(mkind).to_string(),
@@ -376,6 +395,35 @@ fn do_members(ix: &Index, name: &str, substr: bool, limit: usize) -> Reply {
     }
     let total = members.len();
     Reply::Members { container: container_name, members, total, truncated }
+}
+
+/// A symbol's *logical identity* for dedup, derived from its stored name.
+///
+/// AOSP compiles the same source into many build-variant stub jars, so one
+/// logical Java/C++ element appears as many distinct syms whose tickets
+/// differ ONLY in corpus/path. A scry ticket is
+/// `kythe:{lang}:{corpus}#{root}#{path}#{signature}`; the trailing
+/// `signature` is Kythe's own per-element semantic id and is byte-identical
+/// across those copies. So for a ticket we key on that signature (the part
+/// after the last `#`); for a human FQN alias (no `kythe:` prefix) the whole
+/// name already is the identity. Pairing this with the rendered sig/type
+/// keeps genuine overloads (different signatures) and distinct symbols apart.
+fn logical_key(name: &str) -> &str {
+    if name.starts_with("kythe:") {
+        name.rsplit('#').next().unwrap_or(name)
+    } else {
+        name
+    }
+}
+
+/// Resolve a sym's definition site to a `path@off` string, preferring a
+/// DEF over a DECL (the same precedence `def` uses). Returns None when the
+/// sym has neither location. Shared by the inheritance verbs so each
+/// related sym gets a concrete locator even when its name is a bare ticket.
+fn def_loc_str(ix: &Index, sym: u64) -> Option<String> {
+    let (file, off) = ix.sym_def_loc(sym)?;
+    let path = ix.file_path(file)?;
+    Some(format!("{path}@{off}"))
 }
 
 fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
@@ -393,6 +441,13 @@ fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
     let mut hits: Vec<InhHit> = Vec::new();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Dedup by the related sym's LOGICAL identity, not the raw sym: stub-jar
+    // copies are distinct syms for one logical supertype/subtype, differing
+    // only in build-variant path. `logical_key` keys on the Kythe VName
+    // signature, which is identical across those copies, so they collapse to
+    // one hit while genuinely distinct relations survive.
+    let mut rendered: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for sym in syms {
         let related = if sub { ix.inherited_by(sym) } else { ix.inherits_of(sym) };
         for r in related {
@@ -401,7 +456,10 @@ fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
                 let p = ix.sym_def_path(r).unwrap_or("");
                 if !filt.passes(p) { continue; }
             }
-            hits.push(InhHit { name: name_of(r) });
+            let name = name_of(r);
+            if !rendered.insert(logical_key(&name).to_string()) { continue; }
+            let def = def_loc_str(ix, r);
+            hits.push(InhHit { name, def });
         }
     }
     let total = hits.len();
@@ -458,7 +516,7 @@ fn do_callgraph(
         let id = nodes.len() as u32;
         seen.insert(root, id);
         nodes.push(CallNode { id, parent: None, hop: 0,
-                              dir: "root".into(), name: name_of(root) });
+                              dir: "root".into(), name: name_of(root), def: None });
         frontier.push((root, id));
     }
     let go_up   = direction == "up"   || direction == "both";
@@ -474,7 +532,7 @@ fn do_callgraph(
                         let id = nodes.len() as u32;
                         v.insert(id);
                         nodes.push(CallNode { id, parent: Some(cur_id), hop,
-                                              dir: "up".into(), name: name_of(caller) });
+                                              dir: "up".into(), name: name_of(caller), def: None });
                         next.push((caller, id));
                         if nodes.len() >= max_syms { truncated = true; break 'depth; }
                     }
@@ -487,7 +545,7 @@ fn do_callgraph(
                         let id = nodes.len() as u32;
                         v.insert(id);
                         nodes.push(CallNode { id, parent: Some(cur_id), hop,
-                                              dir: "down".into(), name: name_of(callee) });
+                                              dir: "down".into(), name: name_of(callee), def: None });
                         next.push((callee, id));
                         if nodes.len() >= max_syms { truncated = true; break 'depth; }
                     }
@@ -544,13 +602,43 @@ fn do_inheritance(
     let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut nodes: Vec<CallNode> = Vec::new();
     let mut frontier: Vec<(u64, u32)> = Vec::new();
-    for &root in &roots {
-        if seen.contains_key(&root) { continue; }
+    // Dedup by LOGICAL identity, not the sym: stub-jar copies are distinct
+    // syms for one logical type, so the per-sym `seen` map alone leaves
+    // duplicate roots/hops. `logical_key` keys on the Kythe VName signature
+    // (identical across copies). When a candidate's logical key already has
+    // a node, we route this sym to that node (so `seen` stays consistent)
+    // but emit no second node and don't re-traverse its identical edges.
+    let mut rendered: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    // Try to admit `sym` as a new node under `parent_id`/`dir`/`hop`.
+    // Returns Some(id) only when a NEW node was created (so the caller
+    // traverses it once); None when the sym was already seen OR aliased to
+    // an existing logical-equal node (a stub-jar duplicate — the canonical
+    // node already drives traversal). Closures can't borrow these mutably
+    // across the loop, so the tables are threaded in explicitly.
+    let admit = |sym: u64, parent_id: Option<u32>, dir: &str, hop: usize,
+                     nodes: &mut Vec<CallNode>,
+                     seen: &mut std::collections::HashMap<u64, u32>,
+                     rendered: &mut std::collections::HashMap<String, u32>|
+        -> Option<u32> {
+        if seen.contains_key(&sym) { return None; }
+        let name = name_of(sym);
+        let key = logical_key(&name).to_string();
+        if let Some(&existing) = rendered.get(&key) {
+            seen.insert(sym, existing);
+            return None;
+        }
+        let def = def_loc_str(ix, sym);
         let id = nodes.len() as u32;
-        seen.insert(root, id);
-        nodes.push(CallNode { id, parent: None, hop: 0,
-                              dir: "root".into(), name: name_of(root) });
-        frontier.push((root, id));
+        seen.insert(sym, id);
+        rendered.insert(key, id);
+        nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, def });
+        Some(id)
+    };
+    for &root in &roots {
+        if let Some(id) = admit(root, None, "root", 0, &mut nodes, &mut seen, &mut rendered) {
+            frontier.push((root, id));
+        }
     }
     let go_up   = direction == "up"   || direction == "both";
     let go_down = direction == "down" || direction == "both";
@@ -561,11 +649,8 @@ fn do_inheritance(
             if go_up {
                 for parent in ix.inherits_of(cur_sym) {
                     if !pass(parent) { continue; }
-                    if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(parent) {
-                        let id = nodes.len() as u32;
-                        v.insert(id);
-                        nodes.push(CallNode { id, parent: Some(cur_id), hop,
-                                              dir: "up".into(), name: name_of(parent) });
+                    if let Some(id) = admit(parent, Some(cur_id), "up", hop,
+                                            &mut nodes, &mut seen, &mut rendered) {
                         next.push((parent, id));
                         if nodes.len() >= max_syms { truncated = true; break 'depth; }
                     }
@@ -574,11 +659,8 @@ fn do_inheritance(
             if go_down {
                 for child in ix.inherited_by(cur_sym) {
                     if !pass(child) { continue; }
-                    if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(child) {
-                        let id = nodes.len() as u32;
-                        v.insert(id);
-                        nodes.push(CallNode { id, parent: Some(cur_id), hop,
-                                              dir: "down".into(), name: name_of(child) });
+                    if let Some(id) = admit(child, Some(cur_id), "down", hop,
+                                            &mut nodes, &mut seen, &mut rendered) {
                         next.push((child, id));
                         if nodes.len() >= max_syms { truncated = true; break 'depth; }
                     }
@@ -588,7 +670,10 @@ fn do_inheritance(
         if next.is_empty() { break; }
         frontier = next;
     }
-    let total = nodes.len().saturating_sub(roots.len());
+    // total = non-root nodes. Count actual hop-0 nodes (roots can collapse
+    // under rendered-dedup, so `roots.len()` would overcount).
+    let root_nodes = nodes.iter().filter(|n| n.hop == 0).count();
+    let total = nodes.len().saturating_sub(root_nodes);
     Reply::Inheritance { nodes, total, truncated }
 }
 
@@ -679,10 +764,31 @@ pub fn default_socket_for(index: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::PathFilter;
+    use super::{PathFilter, logical_key};
 
     fn f<'a>(in_: Option<&'a str>, not_in: Option<&'a str>) -> PathFilter<'a> {
         PathFilter { in_, not_in, def_in: None }
+    }
+
+    #[test]
+    fn logical_key_collapses_stub_jar_copies() {
+        // Two stub-jar copies of one logical method: same trailing VName
+        // signature, different corpus/path → same logical key.
+        let a = "kythe:java:corpus#root#variantA/Bundle.java#SIGHASH";
+        let b = "kythe:java:corpus#root#variantB/Bundle.java#SIGHASH";
+        assert_eq!(logical_key(a), "SIGHASH");
+        assert_eq!(logical_key(a), logical_key(b));
+        // A different element has a different trailing signature.
+        let other = "kythe:java:corpus#root#variantA/Bundle.java#OTHERHASH";
+        assert_ne!(logical_key(a), logical_key(other));
+    }
+
+    #[test]
+    fn logical_key_passes_fqn_aliases_through() {
+        // A human FQN (no `kythe:` prefix) is already the identity; it is
+        // returned whole, even though it contains no `#`.
+        assert_eq!(logical_key("android.os.Bundle.putByteArray"),
+                   "android.os.Bundle.putByteArray");
     }
 
     #[test]

@@ -225,6 +225,22 @@ fn super_substr_unions_multiple() {
     assert!(s.contains("foo.Parent"), "Parent is super of both Child types: {s}");
 }
 
+#[test]
+fn super_hit_carries_def_location() {
+    // #3: each inheritance hit resolves the related sym's def site to a
+    // `path@off` locator. Parent decls at file 1 (Parent.java) off 100.
+    let (_dir, s2db) = make_index();
+    let v = run(&s2db, &["super", "foo.MainChild"]);
+    let hits = v.get("hits").and_then(|x| x.as_array()).expect("hits array");
+    let parent = hits.iter().find(|h|
+        h.get("name").and_then(|n| n.as_str()) == Some("foo.Parent"))
+        .expect("Parent hit present");
+    let def = parent.get("def").and_then(|d| d.as_str())
+        .expect("Parent hit carries a def locator");
+    assert!(def.contains("Parent.java@100"),
+            "def points at Parent's decl site: {def}");
+}
+
 // -------- SUB -----------------------------------------------------------
 
 #[test]
@@ -400,6 +416,92 @@ fn def_surfaces_signature() {
     let s = serde_json::to_string(&v).unwrap();
     assert!(s.contains("void helper(int flags)"),
         "def carries the sig: {s}");
+}
+
+// -------- DEDUP (stub-jar copies) --------------------------------------
+
+/// A .s2db with two STUB-JAR COPIES of one logical method: distinct
+/// Kythe tickets that differ only in build-variant path but share the
+/// same trailing VName signature (the indexer's per-element semantic id),
+/// each carrying the identical rendered sig. Plus one genuinely distinct
+/// overload (different VName signature). Exercises the query-side
+/// `logical_key` dedup.
+fn make_stub_dup_index() -> (PathBuf, PathBuf) {
+    let tid = format!("{:?}", std::thread::current().id());
+    let tid_num: String = tid.chars().filter(|c| c.is_ascii_digit()).collect();
+    let dir = std::env::temp_dir().join(format!(
+        "scry2-cli-dedup-{}-{}", std::process::id(), tid_num));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s2db = dir.join("test.s2db");
+
+    let mut b = IndexBuilder::new();
+    // Two stub copies: same trailing VName signature `SIGHASH`, different
+    // path (so different ticket / different sym).
+    let copy_a = sym_of("kythe:java:corpus#root#path/variantA/Bundle.java#SIGHASH");
+    let copy_b = sym_of("kythe:java:corpus#root#path/variantB/Bundle.java#SIGHASH");
+    b.upsert_sym(copy_a, kind::FUNCTION, lang::JAVA,
+                 "kythe:java:corpus#root#path/variantA/Bundle.java#SIGHASH");
+    b.upsert_sym(copy_b, kind::FUNCTION, lang::JAVA,
+                 "kythe:java:corpus#root#path/variantB/Bundle.java#SIGHASH");
+    // A genuinely distinct overload: different VName signature.
+    let other = sym_of("kythe:java:corpus#root#path/Other.java#OTHERHASH");
+    b.upsert_sym(other, kind::FUNCTION, lang::JAVA,
+                 "kythe:java:corpus#root#path/Other.java#OTHERHASH");
+
+    b.upsert_file(1, "/aosp/variantA/Bundle.java");
+    b.upsert_file(2, "/aosp/variantB/Bundle.java");
+    b.upsert_file(3, "/aosp/Other.java");
+    b.add_xref(copy_a, role::DEF, 1, 10);
+    b.add_xref(copy_b, role::DEF, 2, 20);
+    b.add_xref(other,  role::DEF, 3, 30);
+
+    // Identical rendered sig on both stub copies; distinct sig on `other`.
+    b.add_sig(copy_a, "void putByteArray(java.lang.String key, byte[] value)");
+    b.add_sig(copy_b, "void putByteArray(java.lang.String key, byte[] value)");
+    b.add_sig(other,  "void putByteArray(java.lang.String key, int[] value)");
+
+    b.finish(&s2db).unwrap();
+    (dir, s2db)
+}
+
+#[test]
+fn sig_dedups_stub_jar_copies() {
+    // #5: the two stub copies (same VName signature, same rendered sig)
+    // collapse to ONE; the genuine overload survives → 2 distinct hits.
+    // `--substr` matches the ticket; both stub copies and the overload
+    // share the `corpus#root` ticket prefix, so the substring reaches all
+    // three syms and dedup acts on the rendered result.
+    let (_dir, s2db) = make_stub_dup_index();
+    let v = run(&s2db, &["sig", "corpus#root", "--substr", "--limit", "50"]);
+    assert_eq!(n_rows(&v), 2,
+        "two stub copies collapse to 1, plus the distinct overload: {v}");
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("byte[] value"), "{s}");
+    assert!(s.contains("int[] value"), "distinct overload kept: {s}");
+}
+
+// -------- TRUNCATION NOTE (#G) -----------------------------------------
+
+#[test]
+fn def_truncation_prints_cap_reached_line() {
+    // #G: when --limit caps the result, the human formatter (stderr)
+    // spells out that more exist, and the JSON carries truncated=true.
+    let (_dir, s2db) = make_index();
+    // Run WITHOUT --json so we get the human cap line on stderr.
+    let bin = scry2_bin();
+    let out = Command::new(&bin)
+        .arg("--index").arg(&s2db)
+        .arg("def").arg("foo").arg("--substr").arg("--limit").arg("1")
+        .output().expect("spawn scry2");
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--limit cap reached"),
+        "cap-reached note expected on stderr: {err}");
+    // And the JSON shape flags it too.
+    let v = run(&s2db, &["def", "foo", "--substr", "--limit", "1"]);
+    assert_eq!(v.get("truncated").and_then(|t| t.as_bool()), Some(true),
+        "truncated flag set in JSON: {v}");
 }
 
 // -------- TILDE ---------------------------------------------------------

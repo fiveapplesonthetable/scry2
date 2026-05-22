@@ -814,6 +814,63 @@ mod tests {
     }
 
     #[test]
+    fn merge_progress_output_is_byte_identical() {
+        // The final merge's progress variant (`write_merged_snapshot_progress`)
+        // only adds per-section stderr logging on top of the silent
+        // `write_merged_snapshot` — both delegate to the same inner pass with
+        // a `log_progress` bool that gates an eprintln!-only closure touching
+        // no output. Guard that the produced `.s2db` is byte-for-byte the same
+        // so progress reporting can never drift the index.
+        let s0 = tmp("mp-shard0");
+        let s1 = tmp("mp-shard1");
+        let silent = tmp("mp-silent");
+        let loud   = tmp("mp-loud");
+
+        let a = sym_of("kythe:c++:t###a");
+        let b = sym_of("kythe:c++:t###b");
+        let mut h0 = IndexBuilder::new();
+        h0.upsert_sym(a, kind::FUNCTION, lang::CXX, "kythe:c++:t###a");
+        h0.add_alias(a, "ns::a");
+        h0.upsert_file(1, "/t/a.cpp");
+        h0.add_xref(a, role::DEF, 1, 10);
+        h0.add_call(a, b, role::CALL);
+        h0.add_type(a, "int *");
+        h0.add_childof(b, a);
+        h0.add_sig(a, "void a()");
+        h0.finish(&s0).unwrap();
+        let mut h1 = IndexBuilder::new();
+        h1.upsert_sym(b, kind::FUNCTION, lang::CXX, "kythe:c++:t###b");
+        h1.add_alias(b, "ns::b");
+        h1.upsert_file(2, "/t/b.cpp");
+        h1.add_xref(b, role::DEF, 2, 20);
+        h1.add_inherit(b, a);
+        h1.finish(&s1).unwrap();
+
+        // Same delta + same sources into both variants.
+        let mk_delta = || {
+            let mut d = IndexBuilder::new();
+            d.upsert_file(3, "/t/c.cpp");
+            d.add_xref(a, role::REF, 3, 5);
+            d.add_call(b, a, role::CALL);
+            d
+        };
+        let i0 = Index::open(&s0).unwrap();
+        let i1 = Index::open(&s1).unwrap();
+        mk_delta().write_merged_snapshot(&[&i0, &i1], &silent).unwrap();
+        mk_delta().write_merged_snapshot_progress(&[&i0, &i1], &loud).unwrap();
+        drop((i0, i1));
+
+        let a_bytes = std::fs::read(&silent).unwrap();
+        let b_bytes = std::fs::read(&loud).unwrap();
+        assert_eq!(a_bytes, b_bytes,
+            "progress logging changed the produced .s2db (must be logging-only)");
+
+        for p in [&s0, &s1, &silent, &loud] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
     fn resume_file_ids_merge_to_correct_paths() {
         // End-to-end of the resume file-id fix. A run-1 shard interns
         // files with allocator A; a resumed run seeds a fresh allocator B

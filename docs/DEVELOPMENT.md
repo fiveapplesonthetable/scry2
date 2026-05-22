@@ -36,10 +36,13 @@ cargo build --release -p scry2-bench
 ```
 
 The test suite covers:
-* round-trip of every section (xrefs, syms, names, files, inhs, calls)
+* round-trip of every section (xrefs, syms, names, files, inh, calls,
+  crev, typed, childrev, inhrev, sig, blob)
 * FQN alias resolution via `add_alias`
 * callgraph both directions + dedup
-* substring name search
+* substring name search (case-sensitive and `-i` case-folded)
+* the k-way final merge matching a reference `finish` across shards
+* the C++ `completes` DEFN↔DECL bridge remap at finalize
 * hand-rolled Kythe Entry decode (proto wire format, no codegen)
 
 If a test fails, the file at the top of the failure trace points at
@@ -65,18 +68,24 @@ scry2/
 │   ├── USAGE.md                     # verb reference + examples
 │   ├── DESIGN.md                    # architecture
 │   ├── KYTHE.md                     # Kythe edge contract
+│   ├── LIMITS.md                    # known correctness limits
+│   ├── VS_KYTHE.md                  # scry2 vs Kythe serving tables
+│   ├── AOSP.md                      # AOSP kzip-build + query recipe
 │   ├── BENCH.md                     # backend tradeoff numbers
 │   └── DEVELOPMENT.md               # this file
 └── crates/
     ├── scry2/                       # main library + CLI
     │   ├── Cargo.toml
     │   └── src/
-    │       ├── main.rs              # CLI dispatch
+    │       ├── main.rs              # CLI dispatch + from-kzip orchestrator
     │       ├── lib.rs               # public re-exports + tests
     │       ├── format.rs            # on-disk layout (header, row types, magic, sym_of)
     │       ├── reader.rs            # mmap + binary search
-    │       ├── writer.rs            # IndexBuilder, atomic file rename
-    │       └── kythe.rs             # Entry proto decoder + body-anchor extraction
+    │       ├── writer.rs            # IndexBuilder, k-way merge, atomic file rename
+    │       ├── kythe.rs             # Entry proto decoder + body-anchor + completes bridge
+    │       ├── kzip.rs              # kzip read/normalize/per-CU sub-kzip extract
+    │       ├── server.rs           # request dispatch, repl, serve daemon, client
+    │       └── reply.rs             # JSON reply shapes (the --json wire format)
     └── scry2-bench/                 # storage-backend benchmark
         ├── Cargo.toml
         └── src/{main, workload, stats, backend, be_mmap, be_redb, be_rocks}.rs
@@ -390,7 +399,10 @@ How the run is structured:
   indexer subprocess and its stderr drain run with the sink free.
 * A shared `Accumulator` collects drained sinks at snapshot time.
 * A `delta_rows` gauge tracks the live in-RAM delta
-  (xrefs + inherits + calls + aliases) across all sinks.
+  (xrefs + inherits + calls + aliases + typed + childof + sig — every
+  append-only delta table) across all sinks. The add (on CU merge) and
+  the subtract (on snapshot drain) count the same table set, so the
+  gauge tracks the true in-memory delta.
 
 What triggers a snapshot:
 
@@ -438,13 +450,13 @@ What `--resume` does:
    triggers.
 
 The final write (always, not just on resume) folds everything into
-the authoritative output exactly once via a chained streaming merge:
-the remaining in-RAM delta is merged with the base partial, then each
-shard — loaded as a delta and merged via `write_merged_snapshot` —
-is folded into the running accumulator one at a time. Each step's
-prior stays on disk (mmap), so peak RAM is one merge's delta, never
-the whole accumulated index. On success the base partial, all shards,
-and the shas file are removed.
+the authoritative output exactly once via a **single k-way streaming
+pass**: `write_merged_snapshot` takes the remaining in-RAM delta plus
+every source (the base partial and every shard, each mmap'd) and merges
+all of them in one pass — not a chained fold that re-reads a growing
+accumulator per shard. Each source is read exactly once, so peak RAM is
+roughly one output blob rather than the whole union. On success the base
+partial, all shards, and the shas file are removed.
 
 Failure modes the design handles:
 - **Crash mid-snapshot**: the shas checkpoint is written only after

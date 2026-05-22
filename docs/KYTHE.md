@@ -59,7 +59,7 @@ below. Everything else is ignored.
 | `/kythe/edge/extends`, `extends/public`, `extends/protected`, `extends/private` | — | `inhs` row `(child = source, parent = target)` |
 | `/kythe/edge/overrides`, `satisfies` | — | `inhs` row |
 | `/kythe/edge/named` | — | register `target.signature` as a human-typeable alias for the source sym — that's how `scry2 def android.os.Binder.clearCallingIdentity` resolves without `--substr` |
-| `/kythe/edge/completes`, `completes/uniquely` | — | DEFN→DECL bridge captured for cxx, see notes below |
+| `/kythe/edge/completes`, `completes/uniquely` | — | C++ DEFN→DECL VName bridge: at CU finalize, every sym-keyed row of the `.cpp` definition VName is remapped to the `.h` declaration VName so the two unify on the queryable decl sym (see notes below) |
 | `/kythe/edge/typed` | — | source sym → its type node; the type is rendered to a string (MarkedSource for named/Java-generic nodes, recursive `tapp` walk for C++ composites) and stored in the `typed` section |
 | `/kythe/edge/childof` | — | member → enclosing parent; stored reversed as `childrev` `(parent, child)` for `members` |
 | `/kythe/edge/param`, `param.N` | — | ordinal-ordered parameters of a function, used (with `typed`) to render the `sig` section — full signatures with param names |
@@ -76,20 +76,32 @@ scry2 strips `.N` ordinal suffixes on edge kinds (e.g.
 `/kythe/edge/childof.42` is treated as `/kythe/edge/childof`) per the
 Kythe convention for repeated edges.
 
+## `childof` is consumed for `members`, NOT for callgraph
+
+`/kythe/edge/childof` connects a child node to its enclosing parent (a
+field/method childof its class, a class childof its package). scry2
+records **every** childof edge into the reverse `childrev` table, then
+`members NAME` filters at query time by the parent sym's kind so only a
+real container (type / record / interface / package) lists members and
+function-local children (a param childof its function) never leak.
+
+What childof is **not** used for is callgraph attribution: cxx_indexer's
+childof nests sym SCOPES (namespace → namespace, class → namespace), not
+anchors to their enclosing function, so chasing it returns zero matches
+for "what calls X". Call containment is reconstructed from body-anchor
+offset containment instead (see "The body-anchor trick").
+
 ## Edges scry2 intentionally ignores
 
-* `/kythe/edge/childof` — cxx_indexer uses this to nest sym SCOPES
-  (namespace → namespace, class → namespace). It does NOT connect
-  anchors to their enclosing function, so chasing it returns zero
-  matches for "what calls X". We use body-anchor offset containment
-  instead.
-* `/kythe/edge/childof/context` — same family, scope-only.
+* `/kythe/edge/childof/context` — scope-only, not a membership edge.
 * `/kythe/edge/ref/expands`, `ref/expands/transitive`, `ref/implicit`
   — macro-expansion noise. Useful for some pipelines, not for the
-  six LLM-shaped queries scry2 cares about
-  (def / ref / callers / super / sub / callgraph).
-* `/kythe/edge/typed`, `param`, `tparam`, `documents`, `aliases` —
-  type-shape edges. Not needed for def/ref/callers/super/sub/callgraph.
+  navigation + comprehension queries scry2 serves (def / ref / callers /
+  callgraph / super / sub / inheritance / type / sig / members).
+* `/kythe/edge/tparam`, `documents`, `aliases`, `instantiates`,
+  `specializes`, `influences` — type-shape and dataflow edges scry2 does
+  not surface. (`typed` and `param` ARE consumed — they back the `type`
+  and `sig` verbs; see the consume table above.)
 
 ## The body-anchor trick
 
@@ -125,9 +137,14 @@ contribute to the `calls` table that `callgraph` walks.
   string already encodes the canonical USR (`c:@N@android@C@Binder@F@…`).
   Result: substring search works; FQN aliases don't help much for cxx.
 * DEFN ↔ DECL identity for cross-TU forward declarations is emitted as
-  `/kythe/edge/completes` from the .cpp anchor to the header anchor.
-  scry2 captures these but currently doesn't bridge — see "Known
-  limitations" below.
+  `/kythe/edge/completes` from the .cpp definition node to the header
+  declaration node. scry2 applies this bridge at CU finalize: every
+  sym-keyed row buffered for the CU (xrefs, aliases, inherits, childof,
+  calls, types, sigs) is remapped from the def VName's sym to the decl
+  VName's sym, so `def <method FQN>` — which resolves through the
+  declaration's FQN alias — finds the `.cpp` body location too, not just
+  the `.h` declaration. Per-CU and `O(rows in this CU)`, since a
+  definition VName is unique to the CU that contains it.
 
 ### `java_indexer.jar`
 
@@ -181,12 +198,15 @@ order to apply the patches) is in
 
 ## Known limitations (honest)
 
-* **completes bridge not applied yet.** scry2 captures cxx's
-  `completes` edges during ingest, but doesn't currently rewrite call-
-  site VNames from the header DECL to the .cpp DEFN. That means
-  cross-translation-unit C++ refs split between forward-decl call
-  sites and definition-site refs. Proper fix is a per-CU bridge map
-  applied at xref emission. Tracked as a v0.2 follow-up.
+* **completes bridge is per-CU.** scry2 applies the cxx `completes`
+  bridge at CU finalize, remapping the `.cpp` definition VName's rows to
+  the `.h` declaration VName so def/ref over a method's FQN cover both
+  sites. The bridge is scoped to the CU that carries the `completes`
+  edge (a definition VName is unique to that CU). Refs from other TUs
+  that see only the forward declaration already key off the decl VName,
+  which is the canonical sym, so they unify too — but a cross-TU ref
+  whose target VName matches neither the decl nor any bridged def in its
+  own CU is not retro-bridged.
 * **Source-level Kotlin gaps.** Public Kythe v0.0.75 ships no
   source-level Kotlin indexer. JVM bytecode mostly fills the gap, but
   lambda bodies / inline functions don't survive the round-trip.

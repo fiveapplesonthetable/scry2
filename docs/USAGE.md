@@ -1,8 +1,11 @@
 # scry2 — usage
 
-Five verbs over a single `.s2db` file. Every example below was run on
-a real index built from a C++ test kzip (`scry2-smoke.s2db`,
-220 k xrefs, 128 k symbols, 64 k callgraph edges, 30 MB on disk).
+A compact verb set over a single `.s2db` file — `def`, `ref`,
+`callers`, `callgraph`, `super`, `sub`, `inheritance`, `type`, `sig`,
+`members`, `names`, `stat`, plus the `repl` / `serve` long-lived modes.
+Every example below was run on a real index built from a C++ test kzip
+(`scry2-smoke.s2db`, 220 k xrefs, 128 k symbols, 64 k callgraph edges,
+30 MB on disk).
 
 ## Build the index
 
@@ -81,7 +84,7 @@ entry stream, and writes a single `.s2db`. The flags:
 | `--in SUBSTR` | scope to CUs whose primary source path contains ANY of these substrings (repeatable / comma-separated). `--not-in` is the inverse. |
 | `--workers N` | CUs indexed concurrently. Default is `num_cpus/2` (the JVM indexers carry a 200–300 MB working set, so the default avoids OOM on big runs). |
 | `--snapshot-every N` | drain the in-RAM delta to a shard after this many successful CUs. Default 2000; a coarse durability fallback. 0 disables. |
-| `--snapshot-rows N` | drain whenever the in-RAM delta reaches this many rows (xrefs+inherits+calls+aliases). **This is what bounds peak memory** — a large CU crosses the budget sooner and triggers an earlier drain, so the peak is deterministic regardless of how rows are distributed. Default 250M (≈ a 25 GB delta). 0 disables. Bound memory with this, not with worker count. |
+| `--snapshot-rows N` | drain whenever the in-RAM delta reaches this many rows (xrefs+inherits+calls+aliases+typed+childof+sig — every append-only delta table). **This is what bounds peak memory** — a large CU crosses the budget sooner and triggers an earlier drain, so the peak is deterministic regardless of how rows are distributed. Default 250M (≈ a 25 GB delta). 0 disables. Bound memory with this, not with worker count. |
 | `--inject-cu-arg PREFIX::ARG` | prepend `ARG` to the indexer argv of any CU whose primary path starts with `PREFIX` (the `::` is the separator). Repeatable. Example: `'libcore/ojluni/src/main/java/::--patch-module=java.base=libcore/ojluni/src/main/java'` so AOSP libcore ojluni files index against `java.base`. Skipped if the CU's argv already has the arg. |
 | `--resume` | continue a killed run from its on-disk partial state. |
 | `-o, --out PATH` | output `.s2db` (default `scry2.s2db`). |
@@ -116,7 +119,7 @@ After every CU finishes, the run does **one k-way streaming pass** over
 is mmap'd and read exactly once, so peak RAM is roughly one output blob
 rather than the whole union.
 
-## Query verbs — by example
+## Output mode and invocation
 
 All examples assume `--index your.s2db`, which can also be the
 default (`./scry2.s2db`).
@@ -231,6 +234,32 @@ $ scry2 --index scry2-smoke.s2db callers __builtin___memcpy --substr --max-hits 
   call prebuilts/.../bits/string3.h@1588
 hits=1
 ```
+
+### `--substr` matching — exact, case-sensitive, and `-i`
+
+`def`, `ref`, and `callers` resolve a NAME two ways:
+
+* **Default (no `--substr`)** — an exact-FQN binary search. It resolves
+  **every** symbol of that exact name (all overloads, all per-jar copies,
+  all language-pair variants), not a single one. This is the fast path —
+  prefer it for hot queries; use `names NAME` to find the exact FQN.
+* **`--substr`** — a parallel linear scan (`memchr::memmem`) over the
+  whole names table, slower but tolerant of partial names. It is
+  **case-SENSITIVE by default** (code identifiers are case-significant).
+  Add `-i` / `--ignore-case` to fold ASCII case so the needle matches
+  regardless of case.
+
+```bash
+# Case-sensitive (default): matches "Binder", "IBinder", "BinderProxy"
+$ scry2 --index aosp.s2db def Binder --substr --limit 5
+
+# Case-insensitive: also matches "binder", "BINDER", "rebinder"
+$ scry2 --index aosp.s2db def binder --substr -i --limit 5
+```
+
+`ref`/`callers --substr` aggregate edges across all matching symbols,
+capped at 64 by default (raise with `--limit`); a broader match returns a
+fast partial flagged `truncated`. Prefer an exact FQN when you have it.
 
 ### `super NAME` — direct supertypes
 

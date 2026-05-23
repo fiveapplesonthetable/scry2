@@ -55,6 +55,7 @@ it doesn't.
   calls    sorted by caller                       +-------+
   calls    sorted by callee
   blob     (UTF-8 strings, no separators)
+  trigram  dict + block-skip postings (--substr)
 ```
 
 ## Storage layout
@@ -83,20 +84,23 @@ on an AOSP-scale index.
 | `childrev` | `(parent u64, child u64)` = 16 B | by (parent, child) | `members` — a type's methods/fields (reverse `childof`) |
 | `sig` | `(sym u64, str_off u64, str_len u16)` = 18 B | by sym | full function signature with param names (C++/Java), pre-rendered |
 | `blob`  | concat UTF-8, no separators | n/a | all names, paths, types, and signatures, referenced by `(off u64, len u16)` slots |
+| `trigram_dict` | `(trigram [u8;3], _pad u8, post_off u64, post_len u32, count u32)` = 20 B | by the 3-byte trigram | substring index: each lowercased trigram → its postings region + posting count |
+| `trigram_post` | varint blob (block-skip / gap-delta) | n/a | per-trigram ascending name-row-ids, block-skip compressed; backs `--substr` |
 
 The `typed`/`childrev`/`inhrev`/`sig` sections are the comprehension
-layer; their header fields are carved from the header's reserved bytes.
-The on-disk format is **v4** and the reader is **strict v4-only**:
-`Index::open` accepts exactly version 4 (`VERSION == MIN_VERSION == 4`
+layer and the `trigram_dict`/`trigram_post` sections are the substring
+index; their header fields are carved from the header's reserved bytes.
+The on-disk format is **v6** and the reader is **strict v6-only**:
+`Index::open` accepts exactly version 6 (`VERSION == MIN_VERSION == 6`
 in `format.rs`) and bails on anything else. This is dev mode — there is
 no backward compatibility, so an index built by an older binary must be
 rebuilt from the kzip. See "Format / version compatibility" below.
 
 ## Format / version compatibility
 
-The `.s2db` on-disk format is **v4**, and the reader is **strict v4-only**.
-`format.rs` pins `VERSION = 4` and `MIN_VERSION = 4`, and `Index::open`
-rejects any file whose header version is not exactly 4. There is no older
+The `.s2db` on-disk format is **v6**, and the reader is **strict v6-only**.
+`format.rs` pins `VERSION = 6` and `MIN_VERSION = 6`, and `Index::open`
+rejects any file whose header version is not exactly 6. There is no older
 fallback path: this is dev mode, not a stable file format. An index
 produced by an older build is not upgraded in place — it is rebuilt from
 the source kzip with `from-kzip`.
@@ -119,8 +123,12 @@ kernel faults each in independently. The sections, in file order:
 | `inhrev` | reverse inherits `(parent, child)` — `sub`/`inheritance --down` |
 | `sig` | sym → full rendered signature with parameter names |
 | `blob` | all UTF-8 strings (names, paths, types, signatures), concatenated, no separators |
+| `trigram_dict` | each lowercased 3-byte trigram → `(post_off, post_len, count)`, sorted by the trigram — binary-searchable substring index |
+| `trigram_post` | block-skip / gap-delta varint postings: each trigram's ascending name-row-ids — backs `--substr` |
 
-All row **keys** are big-endian-packed, so a raw `memcmp` over a row's
+There are **14 sections** in total (the 12 above plus the two trigram
+sections, which are built once post-merge over the final alpha-sorted
+names table and appended after the blob). All row **keys** are big-endian-packed, so a raw `memcmp` over a row's
 key prefix equals the logical sort order — every lookup is a plain binary
 search over a cast byte slice with no parsing and no comparator callback.
 Blob offsets carried in the `syms`, `names`, `files`, `typed`, and `sig`
@@ -185,6 +193,45 @@ Innermost wins so a call inside a lambda is attributed to the lambda,
 not the surrounding method. Per-CU performance is `O((bodies +
 call_sites) log bodies)` which on the smoke test runs at 1.88M
 entries/3 s including the sort.
+
+## Substring search — compressed galloping trigram index
+
+`--substr` is backed by a trigram index built once post-merge over the
+final alpha-sorted names table (two appended sections, `trigram_dict` +
+`trigram_post`). It is not a linear scan.
+
+* **Dict.** Each distinct lowercased 3-byte trigram present in any name
+  is one `trigram_dict` row, sorted by the trigram, carrying its
+  postings region `(off, len)` and a posting `count`. The dict is
+  case-folded so one index backs both the case-sensitive default and
+  `-i`.
+* **Postings.** Each trigram's postings are the ascending name-row-ids
+  that contain it, **block-skip compressed**: split into fixed blocks of
+  `TRIGRAM_BLOCK` (128) ids, each block stored as LEB128 gap-delta
+  varints (dense runs collapse to ~1 byte per id), with a per-trigram
+  skip-table of one `(max_id, block_offset)` entry per block.
+* **Query.** Look up each distinct needle trigram's descriptor with no
+  decode; the smallest `count` is the **driver**. Fully decode only the
+  driver (small). For each driver candidate in ascending order, probe
+  every other trigram for membership via its skip-table — galloping /
+  binary search to the one block that could hold the candidate, decode
+  just that block. A per-list forward cursor means ascending candidates
+  never re-scan earlier blocks. So a query costs the driver list's size
+  plus a per-candidate `O(log n_blocks + TRIGRAM_BLOCK)` probe, not the
+  sum of all list sizes.
+* **Verify.** The trigram intersection is necessary-but-not-sufficient
+  (`abcZZbcd` holds `abc` and `bcd` but not `abcd`), so each candidate
+  that survives all lists is verified with a real substring check —
+  case-sensitive on the raw bytes by default, case-folded under `-i`.
+* **Fallback.** A needle shorter than 3 chars has no trigram, and an
+  empty names table has no dict; both fall back to the parallel
+  `memchr::memmem` linear scan.
+
+Performance: sub-millisecond warm for typical needles; the worst case is
+a needle whose every trigram is near-universal (e.g. on AOSP the
+canonical `kythe:...` VName prefix), which stays in the low-ms range
+because the driver is still the most-selective list. The per-call
+`--limit` cap bounds the work that survives into `ref`/`callers --substr`.
 
 ## What's intentionally absent
 
@@ -341,13 +388,20 @@ host. Everything moves to the warm 1–4 µs regime and stays there.
 * **Packed `[u8; n]` rows, not `bincode` / `flatbuffers`.** Those
   formats can't be `memcmp`'d in sort order, which breaks binary
   search. Packed BE bytes get the ordering for free.
-* **Substring name search is a parallel linear scan.** `--substr` runs
-  a chunked, multi-core `memchr::memmem` scan over the names table. It
-  is case-sensitive by default; `-i` / `--ignore-case` folds ASCII case
-  (needle and each candidate are lowercased before the substring check).
-  Each call is bounded by its per-call cap (`--limit`), which also caps
-  the symbols that flow into the `ref` / `callers --substr` aggregation.
-  See [LIMITS.md](LIMITS.md) for the exact semantics.
+* **Substring name search is a compressed trigram index.** `--substr`
+  intersects the needle's distinct (lowercased) trigrams against the
+  `trigram_dict`/`trigram_post` sections: it galloping-probes the
+  smallest (most-selective) posting list and verifies each surviving
+  candidate with a real substring check. Postings are block-skip
+  compressed (per-trigram skip-table over fixed blocks of gap-delta
+  varints), so a probe touches one block, not the whole list. It is
+  case-sensitive by default (verify on the raw bytes); `-i` /
+  `--ignore-case` verifies case-folded (needle and candidate lowercased).
+  A needle shorter than 3 chars (no trigram) falls back to a parallel
+  `memchr::memmem` linear scan. Each call is bounded by its per-call cap
+  (`--limit`), which also caps the symbols that flow into the `ref` /
+  `callers --substr` aggregation. See [LIMITS.md](LIMITS.md) for the
+  exact semantics.
 * **Kotlin source-level coverage is partial.** Public Kythe v0.0.75
   ships no source-level Kotlin indexer. The JVM bytecode indexer
   handles `.class` files but not source. Kotlin call sites that

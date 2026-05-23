@@ -66,13 +66,48 @@ Name → sym lookup has two paths with different semantics:
 
 ## Substring search semantics
 
-`--substr` runs a **parallel linear scan** over the names table
-(`memchr::memmem`, chunked across cores). It is **case-sensitive by
-default**; pass `-i` / `--ignore-case` for case-insensitive matching —
-the scan lowercases both the needle and each candidate before the
-substring check. Each call is bounded by its per-call cap (`--limit`),
-which also caps how many matching symbols flow into the `ref` /
-`callers --substr` aggregation, so a broad needle stays bounded.
+`--substr` matches NAME against any substring of the qualified symbol
+ticket (paths and enclosing identifiers included). It is backed by a
+**compressed trigram index** (the `trigram_dict`/`trigram_post`
+sections), not a linear scan: the query intersects the needle's distinct
+lowercased trigrams by galloping over the smallest (most-selective)
+posting list, then verifies each surviving candidate with a real
+substring check. It is **case-sensitive by default** (verify on the raw
+bytes); pass `-i` / `--ignore-case` to verify case-folded (needle and
+candidate lowercased) — the index itself is a case-folded candidate
+filter either way, so `-i` runs at the same speed. A needle shorter than
+3 chars has no trigram and falls back to a parallel `memchr::memmem`
+linear scan. Each call is bounded by its per-call cap (`--limit`), which
+also caps how many matching symbols flow into the `ref` / `callers
+--substr` aggregation, so a broad needle stays bounded.
+
+Performance: sub-millisecond warm for typical needles; the worst case
+(every needle trigram near-universal, e.g. all-`kythe:...`-prefix
+trigrams) stays in the low-ms range.
+
+When a result hits the `--limit` cap, the output prints a truncation
+indicator (`(showing N; --limit cap reached, more exist — raise
+--limit)`) so a capped count is never silently mistaken for the whole
+truth.
+
+## Substring rendering / case-fold edge cases
+
+* A small number (~6) of obscure C++ template-metaprogramming internal
+  names still render as a bare `<>` — e.g. a typelist `Head`/`Tail`/`type`
+  whose nested-template head is a Kythe `LOOKUP` token absent from the
+  bare MarkedSource proto, leaving no head to render.
+* Unnamed C++ parameters have no name node, so `sig` synthesizes a
+  non-identifier placeholder name for them rather than inventing a plausible
+  identifier.
+* Anonymous / local subtypes with no name row (no `/kythe/edge/named`
+  alias and no renderable MarkedSource) render as `anon@<path>@<off>`
+  from their def location rather than an FQN — a concrete locator instead
+  of a leaked raw ticket.
+* When both the case-sensitive and the `-i --substr` run hit the
+  `--limit` cap, only the **count relation** (`ci >= cs`) is guaranteed,
+  not set membership — each run keeps a different first-`limit` slice of
+  candidates, so a symbol present in the capped case-sensitive result is
+  not guaranteed to appear in the capped case-insensitive one.
 
 ## `.s2db` is a trusted build output
 

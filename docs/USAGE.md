@@ -57,6 +57,10 @@ Output during build (all on stderr) looks like:
 [from-kzip] java: CUs=8800 (ok=8700 empty=80 failed=20) entries=… …
 [from-kzip] jvm:  CUs=331  (ok=331 empty=0 failed=0) entries=… …
 [from-kzip] final merge: remainder (xrefs=…) + base(yes) + 7 shard(s) — single k-way pass
+[from-kzip] merge: xrefs 80123456 rows (1/13 sections, 1.36G)
+[from-kzip] merge heartbeat: +20s, output 2.41G, rss 14.8G
+[from-kzip] merge: names 110234567 rows (3/13 sections, 3.02G)
+[from-kzip] merge: trigram dict=4812345 postings=0.71G (13/13 sections, 5.09G)
 [from-kzip] done in 1043.27s → your.s2db (5.10 GB)
 ```
 
@@ -118,6 +122,12 @@ After every CU finishes, the run does **one k-way streaming pass** over
 (the in-RAM remainder delta + the base partial + every shard). Each source
 is mmap'd and read exactly once, so peak RAM is roughly one output blob
 rather than the whole union.
+
+The merge logs a `[from-kzip] merge: <section> <rows> (<k>/13 sections,
+<G>)` line as each of the 13 declared sections lands (the 13th being the
+trigram dict + postings, logged as `merge: trigram dict=… postings=…`),
+plus a `[from-kzip] merge heartbeat: +Ns, output …G, rss …G` line every
+~20 s so the long gather sub-phases between section lines don't look hung.
 
 ## Output mode and invocation
 
@@ -190,6 +200,12 @@ calls:  64093
 
 ### `def NAME` — definition site(s)
 
+The `# header` line shows the symbol's human FQN (from `/kythe/edge/named`
+or `/kythe/code` MarkedSource) rather than the raw VName ticket, so
+`def`/`ref`/`callers`/`members`/`super`/`sub`/`inheritance` all render
+readable names. A symbol with no FQN alias (e.g. a C++ builtin) still
+shows its raw ticket — there is no human name to render.
+
 Exact match on the Kythe VName-string (or any `/kythe/edge/named`
 alias):
 
@@ -243,11 +259,16 @@ hits=1
   **every** symbol of that exact name (all overloads, all per-jar copies,
   all language-pair variants), not a single one. This is the fast path —
   prefer it for hot queries; use `names NAME` to find the exact FQN.
-* **`--substr`** — a parallel linear scan (`memchr::memmem`) over the
-  whole names table, slower but tolerant of partial names. It is
-  **case-SENSITIVE by default** (code identifiers are case-significant).
-  Add `-i` / `--ignore-case` to fold ASCII case so the needle matches
-  regardless of case.
+* **`--substr`** — matches NAME against any substring of the qualified
+  symbol ticket, backed by a **compressed trigram index** (the query
+  intersects the needle's trigrams by galloping over the smallest posting
+  list, then verifies each candidate). Sub-millisecond warm for typical
+  needles, low-ms worst case. It is **case-SENSITIVE by default** (code
+  identifiers are case-significant). Add `-i` / `--ignore-case` to fold
+  ASCII case so the needle matches regardless of case (same speed — the
+  index is a case-folded filter either way). A needle shorter than 3
+  chars has no trigram and falls back to a parallel `memchr::memmem`
+  linear scan.
 
 ```bash
 # Case-sensitive (default): matches "Binder", "IBinder", "BinderProxy"
@@ -257,6 +278,10 @@ $ scry2 --index aosp.s2db def Binder --substr --limit 5
 $ scry2 --index aosp.s2db def binder --substr -i --limit 5
 ```
 
+When a result hits the `--limit` cap the output prints a truncation
+indicator on stderr — `(showing N; --limit cap reached, more exist —
+raise --limit)` — so a capped count is never mistaken for the whole truth.
+
 `ref`/`callers --substr` aggregate edges across all matching symbols,
 capped at 64 by default (raise with `--limit`); a broader match returns a
 fast partial flagged `truncated`. Prefer an exact FQN when you have it.
@@ -264,23 +289,32 @@ fast partial flagged `truncated`. Prefer an exact FQN when you have it.
 ### `super NAME` — direct supertypes
 
 `super android.os.Binder` returns the Java `IBinder` interface from
-the `/kythe/edge/extends` edges:
+the `/kythe/edge/extends` edges. Each related symbol is resolved to its
+FQN and its definition site (`path@offset`, preferring a DEF over a
+DECL):
 
 ```bash
 $ scry2 --index aosp.s2db super 'kythe:java:android##.../Binder.java#…'
-android.os.IBinder
+android.os.IBinder  frameworks/base/core/java/android/os/IBinder.java@1234
 hits=1
 ```
+
+Per-jar duplicate copies of one logical supertype (same VName signature,
+different build-variant path) are deduped to a single hit.
 
 ### `sub NAME` — direct subtypes
 
 ```bash
 $ scry2 --index aosp.s2db sub 'kythe:java:android##.../IBinder.java#…'
-android.os.Binder
-android.os.IBinder.Stub
-android.os.IBinder.Stub.Proxy
+android.os.Binder  frameworks/base/core/java/android/os/Binder.java@2048
+android.os.IBinder.Stub  frameworks/base/core/java/android/os/IBinder.java@4096
+android.os.IBinder.Stub.Proxy  frameworks/base/core/java/android/os/IBinder.java@8192
 hits=3
 ```
+
+An anonymous / local subtype with no name row renders as
+`anon@<path>@<off>` rather than an FQN — a concrete locator instead of a
+bare ticket. Per-jar duplicates are deduped.
 
 ### `callgraph NAME --direction up|down|both [--depth N]`
 
@@ -335,12 +369,20 @@ both directions from the root — `dir: "up"` and `dir: "down"` mark
 each edge. `--max-syms 200` caps total nodes so a hub function with
 10 000+ callers doesn't run away.
 
+AOSP compiles one logical function into many build-variant stub copies,
+and the call edges aren't mirrored across them. `callgraph` **unions**
+the call edges across all duplicate copies of each node, and **dedups**
+duplicate roots (so `callgraph parseInt` doesn't flood ~18 identical
+`parent=-` roots), keeping one node per logical function.
+
 ### `inheritance NAME --direction up|down|both [--depth N]`
 
 The type-hierarchy mirror of `callgraph`, with the same id/parent/hop
 forest output. `up` walks transitive supertypes (extends/implements),
 `down` walks transitive subtypes, `both` does both. `--depth` and
-`--max-syms` bound the walk like `callgraph`.
+`--max-syms` bound the walk like `callgraph`. Each node carries its FQN
+and a `def` location (`path@offset`); anonymous/local types with no name
+row render as `anon@<path>@<off>`.
 
 ```
 # Whole ancestor chain of a type
@@ -349,6 +391,13 @@ $ scry2 --index aosp.s2db inheritance android.os.Bundle --direction up
 $ scry2 --index aosp.s2db inheritance android.os.IBinder --direction down
 ```
 
+AOSP compiles one logical type into many build-variant stub copies, and
+the inheritance edges are not mirrored across them. `inheritance` (like
+`callgraph`) **unions** the edges across all duplicate copies of a node,
+so hub types like `Thread` / `HashMap` resolve correctly instead of
+returning empty when the first duplicate happened to carry no edges.
+Logical-duplicate nodes are themselves deduped to one node in the forest.
+
 For ambiguous names prefer the exact FQN: `--substr` can also match
 type-application syms (`const(T)`, `T&`) as roots.
 
@@ -356,10 +405,12 @@ type-application syms (`const(T)`, `T&`) as roots.
 
 The compiler-resolved type, including deduced `auto`/`var` and concrete
 generic/template instantiations (not the syntactic token). C++ and Java.
+Java fields carry their declared type here too.
 
 ```
 $ scry2 --index aosp.s2db type some.Var      #=> java.util.List<java.lang.String>
 $ scry2 --index aosp.s2db type someCxxVar    #=> const Box<int> &
+$ scry2 --index aosp.s2db type android.os.Bundle.EMPTY  #=> android.os.Bundle
 ```
 
 ### `sig NAME` — full signature with parameter names
@@ -370,20 +421,33 @@ C++ and Java:
 ```
 $ scry2 --index aosp.s2db sig setEnabled   #=> void setEnabled(boolean enabled)
 $ scry2 --index aosp.s2db sig pick         #=> java.util.List<java.lang.String> pick(int idx, java.lang.String key)
+$ scry2 --index aosp.s2db sig clearCallingIdentity  #=> long clearCallingIdentity()
 ```
 
-`def` also prints `sig:` inline when present. Type-variable and array
-types render in the indexer's own form (e.g. `array<int>`, `T.m.K`).
-Honest emptiness: a sym with no parameter/return info renders no signature.
+A zero-parameter function renders as `<ret> name()` (it still needs both
+a return type and a name; a synthetic zero-param node with neither — e.g.
+the JVM `<clinit>` — gets no row). `def` also prints `sig:` inline when
+present. Type-variable and array types render in the indexer's own form
+(e.g. `array<int>`, `T.m.K`). Honest emptiness: a sym with no
+parameter/return info renders no signature.
 
 ### `members NAME` — what a type declares
 
 The methods and fields a type/record/interface declares (reverse of
-"member is a child of its class"), each with its kind and signature.
+"member is a child of its class"), each with its kind and — for methods —
+signature. Fields carry their FQN name and type, listed with kind
+`[field/...]`:
 
 ```
 $ scry2 --index aosp.s2db members android.os.Bundle
+# android.os.Bundle
+  android.os.Bundle.EMPTY [field/java]  android.os.Bundle
+  android.os.Bundle.putByteArray [fn/java]  void putByteArray(java.lang.String key, byte[] value)
+  ...
 ```
+
+Per-jar duplicate copies of one logical member (identical rendered
+name + kind + signature) are deduped.
 
 ## Path filters — `--in`, `--not-in`, `--def-in`
 

@@ -37,10 +37,12 @@ cargo build --release -p scry2-bench
 
 The test suite covers:
 * round-trip of every section (xrefs, syms, names, files, inh, calls,
-  crev, typed, childrev, inhrev, sig, blob)
+  crev, typed, childrev, inhrev, sig, blob, plus the trigram dict +
+  postings)
 * FQN alias resolution via `add_alias`
 * callgraph both directions + dedup
-* substring name search (case-sensitive and `-i` case-folded)
+* substring name search via the trigram index (case-sensitive and `-i`
+  case-folded), plus the short-needle linear-scan fallback
 * the k-way final merge matching a reference `finish` across shards
 * the C++ `completes` DEFN↔DECL bridge remap at finalize
 * hand-rolled Kythe Entry decode (proto wire format, no codegen)

@@ -28,14 +28,22 @@ sym = xxHash64("kythe:<language>:<corpus>#<root>#<path>#<signature>")
 ```
 
 Two VNames that differ in any field hash to a different sym. The
-canonical string is what scry2 stores as the sym's primary name; FQN
-aliases come from `/kythe/edge/named` (see below).
+canonical VName string is what scry2 stores as the sym's name in the
+discovery index; FQN aliases come from `/kythe/edge/named` (Java/JVM/Go)
+or `/kythe/code` MarkedSource (C++) — see below. At CU finalize, scry2
+picks the cleanest human FQN among a sym's aliases and sets it as the
+sym's **display name**, so `def`/`ref`/`callers`/`members`/`super`/`sub`/
+`inheritance` render a readable FQN (`android.os.Binder.clearCallingIdentity`)
+instead of the raw `kythe:...#<hash>` ticket. A sym with no FQN alias
+(e.g. a C++ builtin) keeps the ticket as its display name — there is no
+human name to show.
 
 ## Node facts scry2 consumes
 
 | fact_name | purpose | what we do |
 |---|---|---|
 | `/kythe/node/kind` | tags a node as `anchor`, `function`, `record`, `variable`, `package`, `field` | marks anchor accumulators; sets `kind` on symbol metadata |
+| `/kythe/subkind` | refines a node's kind | `field` / `constant` subkind promotes a `variable` node to the FIELD kind (java_indexer emits class fields as `variable` + `subkind=field`), so Java fields surface as `[field/...]` |
 | `/kythe/loc/start` | anchor start byte offset (ASCII decimal) | populates `AnchorAccum.start` |
 | `/kythe/loc/end` | anchor end byte offset | populates `AnchorAccum.end` — needed for body-anchor extents |
 
@@ -58,7 +66,7 @@ below. Everything else is ignored.
 | `/kythe/edge/ref/imports` | REF | xref row only |
 | `/kythe/edge/extends`, `extends/public`, `extends/protected`, `extends/private` | — | `inhs` row `(child = source, parent = target)` |
 | `/kythe/edge/overrides`, `satisfies` | — | `inhs` row |
-| `/kythe/edge/named` | — | register `target.signature` as a human-typeable alias for the source sym — that's how `scry2 def android.os.Binder.clearCallingIdentity` resolves without `--substr` |
+| `/kythe/edge/named` | — | register `target.signature` as a human-typeable alias for the source sym — that's how `scry2 def android.os.Binder.clearCallingIdentity` resolves without `--substr`, and the cleanest such alias becomes the sym's FQN display name |
 | `/kythe/edge/completes`, `completes/uniquely` | — | C++ DEFN→DECL VName bridge: at CU finalize, every sym-keyed row of the `.cpp` definition VName is remapped to the `.h` declaration VName so the two unify on the queryable decl sym (see notes below) |
 | `/kythe/edge/typed` | — | source sym → its type node; the type is rendered to a string (MarkedSource for named/Java-generic nodes, recursive `tapp` walk for C++ composites) and stored in the `typed` section |
 | `/kythe/edge/childof` | — | member → enclosing parent; stored reversed as `childrev` `(parent, child)` for `members` |

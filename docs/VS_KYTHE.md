@@ -12,10 +12,11 @@ guide for which to reach for.
 * You need **microsecond warm queries**. Every lookup is a binary search
   over sorted, big-endian-packed rows; warm point lookups are single-digit
   µs, with no allocator, parser, or syscall on the hot path.
-* You want **substring search** over symbol names without a separate
-  index. `--substr` is a parallel linear scan (`memchr::memmem`) over the
-  names table, case-sensitive by default with `-i` for case-insensitive,
-  bounded by a per-call cap.
+* You want **substring search** over symbol names. `--substr` is backed
+  by a compressed trigram index (galloping intersection over the
+  smallest posting list, then a verify per candidate), case-sensitive by
+  default with `-i` for case-insensitive, bounded by a per-call cap.
+  Sub-millisecond warm for typical needles.
 * You want a **compact verb set for navigation**: `def`, `ref`,
   `callers`, `callgraph`, `super`, `sub`, `inheritance`, `type`, `sig`,
   `members`, `names`. This is the surface an LLM or agent needs to walk a

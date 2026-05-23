@@ -466,15 +466,19 @@ fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
     };
     let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
-    let mut hits: Vec<InhHit> = Vec::new();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    // Dedup by the related sym's LOGICAL identity, not the raw sym: stub-jar
-    // copies are distinct syms for one logical supertype/subtype, differing
-    // only in build-variant path. `logical_key` keys on the Kythe VName
-    // signature, which is identical across those copies, so they collapse to
-    // one hit while genuinely distinct relations survive.
-    let mut rendered: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    // Group related syms by LOGICAL identity, not the raw sym: stub-jar copies
+    // are distinct syms for one logical supertype/subtype, differing only in
+    // build-variant path. `logical_key` keys on the Kythe VName signature,
+    // identical across those copies. We render ONE hit per group, but pick the
+    // def location and the display name PER FIELD from whichever copy carries
+    // them — copies vary in whether they have a def anchor or a readable FQN.
+    // First-wins-on-one-copy (the old behaviour) dropped the def@offset when
+    // the first copy happened to lack an anchor, which is why `super` showed
+    // FQN-only while `sub`/`inheritance` (which pick a locating rep) did not.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<u64>> =
+        std::collections::HashMap::new();
     for sym in syms {
         let related = if sub { ix.inherited_by(sym) } else { ix.inherits_of(sym) };
         for r in related {
@@ -483,15 +487,32 @@ fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
                 let p = ix.sym_def_path(r).unwrap_or("");
                 if !filt.passes(p) { continue; }
             }
-            let name = name_of(r);
-            if !rendered.insert(logical_key(&name).to_string()) { continue; }
-            let def = def_loc_str(ix, r);
-            // Anonymous/local subtypes carry only a raw `kythe:` ticket as
-            // their name; render a readable fallback (def site or trailing
-            // VName sig) instead of leaking the ticket.
-            let name = display_name(ix, r, &name);
-            hits.push(InhHit { name, def });
+            let lk = logical_key(&name_of(r)).to_string();
+            match groups.entry(lk.clone()) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(vec![r]);
+                    order.push(lk);
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(r),
+            }
         }
+    }
+    let mut hits: Vec<InhHit> = Vec::new();
+    for lk in &order {
+        let members = &groups[lk];
+        // def: the first copy that actually has a def site (else None — the
+        // element genuinely has no source location, e.g. a `.class`-only type).
+        let def = members.iter().copied().find_map(|m| def_loc_str(ix, m));
+        // name: prefer a copy with a readable FQN (non-`kythe:` ticket); fall
+        // back to the anonymous renderer (def site / trailing VName sig) of the
+        // first copy for genuinely nameless nodes.
+        let rep = members
+            .iter()
+            .copied()
+            .find(|&m| !name_of(m).starts_with("kythe:"))
+            .unwrap_or(members[0]);
+        let name = display_name(ix, rep, &name_of(rep));
+        hits.push(InhHit { name, def });
     }
     let total = hits.len();
     Reply::Inh { hits, total }

@@ -79,7 +79,26 @@ fn reset_sigpipe() {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "scry2", version, about = "lean Kythe wrapper for AOSP")]
+#[command(name = "scry2", version,
+    about = "Semantic SYMBOL navigation over a Kythe .s2db index (not a text search).",
+    long_about = "\
+scry2 — fast semantic code navigation over a single mmap .s2db index.
+
+WHAT IT INDEXES: SYMBOLS from a Kythe graph — definitions, references, callers, \
+types, signatures, members, inheritance — resolved, not textual. Reach for it to \
+navigate code by symbol: def / ref / callers / callgraph / super / sub / \
+inheritance / type / sig / members / names.
+
+WHAT IT IS NOT: it is not a text search and it is not live. It does NOT index \
+source-file CONTENT — a log string, a comment, or arbitrary text will not be \
+found. `--substr` matches the qualified SYMBOL ticket (names + paths), never file \
+contents. It is also a point-in-time SNAPSHOT, not your working tree — it will not \
+reflect unsaved or post-build edits.
+
+ROUTING (important for automated callers): symbol lookup -> scry2; raw text, log \
+strings, or current/unsaved state -> grep/ripgrep or read the file. A 0-result \
+`--substr` means \"no SYMBOL matches\", NOT \"absent from the codebase\" — do not \
+conclude a string is missing because scry2 returned nothing.")]
 struct Cli {
     /// Path to the .s2db index file. Defaults to ./scry2.s2db. Ignored
     /// when --socket is set — the daemon owns the index.

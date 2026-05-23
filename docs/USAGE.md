@@ -7,6 +7,27 @@ Every example below was run on a real index built from a C++ test kzip
 (`scry2-smoke.s2db`, 220 k xrefs, 128 k symbols, 64 k callgraph edges,
 30 MB on disk).
 
+## When to use scry2 — and when not to
+
+scry2 answers questions about **symbols**, resolved from a Kythe graph: where a
+thing is defined, who references or calls it, its type/signature, what it extends
+or overrides, a type's members. It is semantic (not textual) and fast (single
+mmap, sub-millisecond warm).
+
+It is **not** a text search and **not** live:
+
+- It does **not** index source-file content. A log string, a comment, or any
+  arbitrary text will not be found. `--substr` matches the qualified **symbol
+  ticket** (names + paths), never file contents — so a 0-result `--substr` means
+  "no symbol matched", **not** "absent from the codebase".
+- It is a **snapshot** built at index time, not your working tree — it will not
+  reflect unsaved edits or changes made since the index was built.
+
+Routing rule (especially for automated / LLM callers): **symbol lookup → scry2;
+raw text, log strings, or current-file freshness → `grep`/`ripgrep` or read the
+file.** Misrouting a text query to `--substr` and getting nothing is the most
+common mistake — that is the tool working as designed, not the string missing.
+
 ## Build the index
 
 ### Option 1 — pipe one indexer's stdout

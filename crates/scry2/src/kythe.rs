@@ -255,6 +255,26 @@ pub fn ingest_tolerant<R: Read>(
         // Both endpoints can be a bridged def VName.
         builder.add_inherit(remap(*child), remap(*parent));
     }
+    // -- Supertype name rendering. A generic supertype (`Comparable<T>`,
+    //    `AbstractMap<K,V>`) is a `tapp` type node whose own `/kythe/code`
+    //    MarkedSource renders to a degenerate `<>` — its head is a LOOKUP
+    //    token absent from the bare proto. Render these through
+    //    `render_type`, which walks the buffered `param.N` graph and so
+    //    recovers the head + args, then promote the supertype sym's display
+    //    name to it. `set_sym_name` applies the order-independent
+    //    `prefers_name` rule, so a real `named`-edge FQN already on the sym
+    //    still wins and a degenerate render can never overwrite a good name.
+    {
+        let g = CuTypeGraph { side: &state.types };
+        for key in &state.inherit_parent_keys {
+            // Only type nodes render; a non-type parent (rare) is left to
+            // its alias/ticket name.
+            if let Some(rendered) = render_type(&g, key.as_str()) {
+                let rs = remap(sym_of(key));
+                builder.set_sym_name(rs, &rendered);
+            }
+        }
+    }
     for (child, parent) in &state.childof {
         builder.add_childof(remap(*child), remap(*parent));
     }
@@ -441,6 +461,14 @@ struct IngestState {
     aliases: Vec<(u64, String)>,
     /// `(child, parent)` — inheritance edges.
     inherits: Vec<(u64, u64)>,
+    /// VName string keys of inheritance PARENTS (supertypes). A generic
+    /// supertype is a `tapp` node whose own `/kythe/code` MarkedSource
+    /// renders to a degenerate `<>` (its head is a LOOKUP token, not in the
+    /// bare proto), so it would carry `<>` as its display name. At CU
+    /// finalize we re-render these keys through `render_type` — which uses
+    /// the buffered `param.N` graph and so recovers the head (`AbstractMap`)
+    /// and args (`<K, V>`) — and `set_sym_name` to the readable form.
+    inherit_parent_keys: std::collections::HashSet<String>,
     /// `(child, parent)` — childof membership edges (stored child-first
     /// here; `builder.add_childof` reverses to (parent, child)).
     childof: Vec<(u64, u64)>,
@@ -513,6 +541,7 @@ fn process_entry(
     let xrefs             = &mut state.xrefs;
     let aliases           = &mut state.aliases;
     let inherits          = &mut state.inherits;
+    let inherit_parent_keys = &mut state.inherit_parent_keys;
     let childof           = &mut state.childof;
     let types             = &mut state.types;
     if e.source.is_empty() { return; }
@@ -546,9 +575,13 @@ fn process_entry(
         }
         // inheritance edges → inh[] table
         if is_inherit_edge(&e.edge_kind) && !e.target.is_empty() {
+            let parent_key = e.target.to_symbol_string();
             let child  = sym_of(&source_key);
-            let parent = sym_of(&e.target.to_symbol_string());
+            let parent = sym_of(&parent_key);
             inherits.push((child, parent));
+            // Remember the parent's string key so finalize can render a
+            // readable name for a generic (`tapp`) supertype.
+            inherit_parent_keys.insert(parent_key);
             stats.inherits_emitted += 1;
             return;
         }
@@ -625,7 +658,16 @@ fn process_entry(
         // it and emit the rendered FQN as a sym alias so
         // `def android::Parcel::writeStrongBinder` resolves.
         "/kythe/code" => {
-            if let Some(fqn) = parse_marked_source_fqn(&e.fact_value) {
+            // Skip a DEGENERATE render (`<>`, empty, all-punctuation). It
+            // carries no human identity — a `tapp` supertype/operator node
+            // whose MarkedSource head is a LOOKUP token absent from the bare
+            // proto renders to a bare `<>`. Emitting it as an alias both
+            // pollutes the name index (54k `<>` rows) and can win a sym's
+            // display name. The readable name for these nodes comes from the
+            // `param.N` graph via `render_type` at CU finalize instead.
+            if let Some(fqn) = parse_marked_source_fqn(&e.fact_value)
+                .filter(|s| !is_degenerate_render(s))
+            {
                 let sym = sym_of(&source_key);
                 aliases.push((sym, fqn));
                 stats.aliases_emitted += 1;
@@ -1151,6 +1193,20 @@ fn typename_from_marked_source(code: &[u8]) -> Option<String> {
     let name = parse_marked_source_fqn(code)?;
     let trimmed = name.trim_end_matches("<>").trim_end();
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+/// True for a DEGENERATE MarkedSource render — one with no human identity,
+/// so it must never become a sym's display name or a name-index alias. A
+/// `tapp` (parameterized type) or operator node whose head is a LOOKUP
+/// token (absent from the bare proto) renders to a bare `<>` / `[]` / `?` /
+/// other pure decoration: no alphanumeric character, no identity. The
+/// readable name for such a node is recovered from its `param.N` graph via
+/// [`render_type`], not from this flat render. The same backstop lives in
+/// the writer's `prefers_name`; guarding at emission keeps the degenerate
+/// string out of the name index entirely.
+fn is_degenerate_render(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || !t.chars().any(|c| c.is_alphanumeric())
 }
 
 /// The short (unqualified) name from a parsed FQN: the last `::`- or
@@ -1894,6 +1950,45 @@ mod tests {
         assert!(r.contains("List"), "got {r:?}");
         assert!(r.contains("String"), "got {r:?}");
         assert_eq!(r, "java.util.List<java.lang.String>");
+    }
+
+    // #5: a generic supertype tapp (`Comparable<T>`) renders HEAD + args
+    // from the param graph and NEVER a bare `<>`. The bug was that the
+    // tapp's own `/kythe/code` MarkedSource (head = a LOOKUP token) renders
+    // to `<>`; the param-edge render recovers the head + arg.
+    #[test]
+    fn render_tapp_with_head_and_arg_never_bare_decoration() {
+        // `Comparable` head as an IDENTIFIER MarkedSource (kind 3, pre_text).
+        const COMPARABLE_HEAD_CODE: &[u8] = &[
+            0x08, 0x03, 0x12, 0x0a, b'C', b'o', b'm', b'p', b'a', b'r', b'a', b'b', b'l', b'e',
+        ];
+        let mut g = MapGraph::default();
+        // Head leaf: a record whose MarkedSource is the IDENTIFIER `Comparable`.
+        g.leaf("Comparable", "record", COMPARABLE_HEAD_CODE);
+        // Arg: a type variable (renders to its short name `K`).
+        g.leaf("K", "tvar", JAVA_TVAR_K_CODE);
+        g.tapp("Comparable<K>", &["Comparable", "K"]);
+        let r = render_type(&g, "Comparable<K>").expect("renders");
+        assert_eq!(r, "Comparable<K>", "head + arg, never bare <>: {r:?}");
+        assert_ne!(r, "<>");
+        assert!(r.starts_with("Comparable"), "head present: {r:?}");
+    }
+
+    #[test]
+    fn is_degenerate_render_rejects_decoration_keeps_real_names() {
+        // The emission-side backstop: pure decoration is degenerate; a real
+        // name (even with generic decoration) is not.
+        assert!(is_degenerate_render("<>"));
+        assert!(is_degenerate_render(""));
+        assert!(is_degenerate_render("   "));
+        assert!(is_degenerate_render("[]"));
+        assert!(is_degenerate_render("?"));
+        assert!(is_degenerate_render("::"));
+        assert!(is_degenerate_render("{}"));
+        assert!(!is_degenerate_render("Comparable"));
+        assert!(!is_degenerate_render("Comparable<T>"));
+        assert!(!is_degenerate_render("kythe:java:c#r#X.java#SIG"));
+        assert!(!is_degenerate_render("operator<"));
     }
 
     #[test]

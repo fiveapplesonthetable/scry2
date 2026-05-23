@@ -426,6 +426,33 @@ fn def_loc_str(ix: &Index, sym: u64) -> Option<String> {
     Some(format!("{path}@{off}"))
 }
 
+/// A readable display name for an inheritance/subtype hit.
+///
+/// Anonymous/local Java types and unnamed C++ entities never get an FQN
+/// alias, so their stored name is the raw Kythe ticket
+/// (`kythe:java:...#<hash>`). Surfacing that ticket as a result `name`
+/// is noise — it has a real def site but no human identity. When the
+/// resolved name is still a ticket we render a readable fallback instead,
+/// applied uniformly to text output AND the `--json` `name` field: first a
+/// concrete `anon@<path>@<off>` from its def location, else its trailing
+/// VName signature (the part after the last `#`) — never the raw ticket. A
+/// real FQN/named-edge name is returned verbatim.
+fn display_name(ix: &Index, sym: u64, name: &str) -> String {
+    if !name.starts_with("kythe:") {
+        return name.to_string();
+    }
+    if let Some((file, off)) = ix.sym_def_loc(sym) {
+        if let Some(path) = ix.file_path(file) {
+            return format!("anon@{path}@{off}");
+        }
+    }
+    // No def site: fall back to the trailing VName signature, which is
+    // the element's stable per-element id — still far more useful than
+    // the full ticket and never empty for a well-formed ticket.
+    let sig = name.rsplit('#').next().unwrap_or(name);
+    if sig.is_empty() { name.to_string() } else { sig.to_string() }
+}
+
 fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
           filt: PathFilter<'_>) -> Reply {
     // No kind filter: `inh` holds method `overrides` as well as type
@@ -459,6 +486,10 @@ fn do_inh(ix: &Index, name: &str, substr: bool, limit: usize, sub: bool,
             let name = name_of(r);
             if !rendered.insert(logical_key(&name).to_string()) { continue; }
             let def = def_loc_str(ix, r);
+            // Anonymous/local subtypes carry only a raw `kythe:` ticket as
+            // their name; render a readable fallback (def site or trailing
+            // VName sig) instead of leaking the ticket.
+            let name = display_name(ix, r, &name);
             hits.push(InhHit { name, def });
         }
     }
@@ -505,19 +536,70 @@ fn do_callgraph(
     }
     let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
+    // The full set of dup syms that share a representative's logical
+    // identity. AOSP compiles one logical function into many build-variant
+    // stub copies; each copy is a distinct sym, and the call edges are NOT
+    // mirrored across them — only some copies carry callers/callees. So
+    // collapsing dup roots to one logical node (the fix below) MUST union
+    // the call edges across all dups, or the surviving root would lose
+    // every edge that lived on a sibling copy. Dups share the same stored
+    // name string, so `syms_for_name(name)` recovers the group; we keep
+    // only those with the same logical key to avoid pulling in unrelated
+    // syms that merely share an alias string.
+    let dup_syms = |rep: u64| -> Vec<u64> {
+        let name = name_of(rep);
+        let key = logical_key(&name).to_string();
+        let mut group: Vec<u64> = ix.syms_for_name(&name).into_iter()
+            .filter(|&s| logical_key(&name_of(s)) == key)
+            .collect();
+        if !group.contains(&rep) { group.push(rep); }
+        group
+    };
+    let callers_of = |rep: u64| -> Vec<u64> {
+        let mut out: Vec<u64> = dup_syms(rep).into_iter()
+            .flat_map(|s| ix.called_by(s)).map(|(c, _)| c).collect();
+        out.sort_unstable(); out.dedup(); out
+    };
+    let callees_of = |rep: u64| -> Vec<u64> {
+        let mut out: Vec<u64> = dup_syms(rep).into_iter()
+            .flat_map(|s| ix.calls_from(s)).map(|(c, _)| c).collect();
+        out.sort_unstable(); out.dedup(); out
+    };
     // BFS spanning forest. `seen` maps a sym to the dense node-id it
     // got when first discovered; `nodes` is the result in BFS order
-    // (across roots and hops).
+    // (across roots and hops). `rendered` collapses stub-jar dups by
+    // LOGICAL identity so the forest carries one node per logical
+    // function — without it `callgraph parseInt` floods ~18 identical
+    // parent=- roots and burns the --max-syms budget. A dup's edges are
+    // already folded into the canonical node via the union helpers above,
+    // so an aliased dup is routed to the canonical node and not retraversed.
     let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut nodes: Vec<CallNode> = Vec::new();
     let mut frontier: Vec<(u64, u32)> = Vec::new();  // (sym, node_id)
-    for &root in &roots {
-        if seen.contains_key(&root) { continue; }   // dedup overlap
+    let mut rendered: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let admit = |sym: u64, parent_id: Option<u32>, dir: &str, hop: usize,
+                     nodes: &mut Vec<CallNode>,
+                     seen: &mut std::collections::HashMap<u64, u32>,
+                     rendered: &mut std::collections::HashMap<String, u32>|
+        -> Option<u32> {
+        if seen.contains_key(&sym) { return None; }
+        let name = name_of(sym);
+        let key = logical_key(&name).to_string();
+        if let Some(&existing) = rendered.get(&key) {
+            seen.insert(sym, existing);
+            return None;
+        }
         let id = nodes.len() as u32;
-        seen.insert(root, id);
-        nodes.push(CallNode { id, parent: None, hop: 0,
-                              dir: "root".into(), name: name_of(root), def: None });
-        frontier.push((root, id));
+        seen.insert(sym, id);
+        rendered.insert(key, id);
+        nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, def: None });
+        Some(id)
+    };
+    for &root in &roots {
+        if let Some(id) = admit(root, None, "root", 0, &mut nodes, &mut seen, &mut rendered) {
+            frontier.push((root, id));
+        }
     }
     let go_up   = direction == "up"   || direction == "both";
     let go_down = direction == "down" || direction == "both";
@@ -526,26 +608,20 @@ fn do_callgraph(
         let mut next: Vec<(u64, u32)> = Vec::new();
         for &(cur_sym, cur_id) in &frontier {
             if go_up {
-                for (caller, _) in ix.called_by(cur_sym) {
+                for caller in callers_of(cur_sym) {
                     if !pass(caller) { continue; }
-                    if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(caller) {
-                        let id = nodes.len() as u32;
-                        v.insert(id);
-                        nodes.push(CallNode { id, parent: Some(cur_id), hop,
-                                              dir: "up".into(), name: name_of(caller), def: None });
+                    if let Some(id) = admit(caller, Some(cur_id), "up", hop,
+                                            &mut nodes, &mut seen, &mut rendered) {
                         next.push((caller, id));
                         if nodes.len() >= max_syms { truncated = true; break 'depth; }
                     }
                 }
             }
             if go_down {
-                for (callee, _) in ix.calls_from(cur_sym) {
+                for callee in callees_of(cur_sym) {
                     if !pass(callee) { continue; }
-                    if let std::collections::hash_map::Entry::Vacant(v) = seen.entry(callee) {
-                        let id = nodes.len() as u32;
-                        v.insert(id);
-                        nodes.push(CallNode { id, parent: Some(cur_id), hop,
-                                              dir: "down".into(), name: name_of(callee), def: None });
+                    if let Some(id) = admit(callee, Some(cur_id), "down", hop,
+                                            &mut nodes, &mut seen, &mut rendered) {
                         next.push((callee, id));
                         if nodes.len() >= max_syms { truncated = true; break 'depth; }
                     }
@@ -555,9 +631,10 @@ fn do_callgraph(
         if next.is_empty() { break; }
         frontier = next;
     }
-    // total = non-root edges discovered. With N roots, there are N
-    // root entries which don't count as hits.
-    let total = nodes.len().saturating_sub(roots.len());
+    // total = non-root nodes. Count actual hop-0 nodes (roots collapse
+    // under rendered-dedup, so `roots.len()` would overcount).
+    let root_nodes = nodes.iter().filter(|n| n.hop == 0).count();
+    let total = nodes.len().saturating_sub(root_nodes);
     Reply::Callgraph { nodes, total, truncated }
 }
 
@@ -599,6 +676,38 @@ fn do_inheritance(
     }
     let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
+    // The full set of dup syms that share a representative sym's logical
+    // identity. AOSP compiles one logical type into many build-variant stub
+    // copies; each copy is a distinct sym, and the `inherits`/`inherited_by`
+    // edges are NOT mirrored across them — typically only one copy carries
+    // them. So expanding a frontier node by a single representative sym
+    // (the first dup admitted) silently drops every edge that lives on a
+    // sibling copy: hub types like Thread/HashMap returned EMPTY because the
+    // first dup happened to have no edges. We must UNION the edges across
+    // all dups, exactly as `do_inh` does for the seed name. Dups share the
+    // same stored name string, so `syms_for_name(name)` recovers the group;
+    // we keep only those with the same logical key (identical VName sig) to
+    // avoid pulling in unrelated syms that merely share an alias string.
+    let dup_syms = |rep: u64| -> Vec<u64> {
+        let name = name_of(rep);
+        let key = logical_key(&name).to_string();
+        let mut group: Vec<u64> = ix.syms_for_name(&name).into_iter()
+            .filter(|&s| logical_key(&name_of(s)) == key)
+            .collect();
+        if !group.contains(&rep) { group.push(rep); }
+        group
+    };
+    // Union an inheritance frontier across all dups of `rep`, deduped by sym.
+    let up_edges = |rep: u64| -> Vec<u64> {
+        let mut out: Vec<u64> = dup_syms(rep).into_iter()
+            .flat_map(|s| ix.inherits_of(s)).collect();
+        out.sort_unstable(); out.dedup(); out
+    };
+    let down_edges = |rep: u64| -> Vec<u64> {
+        let mut out: Vec<u64> = dup_syms(rep).into_iter()
+            .flat_map(|s| ix.inherited_by(s)).collect();
+        out.sort_unstable(); out.dedup(); out
+    };
     let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut nodes: Vec<CallNode> = Vec::new();
     let mut frontier: Vec<(u64, u32)> = Vec::new();
@@ -632,6 +741,10 @@ fn do_inheritance(
         let id = nodes.len() as u32;
         seen.insert(sym, id);
         rendered.insert(key, id);
+        // Dedup keys on the raw name's logical key (above); the displayed
+        // name renders a readable fallback for anonymous/local types whose
+        // stored name is still a bare `kythe:` ticket.
+        let name = display_name(ix, sym, &name);
         nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, def });
         Some(id)
     };
@@ -647,7 +760,7 @@ fn do_inheritance(
         let mut next: Vec<(u64, u32)> = Vec::new();
         for &(cur_sym, cur_id) in &frontier {
             if go_up {
-                for parent in ix.inherits_of(cur_sym) {
+                for parent in up_edges(cur_sym) {
                     if !pass(parent) { continue; }
                     if let Some(id) = admit(parent, Some(cur_id), "up", hop,
                                             &mut nodes, &mut seen, &mut rendered) {
@@ -657,7 +770,7 @@ fn do_inheritance(
                 }
             }
             if go_down {
-                for child in ix.inherited_by(cur_sym) {
+                for child in down_edges(cur_sym) {
                     if !pass(child) { continue; }
                     if let Some(id) = admit(child, Some(cur_id), "down", hop,
                                             &mut nodes, &mut seen, &mut rendered) {

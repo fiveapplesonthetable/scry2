@@ -430,31 +430,29 @@ enum Cmd {
         /// is deterministic regardless of how rows are distributed
         /// across CUs. Default 250M ≈ a ~25 GB delta. 0 disables.
         #[arg(long = "snapshot-rows", default_value_t = 250_000_000)] snapshot_rows: u64,
-        /// Incremental-rebuild cache directory. Each compilation unit's
-        /// produced delta shard is persisted here, keyed by a content
-        /// digest of exactly what its indexer consumes (its args + the
-        /// required-input file digests + an indexer-version tag + scry2's
-        /// ingest-schema version). A rebuild REUSES an unchanged CU's
-        /// shard — skipping its indexer subprocess AND its ingest — and
-        /// re-indexes only changed/new CUs, then re-merges to the same
-        /// `.s2db`. The merged output is BYTE-IDENTICAL to a full rebuild
-        /// (file-ids are pre-seeded deterministically from the plan, so a
-        /// cached shard carries the same bytes a fresh build would).
-        /// Defaults to a sibling `<OUT>.cache/`. Mutually exclusive with
-        /// `--no-cache`; ignored with `--resume` (resume uses its own
-        /// partial state). See also `--clean`.
+        /// Enable INCREMENTAL rebuilds, persisting each compilation unit's
+        /// produced delta shard in PATH, keyed by a content digest of
+        /// exactly what its indexer consumes (its args + the required-input
+        /// file digests + an indexer-version tag + scry2's ingest-schema
+        /// version). A later rebuild pointed at the same PATH REUSES an
+        /// unchanged CU's shard — skipping its indexer subprocess AND its
+        /// ingest — and re-indexes only changed/new CUs, then re-merges. The
+        /// merged output is BYTE-IDENTICAL to a full build (file-ids are
+        /// pre-seeded deterministically from the plan, so a cached shard
+        /// carries the same bytes a fresh build would). OMITTING this flag
+        /// (the default) does a plain full build with no cache. Note: at
+        /// AOSP scale the cache is large — per-CU shards do not dedup shared
+        /// blobs, so the cache can be ~20x the `.s2db` — enable it only for a
+        /// working set you iterate on, not for a one-shot whole-tree build.
+        /// Ignored with `--resume` (resume uses its own partial state). See
+        /// also `--clean`.
         #[arg(long = "cache-dir", value_parser = path_arg)]
         cache_dir: Option<PathBuf>,
-        /// Ignore and DELETE any existing cache, do a full from-scratch
-        /// build, and repopulate the cache fresh. Use after a toolchain
-        /// change you want to force through, or to clear a cache you no
-        /// longer trust. The result is identical to a default build into
-        /// an empty cache.
+        /// With `--cache-dir`: ignore and DELETE the existing cache there, do
+        /// a full from-scratch build, and repopulate it fresh. Use after a
+        /// toolchain change you want to force through, or to clear a cache you
+        /// no longer trust. Requires `--cache-dir`.
         #[arg(long, default_value_t = false)] clean: bool,
-        /// Neither read nor write the cache for this run — a pure full
-        /// build. Leaves any existing cache untouched. Mutually exclusive
-        /// with `--clean`/`--cache-dir`.
-        #[arg(long = "no-cache", default_value_t = false)] no_cache: bool,
     },
 }
 
@@ -468,12 +466,9 @@ fn main() -> Result<()> {
         Cmd::FromKzip { kzip, kythe_root, out, langs, jvm_heap,
                         in_, not_in, staging, workers, inject_cu_args,
                         resume, snapshot_every, snapshot_rows,
-                        cache_dir, clean, no_cache } => {
-            if clean && no_cache {
-                anyhow::bail!("--clean and --no-cache are mutually exclusive");
-            }
-            if no_cache && cache_dir.is_some() {
-                anyhow::bail!("--no-cache and --cache-dir are mutually exclusive");
+                        cache_dir, clean } => {
+            if clean && cache_dir.is_none() {
+                anyhow::bail!("--clean requires --cache-dir (there is no default cache to clean)");
             }
             let rules = parse_inject_rules(&inject_cu_args)?;
             return cmd_from_kzip(FromKzipArgs {
@@ -483,7 +478,7 @@ fn main() -> Result<()> {
                 staging: staging.as_deref(), workers,
                 inject_rules: &rules,
                 resume, snapshot_every, snapshot_rows,
-                cache_dir: cache_dir.as_deref(), clean, no_cache,
+                cache_dir: cache_dir.as_deref(), clean,
             });
         }
         Cmd::Serve { socket } => {
@@ -708,14 +703,13 @@ struct FromKzipArgs<'a> {
     /// Row budget that bounds the in-RAM delta. See
     /// `Cmd::FromKzip::snapshot_rows`.
     snapshot_rows: u64,
-    /// Incremental cache directory override. `None` ⇒ the default sibling
-    /// `<out>.cache/`. See `Cmd::FromKzip::cache_dir`.
+    /// Incremental cache directory. `None` (the default) ⇒ no cache, a plain
+    /// full build. `Some(dir)` opts into incremental rebuilds at `dir`. See
+    /// `Cmd::FromKzip::cache_dir`.
     cache_dir: Option<&'a std::path::Path>,
-    /// Delete + repopulate the cache (full from-scratch build). See
-    /// `Cmd::FromKzip::clean`.
+    /// Delete + repopulate the cache (full from-scratch build). Requires
+    /// `cache_dir`. See `Cmd::FromKzip::clean`.
     clean: bool,
-    /// Bypass the cache entirely for this run. See `Cmd::FromKzip::no_cache`.
-    no_cache: bool,
 }
 
 /// One `--inject-cu-arg` rule: when a CU's primary path starts with
@@ -1083,35 +1077,36 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
 
     // --- Incremental shard cache ----------------------------------------
     //
-    // Resolve the cache policy. `--resume` owns its own partial state and is
+    // Resolve the cache policy. The incremental cache is OPT-IN: it is used
+    // only when `--cache-dir` is given. The default (no `--cache-dir`) is a
+    // plain full build. `--resume` owns its own partial state and is
     // incompatible with the per-CU cache model, so resume always runs the
-    // legacy sink/snapshot path with no cache. Otherwise: `--no-cache`
-    // bypasses the cache; `--clean` wipes it first; the default uses it.
+    // legacy sink/snapshot path with no cache. `--clean` wipes the chosen
+    // cache first.
     let indexer_tag = scry2::cache::indexer_version_tag(args.kythe_root);
-    let cache: Option<scry2::cache::ShardCache> = if args.resume || args.no_cache {
-        if args.no_cache { eprintln!("[from-kzip] --no-cache: full build, cache untouched"); }
-        None
-    } else {
-        let dir = args.cache_dir.map(|p| p.to_path_buf())
-            .unwrap_or_else(|| scry2::cache::ShardCache::default_dir(args.out));
-        if args.clean {
-            eprintln!("[from-kzip] --clean: wiping cache {}", dir.display());
-            scry2::cache::ShardCache::clear(&dir)?;
+    let cache: Option<scry2::cache::ShardCache> = match args.cache_dir {
+        Some(dir) if !args.resume => {
+            let dir = dir.to_path_buf();
+            if args.clean {
+                eprintln!("[from-kzip] --clean: wiping cache {}", dir.display());
+                scry2::cache::ShardCache::clear(&dir)?;
+            }
+            // No seed-basis guard. A per-CU shard now stores its file references
+            // in a LOCAL, membership-independent namespace (the path's rank among
+            // only that CU's files — see `IndexBuilder::localize_file_ids`), and
+            // the final merge re-assigns global ids = the path's rank in the
+            // build's sorted seed set. A membership change (added/deleted CU, a
+            // different `--in` filter) therefore only re-sorts the union at merge
+            // time; it never shifts a cached shard's stored ids, so every
+            // unchanged CU is reused. A shard-format change is handled by
+            // `INGEST_SCHEMA_VERSION` (folded into every digest), so an old
+            // global-id cache is invalidated entry-by-entry on lookup rather than
+            // by a whole-cache wipe.
+            let c = scry2::cache::ShardCache::open(&dir)?;
+            eprintln!("[from-kzip] cache: {} (indexer-tag {})", dir.display(), indexer_tag);
+            Some(c)
         }
-        // No seed-basis guard. A per-CU shard now stores its file references
-        // in a LOCAL, membership-independent namespace (the path's rank among
-        // only that CU's files — see `IndexBuilder::localize_file_ids`), and
-        // the final merge re-assigns global ids = the path's rank in the
-        // build's sorted seed set. A membership change (added/deleted CU, a
-        // different `--in` filter) therefore only re-sorts the union at merge
-        // time; it never shifts a cached shard's stored ids, so every
-        // unchanged CU is reused. A shard-format change is handled by
-        // `INGEST_SCHEMA_VERSION` (folded into every digest), so an old
-        // global-id cache is invalidated entry-by-entry on lookup rather than
-        // by a whole-cache wipe.
-        let c = scry2::cache::ShardCache::open(&dir)?;
-        eprintln!("[from-kzip] cache: {} (indexer-tag {})", dir.display(), indexer_tag);
-        Some(c)
+        _ => None,
     };
     // Per-CU content digests, parallel to `plan`. Computed once up front
     // (cheap: hashes proto fields already in memory). Empty when the cache
@@ -1349,7 +1344,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
     let snapshot_every        = args.snapshot_every;
     let snapshot_rows         = args.snapshot_rows;
     // Cache wiring for the per-CU shard path. `cache_ref` is Some only when
-    // the cache is active (not resume, not --no-cache); `digests_ref` is the
+    // the cache is active (--cache-dir given, not resume); `digests_ref` is the
     // matching per-CU content digests. Counters report hits/stores. Hit and
     // freshly stored shards both land as `partial_shard_for(out, idx)`, so
     // the existing final k-way merge folds them with no special-casing.
@@ -2130,7 +2125,7 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             depth, level.len(), coalesce_t0.elapsed().as_secs_f64());
         final_sources = level;
     } else {
-        // Legacy / no-cache / resume path: file ids are already global (the
+        // Legacy / no-cache-dir / resume path: file ids are already global (the
         // shared seed allocator), so drain them into the remainder delta and
         // merge the base partial + every shard directly. Unchanged behavior.
         file_ids.drain_into(&mut final_delta);

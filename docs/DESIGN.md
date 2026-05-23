@@ -254,18 +254,20 @@ because the driver is still the most-selective list. The per-call
 * **Immutable format, incremental build.** The `.s2db` itself is never
   patched in place — every section is sorted at build time, so the reader
   is just `mmap` + `memcmp`, and a rebuild rewrites the whole file
-  atomically. What *is* incremental is the work that feeds the rewrite:
-  `from-kzip` keeps a per-CU shard cache (`<out>.cache/`), keyed by a
+  atomically. What *can* be incremental is the work that feeds the rewrite:
+  passing `--cache-dir PATH` opts into a per-CU shard cache, keyed by a
   content digest of exactly what each compilation unit's indexer consumes
   (its args + required-input file digests + an indexer-version tag +
-  scry2's ingest-schema version). A rebuild reuses the persisted delta
-  shard for every unchanged CU — skipping both its indexer subprocess and
-  its ingest — and re-indexes only changed/new CUs, then re-merges to a
-  fresh `.s2db`. Determinism makes this safe to cache: per-shard file-ids
-  are local, remapped to global ids at merge time over the full plan's
-  sorted seed, so a cached shard carries the same bytes a from-scratch
-  build would. The merged output is **byte-identical** to `--clean`. Pass
-  `--no-cache` for a pure full build, or `--clean` to wipe and repopulate.
+  scry2's ingest-schema version). A rebuild pointed at the same `PATH`
+  reuses the persisted delta shard for every unchanged CU — skipping both
+  its indexer subprocess and its ingest — and re-indexes only changed/new
+  CUs, then re-merges to a fresh `.s2db`. Determinism makes this safe to
+  cache: per-shard file-ids are local, remapped to global ids at merge time
+  over the full plan's sorted seed, so a cached shard carries the same bytes
+  a from-scratch build would. The merged output is **byte-identical** to a
+  full build. The cache is opt-in (not the default) because per-CU shards
+  don't dedup shared blobs, so at whole-AOSP scale it is ~20x the `.s2db`;
+  it pays off for an iterated working set, not a one-shot whole-tree build.
 * **No precision sidecars.** A single `.s2db` is the complete index.
   FQN-alias resolution (the path that lets `scry2 def
   android.os.Binder.clearCallingIdentity` work without `--substr`)

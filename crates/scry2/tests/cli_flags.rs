@@ -895,36 +895,28 @@ fn from_kzip(extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn from_kzip_clean_and_no_cache_conflict() {
-    let out = from_kzip(&["--clean", "--no-cache"]);
+fn from_kzip_clean_requires_cache_dir() {
+    // Incremental is opt-in: --clean only makes sense with a cache to clean.
+    let out = from_kzip(&["--clean"]);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "--clean --no-cache must be rejected");
-    assert!(err.contains("mutually exclusive"),
-            "expected mutual-exclusion error, got: {err}");
-}
-
-#[test]
-fn from_kzip_no_cache_and_cache_dir_conflict() {
-    let out = from_kzip(&["--no-cache", "--cache-dir", "/tmp/whatever"]);
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "--no-cache --cache-dir must be rejected");
-    assert!(err.contains("mutually exclusive"),
-            "expected mutual-exclusion error, got: {err}");
+    assert!(!out.status.success(), "--clean without --cache-dir must be rejected");
+    assert!(err.contains("requires --cache-dir"),
+            "expected '--clean requires --cache-dir' error, got: {err}");
 }
 
 #[test]
 fn from_kzip_flags_parse() {
-    // A lone --no-cache (or --clean / --cache-dir) is accepted by the
-    // parser and the mutual-exclusion validator; the run then fails later
-    // because the dummy kzip can't be opened — but NOT with a clap usage
-    // error and NOT with the mutual-exclusion error. (clap usage errors say
+    // --cache-dir (and --clean WITH --cache-dir) are accepted by the parser
+    // and the validator; the run then fails later because the dummy kzip
+    // can't be opened — but NOT with a clap usage error and NOT with the
+    // --clean-requires-cache-dir validation error. (clap usage errors say
     // "unexpected argument" / "invalid value"; we only assert the flag is
-    // recognized and not falsely rejected as conflicting.)
-    for flag in [&["--no-cache"][..], &["--clean"][..], &["--cache-dir", "/tmp/c"][..]] {
+    // recognized and not falsely rejected.)
+    for flag in [&["--cache-dir", "/tmp/c"][..], &["--clean", "--cache-dir", "/tmp/c"][..]] {
         let out = from_kzip(flag);
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(!err.contains("mutually exclusive"),
-                "{flag:?} wrongly flagged as conflicting: {err}");
+        assert!(!err.contains("requires --cache-dir"),
+                "{flag:?} wrongly rejected: {err}");
         assert!(!err.contains("unexpected argument") && !err.contains("invalid value"),
                 "{flag:?} should be a recognized flag, got: {err}");
     }

@@ -188,14 +188,6 @@ pub struct ShardCache {
 }
 
 impl ShardCache {
-    /// Default cache dir for an output path: a sibling `<out>.cache/`.
-    pub fn default_dir(out: &Path) -> PathBuf {
-        let mut p = out.to_path_buf();
-        let stem = p.file_name().map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        p.set_file_name(format!("{stem}.cache"));
-        p
-    }
 
     /// Open (creating if absent) a cache at `root`.
     pub fn open(root: &Path) -> Result<Self> {

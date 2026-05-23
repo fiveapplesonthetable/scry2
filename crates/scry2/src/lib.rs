@@ -2,6 +2,7 @@
 //! microsecond-scale queries on the verbs an LLM uses to walk code:
 //! `def`, `ref`, `callers`, `super`, `sub`.
 
+pub mod cache;
 pub mod format;
 pub mod kythe;
 pub mod kzip;

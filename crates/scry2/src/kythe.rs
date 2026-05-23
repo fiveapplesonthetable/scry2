@@ -376,51 +376,104 @@ pub struct IngestStats {
 /// ingest — that's the difference between "real parallelism" and
 /// the prior single-allocator-mutex shape where 36 workers all
 /// parked in futex_wait_queue.
+/// Allocator state behind the mutex: the (path → (id, accessed)) table plus
+/// the next id to hand out.
+///
+/// `accessed` is true once a path is `intern`ed (actually referenced by an
+/// anchor during ingest), false for a path only PRE-LOADED via
+/// `seed_paths`/`seed_from`. `push_to`/`drain_into` emit only accessed
+/// paths, so a deterministic pre-seed (which loads every candidate path in
+/// the plan, most of which a given build never references) doesn't bloat the
+/// output's `files` table with phantom unreferenced paths — the table stays
+/// exactly the set of paths the ingest touched, while ids are the
+/// deterministic seed ranks. The next-id counter is explicit (not
+/// `map.len()`) so a seeded, possibly-non-dense namespace can't hand out an
+/// id that collides with a seeded one.
+type AllocState = (HashMap<String, (u32, bool)>, u32);
+
 #[derive(Default)]
 pub struct FileIdAllocator {
-    // (path -> id, next id to assign). Held together under one lock so
-    // id assignment is atomic and `seed_from` can advance the counter
-    // past any pre-loaded ids. The counter is explicit (not `map.len()`)
-    // so a seeded, possibly-non-dense namespace can't hand out an id
-    // that collides with a seeded one.
-    inner: std::sync::Mutex<(HashMap<String, u32>, u32)>,
+    // Held together under one lock so id assignment is atomic and
+    // `seed_from` can advance the counter past any pre-loaded ids.
+    inner: std::sync::Mutex<AllocState>,
 }
 
 impl FileIdAllocator {
     pub fn intern(&self, path: &str) -> u32 {
         let mut g = self.inner.lock().unwrap();
-        if let Some(&id) = g.0.get(path) { return id; }
+        if let Some(e) = g.0.get_mut(path) {
+            // Mark a pre-seeded path as actually referenced so it lands in
+            // the output's `files` table (a seed-only path stays out).
+            e.1 = true;
+            return e.0;
+        }
         let id = g.1;
         g.1 += 1;
-        g.0.insert(path.to_string(), id);
+        g.0.insert(path.to_string(), (id, true));
         id
+    }
+    /// Deterministic pre-seed: assign every path in `sorted_paths` a dense
+    /// id in iteration order (0, 1, 2, …), so a path's file-id is its rank
+    /// in that order rather than the parallel-intern order it happens to be
+    /// first touched in. The caller passes a deterministically-ordered,
+    /// deduplicated path list (the sorted union of every planned CU's
+    /// candidate file paths), so the resulting (path → id) map is a pure
+    /// function of the plan — identical across a full build and a
+    /// cache-assisted rebuild of the same kzip, and identical regardless of
+    /// worker scheduling.
+    ///
+    /// This is what makes the merged `.s2db` byte-identical: every `intern`
+    /// during ingest then resolves to a pre-assigned id, so xref `file`
+    /// columns and the `files` table carry order-independent values. The
+    /// seed must be a SUPERSET of the paths that ingest will actually
+    /// intern; any interned path absent from the seed falls back to a fresh
+    /// counter id whose value depends on intern order (non-deterministic),
+    /// so callers build the seed from the same VName/info path fields the
+    /// indexer reads from. Call once, before any ingest, on a fresh
+    /// allocator. Idempotent for an already-seeded path (first id wins).
+    pub fn seed_paths<'a, I: IntoIterator<Item = &'a str>>(&self, sorted_paths: I) {
+        let mut g = self.inner.lock().unwrap();
+        for path in sorted_paths {
+            if !g.0.contains_key(path) {
+                let id = g.1;
+                g.1 += 1;
+                // Pre-seeded, not yet referenced: emitted into the output's
+                // `files` table only once `intern` marks it accessed.
+                g.0.insert(path.to_string(), (id, false));
+            }
+        }
     }
     /// Resume support: pre-load (path, id) pairs from a prior base/shard
     /// so a resumed run continues the SAME file-id namespace. Without
     /// this a resumed run restarts ids at 0, which collide with the
     /// existing shards' ids when the final merge dedups the file tables
-    /// by id — silently misattributing xrefs to the wrong file.
+    /// by id — silently misattributing xrefs to the wrong file. Pre-loaded
+    /// paths are marked not-accessed: the prior shard already carries them
+    /// in its own file table, so they only re-enter this run's delta if it
+    /// re-interns them — avoiding a redundant phantom row.
     pub fn seed_from(&self, ix: &crate::reader::Index) {
         let mut g = self.inner.lock().unwrap();
         for (id, path) in ix.iter_files() {
-            g.0.entry(path.to_string()).or_insert(id);
+            g.0.entry(path.to_string()).or_insert((id, false));
             if id >= g.1 { g.1 = id + 1; }
         }
     }
     pub fn drain_into(self, builder: &mut IndexBuilder) {
-        for (path, id) in self.inner.into_inner().unwrap().0 {
-            builder.upsert_file(id, &path);
+        for (path, (id, accessed)) in self.inner.into_inner().unwrap().0 {
+            if accessed { builder.upsert_file(id, &path); }
         }
     }
     /// Non-consuming variant for mid-run snapshots: copy the current
     /// (path, id) map into `builder` so each shard captures every
     /// file_id its xrefs might reference. `IndexBuilder::upsert_file`
     /// is first-write-wins, so this is safe to call repeatedly and to
-    /// interleave with the final `drain_into`.
+    /// interleave with the final `drain_into`. Emits only accessed
+    /// (actually-interned) paths — a pre-seeded but unreferenced path is
+    /// not a fact this shard needs to carry.
     pub fn push_to(&self, builder: &mut IndexBuilder) {
         let g = self.inner.lock().unwrap();
-        for (path, &id) in g.0.iter() {
-            builder.upsert_file(id, path);
+        for (path, &(id, accessed)) in g.0.iter() {
+            if accessed { builder.upsert_file(id, path); }
         }
     }
 }
@@ -632,6 +685,14 @@ fn process_entry(
             }
             if let (true, Some(start)) = (a.is_anchor, a.start) {
                 let file_id = file_ids.intern(&a.path);
+                // Record this CU's (file_id → path) into the per-CU builder
+                // so its shard carries exactly the files it touched. The
+                // per-CU cache path writes that builder as a standalone
+                // shard and needs a self-contained file table; the legacy
+                // path merges it into the sink (idempotent — `upsert_file`
+                // is first-wins). Done at intern time so even an anchor that
+                // ultimately emits no xref still contributes its file.
+                builder.upsert_file(file_id, &a.path);
                 emit_xref_resolved(&e.target, role_byte, file_id, start,
                                    xrefs, builder, stats);
                 if role_byte == role::REF || role_byte == role::CALL {
@@ -746,6 +807,7 @@ fn process_entry(
                 // record the body range now.
                 if let (true, Some(start), Some(sym)) = (a.is_anchor, a.start, a.body_def_sym) {
                     let file_id = file_ids.intern(&a.path);
+                    builder.upsert_file(file_id, &a.path);
                     body_anchors.push((file_id, start, v, sym));
                 }
             }
@@ -767,6 +829,10 @@ fn flush_ready(
     let start = a.start.unwrap();
     let path  = a.path.clone();
     let file_id = file_ids.intern(&path);
+    // Record the file even if `pend` is empty (an anchor with no resolved
+    // targets still names a file the CU touched), so the per-CU shard's
+    // file table is exactly the set of paths this CU interned.
+    builder.upsert_file(file_id, &path);
     let pend  = std::mem::take(&mut a.pending);
     for (target, role_byte) in pend {
         let target_sym = sym_of(&target.to_symbol_string());
@@ -3026,5 +3092,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn seed_paths_assigns_dense_sorted_ids() {
+        // Deterministic pre-seed: a path's id is its rank in the seed
+        // order, regardless of the order it is later interned.
+        let a = FileIdAllocator::default();
+        a.seed_paths(["", "a.cpp", "b.h", "z.cc"]);
+        assert_eq!(a.intern("a.cpp"), 1);
+        assert_eq!(a.intern(""),      0);
+        assert_eq!(a.intern("z.cc"),  3);
+        assert_eq!(a.intern("b.h"),   2);
+    }
+
+    #[test]
+    fn seed_paths_makes_intern_order_independent() {
+        // The whole point: two allocators seeded identically hand out the
+        // same id for the same path even when interned in opposite orders.
+        let seed = ["", "alpha", "beta", "gamma"];
+        let a = FileIdAllocator::default();
+        a.seed_paths(seed);
+        let b = FileIdAllocator::default();
+        b.seed_paths(seed);
+        // Intern in opposite orders.
+        let ida: Vec<u32> = ["gamma", "alpha", "", "beta"].iter().map(|p| a.intern(p)).collect();
+        let mut order_b = ["beta", "", "gamma", "alpha"];
+        order_b.reverse();
+        let _ = order_b.iter().map(|p| b.intern(p)).collect::<Vec<_>>();
+        // Same path → same id in both, independent of intern order.
+        for p in ["", "alpha", "beta", "gamma"] {
+            assert_eq!(a.intern(p), b.intern(p), "path {p:?} got different ids");
+        }
+        // The ids are the sorted-seed ranks.
+        assert_eq!(ida, vec![3, 1, 0, 2]);
+    }
+
+    #[test]
+    fn seed_paths_then_new_path_gets_fresh_noncolliding_id() {
+        // A path not in the seed (an interned path the superset missed)
+        // still gets a fresh id past the seeded range — no collision with a
+        // seeded id. (Such a path is the only non-deterministic case, which
+        // the from-kzip seed is built to avoid by being a superset.)
+        let a = FileIdAllocator::default();
+        a.seed_paths(["x", "y"]); // ids 0,1
+        let fresh = a.intern("brand-new");
+        assert_eq!(fresh, 2, "fresh id continues past the seeded range");
+        assert_ne!(fresh, a.intern("x"));
+        assert_ne!(fresh, a.intern("y"));
     }
 }

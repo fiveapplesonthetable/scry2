@@ -824,6 +824,21 @@ struct LangStats {
 const MAX_FAIL_TAILS: usize = 8;
 const STDERR_TAIL_BYTES: usize = 4096;
 
+/// Cache-mode final merge fan-in control. The per-CU shards are coalesced
+/// RECURSIVELY in groups of this many: level 1 merges each group of per-CU
+/// LOCAL-id shards into one GLOBAL-id intermediate (with the remap); each
+/// further level merges groups of intermediates again, until the count is
+/// `≤ COALESCE_GROUP`. So the FINAL k-way merge's fan-in is bounded to
+/// `≤ COALESCE_GROUP` regardless of CU count — e.g. ~23.6K AOSP CUs collapse
+/// to ~369 (L1) → ~6 (L2), a final fan-in of single digits, instead of
+/// feeding ~23.6K shards into one merge. Level 1 loads each group's rows into
+/// a builder, so this value bounds L1 peak RAM (a group of CU deltas); upper
+/// levels are streaming (sources read once), so they stay memory-light. The
+/// merge is partition-invariant, so the group size affects only memory/fan-in,
+/// never the output bytes. 64 keeps L1's per-group delta modest while giving
+/// a single-digit final fan-in even at whole-AOSP scale.
+const COALESCE_GROUP: usize = 64;
+
 /// One worker's owned ingest state. Each worker thread holds a
 /// `Mutex<WorkerSink>` and is the only contender for the lock in
 /// the normal path; the snapshotter occasionally takes the lock
@@ -901,6 +916,20 @@ fn partial_shard_for(out: &std::path::Path, idx: usize) -> std::path::PathBuf {
     let stem = p.file_name().map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     p.set_file_name(format!("{stem}.partial.shard.{idx:04}.s2db"));
+    p
+}
+
+/// Path of the `gi`-th coalesced intermediate shard. The cache-mode final
+/// merge first folds each group of per-CU shards into one of these (with the
+/// local→global file-id remap), then merges the intermediates into the
+/// output. A distinct `.inter.` infix keeps them out of `scan_partial_shards`
+/// (which globs `.partial.shard.`), so the per-CU shard enumeration never
+/// picks an intermediate up. Removed after the final merge.
+fn inter_shard_for(out: &std::path::Path, gi: usize) -> std::path::PathBuf {
+    let mut p = out.to_path_buf();
+    let stem = p.file_name().map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    p.set_file_name(format!("{stem}.inter.shard.{gi:04}.s2db"));
     p
 }
 
@@ -1069,30 +1098,19 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             eprintln!("[from-kzip] --clean: wiping cache {}", dir.display());
             scry2::cache::ShardCache::clear(&dir)?;
         }
-        // Seed-basis guard. A cached shard's file-ids are RANKS in this
-        // build's deterministic seed (the sorted plan path set). Reusing a
-        // shard is only valid when the current build's seed basis matches the
-        // basis the shard was built under; otherwise every cached id is
-        // shifted (e.g. a different `--in` filter changed the path set) and
-        // merging would corrupt file attribution. On a mismatch we wipe the
-        // cache and rebuild from scratch (then repopulate under the new
-        // basis) — correctness over a stale reuse. Same-kzip rebuilds (the
-        // incremental case) keep an identical basis, so this never fires
-        // there.
-        let basis = scry2::cache::ShardCache::seed_basis(seed_paths.iter().copied());
-        let mut c = scry2::cache::ShardCache::open(&dir)?;
-        if let Some(prev) = c.stored_basis() {
-            if prev != basis {
-                eprintln!("[from-kzip] cache: seed basis changed ({} → {}); \
-                           the file-id ranks shifted, so prior shards can't be \
-                           reused — wiping and rebuilding", prev, basis);
-                scry2::cache::ShardCache::clear(&dir)?;
-                c = scry2::cache::ShardCache::open(&dir)?;
-            }
-        }
-        c.write_basis(&basis)?;
-        eprintln!("[from-kzip] cache: {} (indexer-tag {}, seed-basis {})",
-            dir.display(), indexer_tag, basis);
+        // No seed-basis guard. A per-CU shard now stores its file references
+        // in a LOCAL, membership-independent namespace (the path's rank among
+        // only that CU's files — see `IndexBuilder::localize_file_ids`), and
+        // the final merge re-assigns global ids = the path's rank in the
+        // build's sorted seed set. A membership change (added/deleted CU, a
+        // different `--in` filter) therefore only re-sorts the union at merge
+        // time; it never shifts a cached shard's stored ids, so every
+        // unchanged CU is reused. A shard-format change is handled by
+        // `INGEST_SCHEMA_VERSION` (folded into every digest), so an old
+        // global-id cache is invalidated entry-by-entry on lookup rather than
+        // by a whole-cache wipe.
+        let c = scry2::cache::ShardCache::open(&dir)?;
+        eprintln!("[from-kzip] cache: {} (indexer-tag {})", dir.display(), indexer_tag);
         Some(c)
     };
     // Per-CU content digests, parallel to `plan`. Computed once up front
@@ -1714,13 +1732,25 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                             // the final merge fold it. The CU builder already
                             // carries exactly the files it touched (ingest
                             // upserts each interned file into it), so its
-                            // shard is self-contained. The shard is byte-
-                            // reproducible (deterministic file-ids + deduped
-                            // rows), so a later rebuild that reuses it is
-                            // byte-identical to having rebuilt it here. Per-CU
-                            // shards bound worker RAM to one CU, so the
-                            // snapshot machinery is unused on this path.
+                            // shard is self-contained. Per-CU shards bound
+                            // worker RAM to one CU, so the snapshot machinery
+                            // is unused on this path.
+                            //
+                            // Localize the shard's file ids first: rewrite
+                            // them from this build's GLOBAL seed ranks to a
+                            // per-CU LOCAL namespace (the path's rank among
+                            // only this CU's touched files). That makes the
+                            // shard a pure function of the CU's CONTENT,
+                            // independent of the plan's path-set membership —
+                            // so adding/deleting any other CU never shifts
+                            // this shard's ids and the cache entry stays
+                            // valid. The final coalescing merge re-assigns
+                            // global ids = the path's rank in the build's
+                            // sorted seed set (the exact clean-build rule),
+                            // making the merged output byte-identical to a
+                            // full build. See `IndexBuilder::localize_file_ids`.
                             let _ = rows; // gauge unused in cache mode
+                            cu_builder.localize_file_ids();
                             let idx = next_shard.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let shard_path = partial_shard_for(out_path, idx);
                             cu_builder.finish(&shard_path).with_context(|| format!(
@@ -1996,33 +2026,145 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
                    (of {} CUs)", plan_ref.len());
     }
 
-    file_ids.drain_into(&mut final_delta);
+    let shards = list_partial_shards(args.out);
+    let acc_path = args.out.with_extension("s2db.merging");
+
+    // --- Cache mode: COALESCE per-CU local-id shards into global-id
+    //     intermediates before the final merge --------------------------
+    //
+    // A per-CU shard stores LOCAL file ids (membership-independent — that's
+    // what lets add/delete reuse it). The final `.s2db` must carry GLOBAL ids
+    // = each path's rank in the build's sorted seed set, EXACTLY as a clean
+    // build assigns them. `global_of` is that map (seed_paths is already
+    // sorted, so a path's rank is its index). Each group of shards is merged
+    // — with the local→global remap — into one intermediate (in parallel);
+    // the intermediates carry global ids, so the final merge folds them with
+    // no further remap. This both performs the remap (Change 1) and bounds
+    // the final fan-in (Change 2). The in-memory `final_delta` carries NO
+    // file rows in cache mode (every CU's facts live in its shard), so we do
+    // NOT drain the global allocator into it — the intermediates supply the
+    // entire files table.
+    // All intermediate files written across every coalescing level — tracked
+    // so the final cleanup removes them. The LAST level's outputs are the
+    // final merge's sources.
+    let mut all_intermediates: Vec<std::path::PathBuf> = Vec::new();
+    let final_sources: Vec<std::path::PathBuf>;
+    if cache.is_some() {
+        let global_of: std::collections::HashMap<&str, u32> = seed_paths.iter()
+            .enumerate().map(|(i, p)| (*p, i as u32)).collect();
+        let global_of_ref = &global_of;
+        let coalesce_t0 = Instant::now();
+        let mut level_counter = 0usize; // unique file-name suffix across levels
+
+        // Level 1: per-CU LOCAL-id shards → GLOBAL-id intermediates, with the
+        // remap. Each group is merged in parallel; peak RAM per group is its
+        // combined delta, so COALESCE_GROUP is the memory knob.
+        let groups: Vec<&[std::path::PathBuf]> = shards.chunks(COALESCE_GROUP).collect();
+        eprintln!("[from-kzip] coalesce L1: {} per-CU shard(s) → {} intermediate(s) (group={}), parallel local→global remap",
+            shards.len(), groups.len(), COALESCE_GROUP);
+        let l1: Vec<std::path::PathBuf> = (0..groups.len())
+            .map(|gi| inter_shard_for(args.out, level_counter + gi)).collect();
+        level_counter += groups.len();
+        {
+            let l1_ref = &l1;
+            std::thread::scope(|s| -> Result<()> {
+                let mut handles = Vec::with_capacity(groups.len());
+                for (gi, grp) in groups.iter().enumerate() {
+                    let grp = *grp;
+                    let out_inter = &l1_ref[gi];
+                    handles.push(s.spawn(move || -> Result<()> {
+                        scry2::writer::coalesce_shards_remapped(grp, global_of_ref, out_inter)
+                            .with_context(|| format!("coalesce L1 group {gi}"))?;
+                        Ok(())
+                    }));
+                }
+                for h in handles {
+                    h.join().map_err(|_| anyhow::anyhow!("coalesce L1 thread panicked"))??;
+                }
+                Ok(())
+            })?;
+        }
+        // The per-CU working shards are folded into L1 now; drop them.
+        for src in &shards { let _ = std::fs::remove_file(src); }
+        all_intermediates.extend(l1.iter().cloned());
+        let mut level = l1;
+
+        // Levels 2+: if a level still has more than COALESCE_GROUP members,
+        // merge it again in groups (already GLOBAL ids — no remap) so the
+        // FINAL fan-in is bounded to ≤ COALESCE_GROUP regardless of CU count.
+        // Each upper level is memory-bounded the same way and runs its groups
+        // in parallel. The merge is partition-invariant, so the extra levels
+        // don't change the bytes.
+        let mut depth = 1usize;
+        while level.len() > COALESCE_GROUP {
+            depth += 1;
+            let groups: Vec<&[std::path::PathBuf]> = level.chunks(COALESCE_GROUP).collect();
+            eprintln!("[from-kzip] coalesce L{depth}: {} → {} intermediate(s) (group={})",
+                level.len(), groups.len(), COALESCE_GROUP);
+            let next: Vec<std::path::PathBuf> = (0..groups.len())
+                .map(|gi| inter_shard_for(args.out, level_counter + gi)).collect();
+            level_counter += groups.len();
+            {
+                let next_ref = &next;
+                std::thread::scope(|s| -> Result<()> {
+                    let mut handles = Vec::with_capacity(groups.len());
+                    for (gi, grp) in groups.iter().enumerate() {
+                        let grp = *grp;
+                        let out_inter = &next_ref[gi];
+                        handles.push(s.spawn(move || -> Result<()> {
+                            scry2::writer::merge_group_global(grp, out_inter)
+                                .with_context(|| format!("coalesce L{depth} group {gi}"))?;
+                            Ok(())
+                        }));
+                    }
+                    for h in handles {
+                        h.join().map_err(|_| anyhow::anyhow!("coalesce L{depth} thread panicked"))??;
+                    }
+                    Ok(())
+                })?;
+            }
+            all_intermediates.extend(next.iter().cloned());
+            level = next;
+        }
+        eprintln!("[from-kzip] coalesce: {} level(s), final fan-in {} in {:.2}s",
+            depth, level.len(), coalesce_t0.elapsed().as_secs_f64());
+        final_sources = level;
+    } else {
+        // Legacy / no-cache / resume path: file ids are already global (the
+        // shared seed allocator), so drain them into the remainder delta and
+        // merge the base partial + every shard directly. Unchanged behavior.
+        file_ids.drain_into(&mut final_delta);
+        final_sources = shards.clone();
+    }
+
     // Final merge — one k-way streaming pass over (in-memory remainder
-    // delta + base partial + every shard). Each source is mmap'd and read
+    // delta + base partial + every source). Each source is mmap'd and read
     // exactly once and the output string blob is built once, so peak RAM
     // is ~one blob + the alias gather (bounded by alias count), not the
-    // whole union. This replaces the old chained fold, which re-read the
-    // growing accumulator once per shard (O(N*shards) IO ≈ 1 TB at 57
-    // shards) and rebuilt the full names blob + re-gathered every alias on
-    // each fold (the ~80-100G heap ceiling). Runs with all workers joined
-    // and every indexer gone, so the machine is free.
-    let shards = list_partial_shards(args.out);
-    eprintln!("[from-kzip] final merge: remainder (xrefs={}) + base({}) + {} shard(s) — single k-way pass",
+    // whole union. In cache mode the sources are the coalesced intermediates
+    // (bounded fan-in, global ids); otherwise they are the base partial + the
+    // per-CU/snapshot shards. Runs with all workers joined and every indexer
+    // gone, so the machine is free.
+    let merge_srcs: &[std::path::PathBuf] = &final_sources;
+    eprintln!("[from-kzip] final merge: remainder (xrefs={}) + base({}) + {} source(s) — single k-way pass",
         final_delta.n_xrefs(),
-        if partial_s2db_path.exists() { "yes" } else { "no" }, shards.len());
+        if partial_s2db_path.exists() && cache.is_none() { "yes" } else { "no" },
+        merge_srcs.len());
 
-    let acc_path = args.out.with_extension("s2db.merging");
     // Open every source as a read-only mmap up front; the handles must
     // outlive the merge, which reads through them. mmap is lazy — pages
     // fault in during the single pass, not at open.
-    let mut source_ix: Vec<scry2::reader::Index> = Vec::with_capacity(shards.len() + 1);
-    if partial_s2db_path.exists() {
+    let mut source_ix: Vec<scry2::reader::Index> = Vec::with_capacity(merge_srcs.len() + 1);
+    // The base partial only carries global-id rows from the legacy snapshot
+    // path; in cache mode it is never written, so it is only a merge source
+    // outside cache mode.
+    if partial_s2db_path.exists() && cache.is_none() {
         source_ix.push(scry2::reader::Index::open(&partial_s2db_path)
             .with_context(|| format!("open base {}", partial_s2db_path.display()))?);
     }
-    for src in &shards {
+    for src in merge_srcs {
         source_ix.push(scry2::reader::Index::open(src)
-            .with_context(|| format!("open shard {}", src.display()))?);
+            .with_context(|| format!("open source {}", src.display()))?);
     }
     let sources: Vec<&scry2::reader::Index> = source_ix.iter().collect();
 
@@ -2097,12 +2239,15 @@ fn cmd_from_kzip(args: FromKzipArgs<'_>) -> Result<()> {
             eprintln!("[from-kzip] cache finalize failed: {e:#}");
         }
     }
-    // Discard the base partial, working shards, and shas so the next
-    // from-kzip against this `--out` starts clean. (The cache's own shard
-    // copies are independent and survive in the cache dir.)
+    // Discard the base partial, working shards, intermediates, and shas so
+    // the next from-kzip against this `--out` starts clean. (The cache's own
+    // shard copies are independent and survive in the cache dir.) In cache
+    // mode the per-CU working shards were already removed once coalesced; the
+    // intermediates are removed here.
     let _ = std::fs::remove_file(&partial_s2db_path);
     let _ = std::fs::remove_file(&partial_shas_path);
     for src in &shards { let _ = std::fs::remove_file(src); }
+    for src in &all_intermediates { let _ = std::fs::remove_file(src); }
     let _ = std::fs::remove_dir_all(&staging);
     eprintln!("[from-kzip] done in {:.2}s → {} ({:.2} GB)",
         t0.elapsed().as_secs_f64(), args.out.display(), bytes as f64 / 1e9);

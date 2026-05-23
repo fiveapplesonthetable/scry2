@@ -11,18 +11,27 @@
 //! re-indexed. The final k-way merge then folds the reused + freshly built
 //! shards into the same output.
 //!
-//! ## Why this is byte-identical to a full build
+//! ## Why this is byte-identical to a full build (and reuses across add/delete)
 //!
 //! The merged `.s2db` is a deterministic function of (a) the set of delta
-//! rows across all CUs and (b) the path → file-id map. A cached CU's shard
-//! carries byte-identical rows to a freshly built one BECAUSE file-ids are
-//! pre-seeded deterministically from the plan's path set
-//! ([`crate::kythe::FileIdAllocator::seed_paths`]) before any ingest — so a
-//! CU's shard is the same whether built now or built in a prior run. The
-//! k-way merge output is invariant to how CUs are partitioned into shards
-//! (it is the sorted-deduped union), so reusing per-CU shards yields the
-//! identical merged bytes a full build produces. See `DESIGN`/the gate in
-//! the feature commit for the byte-for-byte `cmp` evidence.
+//! rows across all CUs and (b) the path → file-id map. A per-CU shard stores
+//! its file references in a LOCAL, membership-independent namespace: each
+//! path the CU touches gets its dense rank among only that CU's files
+//! ([`crate::writer::IndexBuilder::localize_file_ids`]). That makes a shard a
+//! pure function of the CU's CONTENT — built now or in a prior run, with any
+//! other CU added or removed, it is byte-identical — so a digest hit reuses
+//! it directly.
+//!
+//! The final merge then re-assigns GLOBAL file-ids = each path's rank in the
+//! build's sorted seed set (the exact rule a clean build uses), remapping
+//! every shard's local ids while folding them
+//! ([`crate::writer::coalesce_shards_remapped`]). Because the global ids it
+//! assigns are identical to a clean build's, and the per-table merge is the
+//! same sorted-deduped union, the merged bytes equal a full build's. A
+//! membership change only re-sorts the union at merge time; it never shifts a
+//! cached shard's stored ids — so adding/deleting a CU reuses every unchanged
+//! shard with no cache wipe. See the gate in the feature commit for the
+//! byte-for-byte `cmp` evidence.
 //!
 //! ## Digest key
 //!
@@ -37,28 +46,38 @@
 //!
 //! ## Scale
 //!
-//! In cache mode every CU contributes ONE per-CU shard to the final k-way
-//! merge (a cache hit copies its shard in; a miss writes + stores one). The
-//! merge is partition-invariant, so this is correct at any count, and at the
-//! gate's scale (a scoped `--in` slice, hundreds of CUs) it is also cheap.
-//! For a whole-AOSP run (tens of thousands of CUs) the merge would mmap that
-//! many shards at once — well within this host's fd limit but heavier than
-//! the legacy snapshot path's coarse batching. Coalescing cache shards into
-//! batches before the merge would restore that, and is the natural follow-up
-//! if the cache is pointed at a corpus-scale build; it does not affect the
-//! per-CU keying or byte-identity established here.
+//! In cache mode every CU contributes ONE per-CU shard (a cache hit copies
+//! its shard in; a miss writes + stores one). Feeding tens of thousands of
+//! per-CU shards directly into one k-way merge would mmap them all at once
+//! and fan in over a very wide front. Instead the final merge is COALESCED:
+//! the per-CU shards are partitioned into fixed-size groups, each group is
+//! merged (with the local→global file-id remap) into one intermediate shard
+//! in parallel, and the ~tens of intermediates are merged into the final
+//! `.s2db`. The merge is partition-invariant (a commutative, associative
+//! sorted-deduped union with deterministic tie-breaks and clean-build-
+//! identical global ids), so grouping cannot change the result — the gate
+//! proves it. The group size is the memory/fan-in knob.
 
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Bumped whenever scry2's ingest (`kythe::ingest_tolerant`) or the `.s2db`
-/// row semantics change in a way that would make an OLD cached shard
-/// inconsistent with a freshly built one. Folded into every CU digest so a
-/// scry2 upgrade transparently invalidates every stale cache entry rather
-/// than silently merging incompatible shards. Keep this in lockstep with
-/// any change to what rows a CU's ingest emits.
-pub const INGEST_SCHEMA_VERSION: u32 = 1;
+/// row semantics — including the per-shard file-id ENCODING — change in a
+/// way that would make an OLD cached shard inconsistent with a freshly built
+/// one. Folded into every CU digest so a scry2 upgrade transparently
+/// invalidates every stale cache entry (the digest no longer matches, so the
+/// shard is a miss and gets rebuilt) rather than silently merging
+/// incompatible shards. Keep this in lockstep with any change to what rows a
+/// CU's ingest emits or how a shard stores them.
+///
+/// v2: per-CU shards store LOCAL file ids ([`crate::writer::IndexBuilder::
+/// localize_file_ids`]) remapped to global at merge time, instead of the v1
+/// scheme that baked the build's global seed ranks into each shard. The
+/// bump invalidates any v1 (global-id) shard automatically — its rows would
+/// be misattributed if reused under the local-id merge — so no separate
+/// cache wipe is needed across the upgrade.
+pub const INGEST_SCHEMA_VERSION: u32 = 2;
 
 /// A tag identifying the indexer toolchain that produced (and would
 /// reproduce) a CU's shard. Folded into the digest so swapping the indexer
@@ -193,39 +212,6 @@ impl ShardCache {
                 .with_context(|| format!("rm cache {}", root.display()))?;
         }
         Ok(())
-    }
-
-    /// The stored seed-basis token, if any. The basis is a hash of the
-    /// build's deterministic file-id seed (the sorted plan path set). A
-    /// cached shard's file-ids are RANKS in that seed, so reusing a shard is
-    /// only valid when the current build's seed basis matches the one the
-    /// shard was built under. A mismatch (e.g. a different `--in` filter that
-    /// changes the path set, shifting every rank) means every cached shard's
-    /// ids are stale — the cache must be discarded, not silently merged.
-    pub fn stored_basis(&self) -> Option<String> {
-        std::fs::read_to_string(self.root.join("basis"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    /// Record the current build's seed-basis token (atomic write).
-    pub fn write_basis(&self, basis: &str) -> Result<()> {
-        let tmp = self.root.join(format!(".basis.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, basis.as_bytes())
-            .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, self.root.join("basis"))
-            .with_context(|| "rename basis")?;
-        Ok(())
-    }
-
-    /// Compute the seed-basis token from the sorted seed path list. A 128-bit
-    /// xxh3 over the length-prefixed paths — order-sensitive (rank order is
-    /// what matters) and collision-safe.
-    pub fn seed_basis<'a, I: IntoIterator<Item = &'a str>>(sorted_paths: I) -> String {
-        let mut h = Hasher::new();
-        for p in sorted_paths { h.add_str(p); }
-        format!("{:032x}", h.finish())
     }
 
     /// Path of the shard for `digest` (whether or not it exists).
@@ -415,30 +401,4 @@ mod tests {
         ShardCache::clear(&dir).unwrap();
     }
 
-    #[test]
-    fn seed_basis_order_sensitive() {
-        // Rank order is what file-ids encode, so a reordered path set is a
-        // DIFFERENT basis (its ranks differ), and the same set is the same
-        // basis.
-        let a = ShardCache::seed_basis(["", "a", "b", "c"]);
-        let same = ShardCache::seed_basis(["", "a", "b", "c"]);
-        let reordered = ShardCache::seed_basis(["", "b", "a", "c"]);
-        let extra = ShardCache::seed_basis(["", "a", "b", "c", "d"]);
-        assert_eq!(a, same, "identical path set → identical basis");
-        assert_ne!(a, reordered, "reordered set → different basis");
-        assert_ne!(a, extra, "added path → different basis");
-    }
-
-    #[test]
-    fn basis_roundtrip_and_absent() {
-        let dir = std::env::temp_dir().join(format!("scry2-cache-basis-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let cache = ShardCache::open(&dir).unwrap();
-        assert!(cache.stored_basis().is_none(), "fresh cache: no basis");
-        cache.write_basis("abc123").unwrap();
-        assert_eq!(cache.stored_basis().as_deref(), Some("abc123"));
-        cache.write_basis("def456").unwrap();
-        assert_eq!(cache.stored_basis().as_deref(), Some("def456"), "basis overwrites");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

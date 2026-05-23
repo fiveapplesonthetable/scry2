@@ -905,6 +905,223 @@ mod tests {
     }
 
     #[test]
+    fn localize_file_ids_assigns_sorted_local_ranks() {
+        // A localized builder's file ids are the dense rank of each path in
+        // SORTED path order, and every xref's file column is rewritten to
+        // match — independent of whatever ids the builder was fed.
+        let a = sym_of("kythe:c++:t###a");
+        let mut b = IndexBuilder::new();
+        // Feed non-dense, non-sorted ids on purpose.
+        b.upsert_file(50, "/t/zeta.cpp");
+        b.upsert_file(10, "/t/alpha.cpp");
+        b.upsert_file(30, "/t/mid.cpp");
+        b.add_xref(a, role::DEF, 50, 1);   // zeta -> should become local 2
+        b.add_xref(a, role::REF, 10, 2);   // alpha -> local 0
+        b.add_xref(a, role::REF, 30, 3);   // mid   -> local 1
+        let table = b.localize_file_ids();
+        // Sorted: alpha(0), mid(1), zeta(2).
+        assert_eq!(table, vec![
+            (0u32, "/t/alpha.cpp".to_string()),
+            (1u32, "/t/mid.cpp".to_string()),
+            (2u32, "/t/zeta.cpp".to_string()),
+        ]);
+        // Round-trip through finish and confirm the xrefs reference the new
+        // local ids (alpha=0, mid=1, zeta=2).
+        let p = tmp("localize");
+        b.finish(&p).unwrap();
+        let ix = Index::open(&p).unwrap();
+        let mut got: Vec<(u8, u32)> = ix.xrefs(a, 0, u8::MAX)
+            .map(|(_, role, file, _)| (role, file)).collect();
+        got.sort();
+        assert_eq!(got, vec![(role::DEF, 2), (role::REF, 0), (role::REF, 1)]);
+        assert_eq!(ix.file_path(0), Some("/t/alpha.cpp"));
+        assert_eq!(ix.file_path(1), Some("/t/mid.cpp"));
+        assert_eq!(ix.file_path(2), Some("/t/zeta.cpp"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn coalesce_then_merge_matches_global_finish() {
+        // The two-level cache merge (per-CU LOCAL-id shards → coalesced
+        // GLOBAL-id intermediates → final merge) must be byte-for-byte
+        // identical to a single finish() over the same rows carrying the
+        // GLOBAL ids a clean build assigns. This is the in-process gate for
+        // Change 1 (local ids + merge-time global remap) + Change 2
+        // (coalescing), independent of the from-kzip plumbing.
+        use std::collections::HashMap;
+        let a = sym_of("kythe:c++:t###a");
+        let b = sym_of("kythe:c++:t###b");
+        let c = sym_of("kythe:c++:t###c");
+
+        // The build's GLOBAL seed: the sorted union of every path any CU
+        // touches PLUS extra candidate paths no CU references (the empty
+        // path, and a header only listed in the plan). A clean build ranks
+        // over THIS superset, so an accessed path's global id is its rank
+        // here — NOT its rank among accessed-only paths.
+        let seed: Vec<&str> = {
+            let mut s = vec!["", "/t/a.cpp", "/t/b.cpp", "/t/c.cpp",
+                             "/t/shared.h", "/t/unref.h"];
+            s.sort_unstable();
+            s
+        };
+        let global_of: HashMap<&str, u32> = seed.iter().enumerate()
+            .map(|(i, p)| (*p, i as u32)).collect();
+
+        // Three per-CU shards, each built with arbitrary local-ish ids then
+        // LOCALIZED (as the cache-miss path does). They share "/t/shared.h".
+        let mk = |sym: u64, src: &str, srcid: u32, hid: u32| -> IndexBuilder {
+            let mut h = IndexBuilder::new();
+            h.upsert_sym(sym, kind::FUNCTION, lang::CXX, &format!("kythe:c++:t###{}",
+                src.trim_start_matches("/t/").trim_end_matches(".cpp")));
+            h.upsert_file(srcid, src);
+            h.upsert_file(hid, "/t/shared.h");
+            h.add_xref(sym, role::DEF, srcid, 10);
+            h.add_xref(sym, role::REF, hid, 20);
+            h
+        };
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let mut shard_paths = Vec::new();
+        for (i, mut hb) in [mk(a, "/t/a.cpp", 7, 3),
+                            mk(b, "/t/b.cpp", 99, 1),
+                            mk(c, "/t/c.cpp", 4, 8)].into_iter().enumerate() {
+            hb.localize_file_ids();
+            let p = dir.join(format!("scry2-coal-shard{i}-{pid}.s2db"));
+            hb.finish(&p).unwrap();
+            shard_paths.push(p);
+        }
+
+        // Coalesce in TWO groups (so the two-level fan-in is exercised),
+        // remapping local→global, then merge the intermediates.
+        let inter0 = dir.join(format!("scry2-coal-inter0-{pid}.s2db"));
+        let inter1 = dir.join(format!("scry2-coal-inter1-{pid}.s2db"));
+        crate::writer::coalesce_shards_remapped(&shard_paths[..2], &global_of, &inter0).unwrap();
+        crate::writer::coalesce_shards_remapped(&shard_paths[2..], &global_of, &inter1).unwrap();
+        let i0 = Index::open(&inter0).unwrap();
+        let i1 = Index::open(&inter1).unwrap();
+        let merged = dir.join(format!("scry2-coal-merged-{pid}.s2db"));
+        IndexBuilder::new().write_merged_snapshot(&[&i0, &i1], &merged).unwrap();
+        drop((i0, i1));
+
+        // Reference: a single finish() over the union, carrying GLOBAL ids.
+        let g = |p: &str| global_of[p];
+        let mut r = IndexBuilder::new();
+        r.upsert_sym(a, kind::FUNCTION, lang::CXX, "kythe:c++:t###a");
+        r.upsert_sym(b, kind::FUNCTION, lang::CXX, "kythe:c++:t###b");
+        r.upsert_sym(c, kind::FUNCTION, lang::CXX, "kythe:c++:t###c");
+        r.upsert_file(g("/t/a.cpp"), "/t/a.cpp");
+        r.upsert_file(g("/t/b.cpp"), "/t/b.cpp");
+        r.upsert_file(g("/t/c.cpp"), "/t/c.cpp");
+        r.upsert_file(g("/t/shared.h"), "/t/shared.h");
+        r.add_xref(a, role::DEF, g("/t/a.cpp"), 10);
+        r.add_xref(a, role::REF, g("/t/shared.h"), 20);
+        r.add_xref(b, role::DEF, g("/t/b.cpp"), 10);
+        r.add_xref(b, role::REF, g("/t/shared.h"), 20);
+        r.add_xref(c, role::DEF, g("/t/c.cpp"), 10);
+        r.add_xref(c, role::REF, g("/t/shared.h"), 20);
+        let reference = dir.join(format!("scry2-coal-ref-{pid}.s2db"));
+        r.finish(&reference).unwrap();
+
+        // BYTE-IDENTICAL is the gate.
+        let mb = std::fs::read(&merged).unwrap();
+        let rb = std::fs::read(&reference).unwrap();
+        assert_eq!(mb, rb, "coalesced two-level merge != single global finish");
+        // The shared header lands at its global id; unref.h never appears
+        // (no CU touched it), matching a clean build's accessed-only files.
+        let m = Index::open(&merged).unwrap();
+        assert_eq!(m.file_path(g("/t/shared.h")), Some("/t/shared.h"));
+        assert_eq!(m.n_files(), 4, "exactly the 4 accessed paths, none of the unref seed");
+
+        for p in shard_paths.iter().chain([&inter0, &inter1, &merged, &reference]) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn recursive_coalesce_levels_match_global_finish() {
+        // The recursive upper-level merge (merge_group_global over already-
+        // global intermediates) must be byte-identical to a single global
+        // finish() — proving the extra coalescing levels the AOSP-scale fan-in
+        // control adds never change the bytes. Force TWO levels with a group
+        // of 2 over 5 CUs: L1 = ceil(5/2)=3 intermediates, L2 = ceil(3/2)=2.
+        use std::collections::HashMap;
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let seed: Vec<&str> = {
+            let mut s = vec!["", "/t/0.cpp", "/t/1.cpp", "/t/2.cpp", "/t/3.cpp",
+                             "/t/4.cpp", "/t/h.h"];
+            s.sort_unstable();
+            s
+        };
+        let global_of: HashMap<&str, u32> = seed.iter().enumerate()
+            .map(|(i, p)| (*p, i as u32)).collect();
+        let syms: Vec<u64> = (0..5).map(|i| sym_of(&format!("kythe:c++:t###f{i}"))).collect();
+
+        // 5 per-CU localized shards, each touching its own .cpp + shared h.h.
+        let mut shard_paths = Vec::new();
+        for (i, &sym) in syms.iter().enumerate() {
+            let mut h = IndexBuilder::new();
+            let src = format!("/t/{i}.cpp");
+            h.upsert_sym(sym, kind::FUNCTION, lang::CXX, &format!("kythe:c++:t###f{i}"));
+            h.upsert_file((i as u32) * 7 + 1, &src);   // arbitrary feed ids
+            h.upsert_file((i as u32) * 7 + 2, "/t/h.h");
+            h.add_xref(sym, role::DEF, (i as u32) * 7 + 1, 10 + i as u32);
+            h.add_xref(sym, role::REF, (i as u32) * 7 + 2, 100);
+            h.localize_file_ids();
+            let p = dir.join(format!("scry2-rec-shard{i}-{pid}.s2db"));
+            h.finish(&p).unwrap();
+            shard_paths.push(p);
+        }
+
+        // L1: group of 2 → 3 intermediates (with remap).
+        let g = 2usize;
+        let mut l1 = Vec::new();
+        for (gi, grp) in shard_paths.chunks(g).enumerate() {
+            let p = dir.join(format!("scry2-rec-l1-{gi}-{pid}.s2db"));
+            crate::writer::coalesce_shards_remapped(grp, &global_of, &p).unwrap();
+            l1.push(p);
+        }
+        assert_eq!(l1.len(), 3, "L1 fan-out");
+        // L2: group of 2 over 3 intermediates → 2 (no remap, already global).
+        let mut l2 = Vec::new();
+        for (gi, grp) in l1.chunks(g).enumerate() {
+            let p = dir.join(format!("scry2-rec-l2-{gi}-{pid}.s2db"));
+            crate::writer::merge_group_global(grp, &p).unwrap();
+            l2.push(p);
+        }
+        assert_eq!(l2.len(), 2, "L2 fan-out");
+        // Final merge over the 2 L2 intermediates.
+        let l2ix: Vec<Index> = l2.iter().map(|p| Index::open(p).unwrap()).collect();
+        let l2refs: Vec<&Index> = l2ix.iter().collect();
+        let merged = dir.join(format!("scry2-rec-merged-{pid}.s2db"));
+        IndexBuilder::new().write_merged_snapshot(&l2refs, &merged).unwrap();
+        drop(l2ix);
+
+        // Reference: single global finish().
+        let gid = |p: &str| global_of[p];
+        let mut r = IndexBuilder::new();
+        for (i, &sym) in syms.iter().enumerate() {
+            let src = format!("/t/{i}.cpp");
+            r.upsert_sym(sym, kind::FUNCTION, lang::CXX, &format!("kythe:c++:t###f{i}"));
+            r.upsert_file(gid(&src), &src);
+            r.add_xref(sym, role::DEF, gid(&src), 10 + i as u32);
+            r.add_xref(sym, role::REF, gid("/t/h.h"), 100);
+        }
+        r.upsert_file(gid("/t/h.h"), "/t/h.h");
+        let reference = dir.join(format!("scry2-rec-ref-{pid}.s2db"));
+        r.finish(&reference).unwrap();
+
+        let mb = std::fs::read(&merged).unwrap();
+        let rb = std::fs::read(&reference).unwrap();
+        assert_eq!(mb, rb, "recursive 2-level coalesce != single global finish");
+
+        for p in shard_paths.iter().chain(l1.iter()).chain(l2.iter())
+            .chain([&merged, &reference]) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
     fn merge_progress_output_is_byte_identical() {
         // The final merge's progress variant (`write_merged_snapshot_progress`)
         // only adds per-section stderr logging on top of the silent

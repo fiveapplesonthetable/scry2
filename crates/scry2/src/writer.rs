@@ -110,6 +110,66 @@ impl IndexBuilder {
         self.files.entry(file).or_insert_with(|| path.to_string());
     }
 
+    /// Rewrite this builder's file ids into a LOCAL, membership-independent
+    /// namespace: each distinct path the builder touches is assigned its
+    /// dense rank (0, 1, 2, …) in the SORTED order of those paths, and every
+    /// xref's `file` column plus the `files` table are rewritten to that id.
+    /// Returns the resulting local `files` table as `(local_id, path)` rows
+    /// in id order (i.e. sorted by path) — the per-shard local-id → path
+    /// table the merge needs to map a shard's local ids back to the build's
+    /// global ids.
+    ///
+    /// ## Why per-CU shards must be local
+    ///
+    /// A per-CU cache shard is keyed by the CU's CONTENT, so the same CU must
+    /// produce a byte-identical shard whichever build (or build's path set)
+    /// emits it. If a shard baked in GLOBAL file ids (a path's rank in the
+    /// whole plan's path set), then adding or deleting any CU would shift
+    /// those ranks and invalidate every cached shard. A local namespace —
+    /// the path's rank among ONLY the files this CU touches — depends solely
+    /// on the CU's own (deterministic) ingest output, so the shard is stable
+    /// across membership changes. The final merge unions the per-shard path
+    /// tables and re-assigns global ids = the path's rank in the build's
+    /// sorted seed set (the exact rule a clean build uses), remapping each
+    /// shard's local ids while merging — see
+    /// `write_merged_snapshot_remapped`. Net: the merged output is identical
+    /// to a clean build's, and a membership change only re-sorts the union at
+    /// merge time without touching any cached shard.
+    ///
+    /// Precondition (upheld by ingest): every `file` id referenced by an
+    /// xref also appears in the `files` table — ingest `upsert_file`s each
+    /// path it interns. A stray xref id with no path would be dropped here;
+    /// debug-asserted so a future ingest regression surfaces in tests.
+    pub fn localize_file_ids(&mut self) -> Vec<(u32, String)> {
+        // Sorted distinct paths → dense local ranks.
+        let mut paths: Vec<&str> = self.files.values().map(|s| s.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let local_of: HashMap<&str, u32> = paths.iter().enumerate()
+            .map(|(i, p)| (*p, i as u32))
+            .collect();
+        // global id → local id, via the path each global id names.
+        let g2l: HashMap<u32, u32> = self.files.iter()
+            .map(|(g, p)| (*g, local_of[p.as_str()]))
+            .collect();
+        for (_, _, file, _) in self.xrefs.iter_mut() {
+            debug_assert!(g2l.contains_key(file),
+                "localize_file_ids: xref references file id {file} absent from files table");
+            if let Some(&l) = g2l.get(file) { *file = l; }
+        }
+        // Rebuild the files table under local ids. First-wins is irrelevant
+        // (each path has exactly one local id).
+        let new_files: HashMap<u32, String> = self.files.drain()
+            .map(|(g, p)| (g2l[&g], p))
+            .collect();
+        self.files = new_files;
+        let mut table: Vec<(u32, String)> = self.files.iter()
+            .map(|(id, p)| (*id, p.clone()))
+            .collect();
+        table.sort_unstable_by_key(|r| r.0);
+        table
+    }
+
     pub fn add_inherit(&mut self, child: u64, parent: u64) {
         self.inherits.push((child, parent));
     }
@@ -322,6 +382,67 @@ impl IndexBuilder {
             self.add_childof(child, parent);
         }
         for (sym, sig) in ix.iter_sig() {
+            self.add_sig(sym, sig);
+        }
+        Ok(())
+    }
+
+    /// Replay every row from a per-CU cache `shard` into `self`, REMAPPING
+    /// the shard's LOCAL file ids to this build's GLOBAL ids via `global_of`
+    /// (path → global id). A shard stores file references in its own local
+    /// namespace ([`localize_file_ids`]); this is the inverse step that the
+    /// coalescing merge applies so the intermediate (and ultimately the
+    /// final `.s2db`) carries the global ids a clean build would assign.
+    ///
+    /// Every path in the shard's `files` table is expected to be present in
+    /// `global_of` — it is built as the rank of the whole plan's sorted seed
+    /// path set, a superset of every CU's touched paths. A path absent from
+    /// the map (which would mean the seed missed a path ingest actually
+    /// interned — the same precondition the deterministic seed already
+    /// upholds for a clean build) is debug-asserted; in release it skips that
+    /// file's rows rather than panicking mid-build.
+    pub fn populate_from_shard_remapped(
+        &mut self,
+        shard: &crate::reader::Index,
+        global_of: &HashMap<&str, u32>,
+    ) -> Result<()> {
+        // shard local id → global id, via the path each local id names.
+        let mut l2g: HashMap<u32, u32> = HashMap::new();
+        for (local, path) in shard.iter_files() {
+            match global_of.get(path) {
+                Some(&g) => { l2g.insert(local, g); }
+                None => {
+                    debug_assert!(false,
+                        "populate_from_shard_remapped: shard path {path:?} absent from global seed map");
+                }
+            }
+        }
+        for (sym, role, file, offset) in shard.iter_xrefs() {
+            let Some(&g) = l2g.get(&file) else { continue };
+            self.add_xref(sym, role, g, offset);
+        }
+        for (sym, kind, lang, name) in shard.iter_syms() {
+            self.upsert_sym(sym, kind, lang, name);
+        }
+        for (local, path) in shard.iter_files() {
+            if let Some(&g) = l2g.get(&local) { self.upsert_file(g, path); }
+        }
+        for (child, parent) in shard.iter_inherits() {
+            self.add_inherit(child, parent);
+        }
+        for (caller, callee, role) in shard.iter_calls() {
+            self.add_call(caller, callee, role);
+        }
+        for (sym, alias) in shard.iter_aliases() {
+            self.add_alias(sym, alias);
+        }
+        for (sym, ty) in shard.iter_typed() {
+            self.add_type(sym, ty);
+        }
+        for (parent, child) in shard.iter_childrev() {
+            self.add_childof(child, parent);
+        }
+        for (sym, sig) in shard.iter_sig() {
             self.add_sig(sym, sig);
         }
         Ok(())
@@ -1121,6 +1242,59 @@ impl IndexBuilder {
         std::fs::rename(&tmp_path, path).with_context(|| format!("rename to {}", path.display()))?;
         Ok(total)
     }
+}
+
+/// Coalesce a GROUP of per-CU cache shards into one intermediate `.s2db` at
+/// `output`, remapping each shard's LOCAL file ids to GLOBAL ids via
+/// `global_of` (path → global id). The intermediate carries global ids and
+/// is byte-shaped exactly like any `.s2db`, so the final merge folds it with
+/// no further remap.
+///
+/// Implemented by draining every shard (remapped) into one delta builder and
+/// writing it with [`IndexBuilder::write_merged_snapshot`] over an EMPTY
+/// source set — the identical sort/dedup/prefer-name/first-wins merge the
+/// final pass uses. Because every per-table merge is a commutative,
+/// associative sorted-dedup-with-deterministic-tiebreak fold, coalescing a
+/// subset first and then merging the intermediates yields the same bytes as
+/// merging all shards in one pass. Peak RAM is bounded by the group's
+/// combined delta, so the group size is the memory/fan-in knob.
+pub fn coalesce_shards_remapped(
+    shard_paths: &[std::path::PathBuf],
+    global_of: &HashMap<&str, u32>,
+    output: &Path,
+) -> Result<u64> {
+    let mut delta = IndexBuilder::new();
+    for sp in shard_paths {
+        let ix = crate::reader::Index::open(sp)
+            .with_context(|| format!("open shard {}", sp.display()))?;
+        delta.populate_from_shard_remapped(&ix, global_of)
+            .with_context(|| format!("coalesce shard {}", sp.display()))?;
+    }
+    delta.write_merged_snapshot(&[], output)
+        .with_context(|| format!("write coalesced intermediate {}", output.display()))
+}
+
+/// Merge a GROUP of already-GLOBAL-id `.s2db` sources (e.g. first-level
+/// coalesced intermediates) into one at `output` — no file-id remap, because
+/// the inputs already carry global ids. Used by the recursive coalescing
+/// upper levels to drive the final fan-in down to `≤ COALESCE_GROUP`
+/// regardless of CU count, while each level stays memory-bounded by the
+/// group size. Streaming (the inputs are merge SOURCES, read once each),
+/// over an empty in-memory delta. Byte-identical to merging the same inputs
+/// in the final pass, by the same partition-invariance argument as
+/// `coalesce_shards_remapped`.
+pub fn merge_group_global(
+    sources: &[std::path::PathBuf],
+    output: &Path,
+) -> Result<u64> {
+    let mut ix: Vec<crate::reader::Index> = Vec::with_capacity(sources.len());
+    for sp in sources {
+        ix.push(crate::reader::Index::open(sp)
+            .with_context(|| format!("open intermediate {}", sp.display()))?);
+    }
+    let refs: Vec<&crate::reader::Index> = ix.iter().collect();
+    IndexBuilder::new().write_merged_snapshot(&refs, output)
+        .with_context(|| format!("write coalesced level {}", output.display()))
 }
 
 // ============================================================

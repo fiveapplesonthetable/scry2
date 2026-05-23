@@ -614,3 +614,264 @@ fn def_substr_ignore_case_opt_in_only() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Build a fixture modelling AOSP's stub-jar duplication for the
+/// inheritance/callgraph verbs: ONE logical type `p.Hub` exists as several
+/// distinct syms that all share the alias `p.Hub`, but the `inherits` /
+/// `calls` edges live on only ONE of the dup syms (the others are
+/// edge-less stub copies). `syms_for_name("p.Hub")` lands on the dups in
+/// id order; the BFS must UNION edges across all of them or it returns
+/// empty when the first dup happens to be edge-less. Returns (dir, s2db).
+fn make_dup_hub_index() -> (PathBuf, PathBuf) {
+    let tid: String = format!("{:?}", std::thread::current().id())
+        .chars().filter(|c| c.is_ascii_digit()).collect();
+    let dir = std::env::temp_dir().join(format!(
+        "scry2-cli-hub-{}-{}", std::process::id(), tid));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s2db = dir.join("hub.s2db");
+    let mut b = IndexBuilder::new();
+
+    // Three edge-less stub copies of p.Hub + one copy that carries the
+    // edges. Distinct tickets (so distinct syms), all aliased to "p.Hub".
+    // The edge-less copies sort BEFORE the edge-bearing one by sym id so
+    // the first-dup-only bug would surface as empty results.
+    let stub1 = sym_of("kythe:java:c#r#variant1/Hub.java#HUBSIG");
+    let stub2 = sym_of("kythe:java:c#r#variant2/Hub.java#HUBSIG");
+    let real  = sym_of("kythe:java:c#r#variant3/Hub.java#HUBSIG");
+    for (s, t) in [(stub1, "kythe:java:c#r#variant1/Hub.java#HUBSIG"),
+                   (stub2, "kythe:java:c#r#variant2/Hub.java#HUBSIG"),
+                   (real,  "kythe:java:c#r#variant3/Hub.java#HUBSIG")] {
+        b.upsert_sym(s, kind::TYPE, lang::JAVA, t);
+        b.add_alias(s, "p.Hub");
+    }
+    // Supertypes + subtypes, all on the `real` copy only.
+    let base  = sym_of("p.Base");
+    let iface = sym_of("p.Iface");
+    let child = sym_of("p.Child");
+    for (s, n) in [(base, "p.Base"), (iface, "p.Iface"), (child, "p.Child")] {
+        b.upsert_sym(s, kind::TYPE, lang::JAVA, n);
+    }
+    b.upsert_file(1, "core/java/p/Base.java");
+    b.upsert_file(2, "core/java/p/Iface.java");
+    b.upsert_file(3, "core/java/p/Child.java");
+    b.add_xref(base,  role::DECL, 1, 100);
+    b.add_xref(iface, role::DECL, 2, 100);
+    b.add_xref(child, role::DECL, 3, 100);
+    b.add_inherit(real,  base);    // Hub extends Base
+    b.add_inherit(real,  iface);   // Hub implements Iface
+    b.add_inherit(child, real);    // Child extends Hub
+
+    // Call edges, also only on the `real` copy: Hub.run calls + is called.
+    // Model Hub itself (a method-shaped sym) as the dup; reuse the type
+    // dups as call endpoints for simplicity by adding a function dup set.
+    let fstub1 = sym_of("kythe:java:c#r#variant1/Hub.java#RUNSIG");
+    let fstub2 = sym_of("kythe:java:c#r#variant2/Hub.java#RUNSIG");
+    let freal  = sym_of("kythe:java:c#r#variant3/Hub.java#RUNSIG");
+    for (s, t) in [(fstub1, "kythe:java:c#r#variant1/Hub.java#RUNSIG"),
+                   (fstub2, "kythe:java:c#r#variant2/Hub.java#RUNSIG"),
+                   (freal,  "kythe:java:c#r#variant3/Hub.java#RUNSIG")] {
+        b.upsert_sym(s, kind::FUNCTION, lang::JAVA, t);
+        b.add_alias(s, "p.Hub.run");
+    }
+    let caller = sym_of("p.App.main");
+    let callee = sym_of("p.Helper.do");
+    b.upsert_sym(caller, kind::FUNCTION, lang::JAVA, "p.App.main");
+    b.upsert_sym(callee, kind::FUNCTION, lang::JAVA, "p.Helper.do");
+    b.add_call(caller, freal, role::CALL);   // App.main calls Hub.run (up)
+    b.add_call(freal, callee, role::CALL);   // Hub.run calls Helper.do (down)
+
+    b.finish(&s2db).unwrap();
+    (dir, s2db)
+}
+
+// -------- ISSUE 1: inheritance unions edges across dup syms -------------
+
+#[test]
+fn inheritance_up_unions_edges_across_dup_syms() {
+    // #1 regression: `inheritance --direction up` returned EMPTY for hub
+    // types because do_inheritance expanded only the first dup sym, which
+    // was edge-less. The fix unions inherits edges across all dups, so up
+    // from p.Hub must reach BOTH supertypes (Base + Iface) — matching what
+    // `super` returns.
+    let (dir, s2db) = make_dup_hub_index();
+    let v = run(&s2db, &["inheritance", "p.Hub", "--direction", "up"]);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("p.Base"),  "up must reach Base across dups: {s}");
+    assert!(s.contains("p.Iface"), "up must reach Iface across dups: {s}");
+    // And it matches `super` (the union path that already worked).
+    let sup = run(&s2db, &["super", "p.Hub"]).to_string();
+    assert!(sup.contains("p.Base") && sup.contains("p.Iface"),
+            "super baseline: {sup}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn inheritance_down_unions_edges_across_dup_syms() {
+    // The same union must hold for `down`: subtypes live on one dup only.
+    let (dir, s2db) = make_dup_hub_index();
+    let v = run(&s2db, &["inheritance", "p.Hub", "--direction", "down"]);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("p.Child"), "down must reach Child across dups: {s}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -------- ISSUE 2: callgraph dedups dup roots, unions edges -------------
+
+#[test]
+fn callgraph_dedups_dup_roots_to_one_logical_root() {
+    // #2 regression: `callgraph` emitted one parent=- root per dup sym
+    // (~18 for a hub method), flooding the forest. The fix collapses dups
+    // by logical key to ONE root and unions the call edges, so the callees
+    // still surface.
+    let (dir, s2db) = make_dup_hub_index();
+    let v = run(&s2db, &["callgraph", "p.Hub.run", "--direction", "down", "--depth", "2"]);
+    let nodes = v.get("nodes").and_then(|x| x.as_array()).expect("nodes");
+    let n_roots = nodes.iter()
+        .filter(|n| n.get("parent").map(|p| p.is_null()).unwrap_or(false))
+        .count();
+    assert_eq!(n_roots, 1, "dup roots collapse to one logical root: {v}");
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(s.contains("p.Helper.do"), "callee surfaces via the union: {s}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn callgraph_up_unions_callers_across_dup_roots() {
+    // The dedup must not drop callers that live on a sibling dup.
+    let (dir, s2db) = make_dup_hub_index();
+    let v = run(&s2db, &["callgraph", "p.Hub.run", "--direction", "up", "--depth", "2"]);
+    let nodes = v.get("nodes").and_then(|x| x.as_array()).expect("nodes");
+    let n_roots = nodes.iter()
+        .filter(|n| n.get("parent").map(|p| p.is_null()).unwrap_or(false))
+        .count();
+    assert_eq!(n_roots, 1, "one logical root: {v}");
+    assert!(v.to_string().contains("p.App.main"), "caller surfaces: {v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -------- ISSUE 3: ticket-shaped names get a readable fallback ----------
+
+#[test]
+fn sub_anonymous_subtype_renders_readable_fallback_not_ticket() {
+    // #3 regression: anonymous/local subtypes carry only a raw `kythe:`
+    // ticket as their name; `sub` leaked it. The fix renders an
+    // `anon@<path>@<off>` (or trailing-sig) fallback — never a raw ticket
+    // — in BOTH text and the --json `name` field.
+    let tid: String = format!("{:?}", std::thread::current().id())
+        .chars().filter(|c| c.is_ascii_digit()).collect();
+    let dir = std::env::temp_dir().join(format!("scry2-cli-anon-{}-{}", std::process::id(), tid));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s2db = dir.join("anon.s2db");
+    let mut b = IndexBuilder::new();
+    let base = sym_of("p.Runnable");
+    // An anonymous subtype with NO alias — its only name is the ticket.
+    let anon = sym_of("kythe:java:c#r#Anon.java#ANONSIG");
+    b.upsert_sym(base, kind::TYPE, lang::JAVA, "p.Runnable");
+    b.upsert_sym(anon, kind::TYPE, lang::JAVA, "kythe:java:c#r#Anon.java#ANONSIG");
+    b.upsert_file(1, "core/java/p/Anon.java");
+    b.add_xref(anon, role::DEF, 1, 4242);   // gives the anon a def site
+    b.add_inherit(anon, base);              // anon extends Runnable
+    b.finish(&s2db).unwrap();
+
+    // Text output: no raw ticket, and the anon@ locator is present.
+    let bin = scry2_bin();
+    let out = Command::new(&bin)
+        .arg("--index").arg(&s2db).arg("sub").arg("p.Runnable")
+        .output().expect("spawn");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("kythe:"), "raw ticket leaked in text: {text}");
+    assert!(text.contains("anon@core/java/p/Anon.java@4242"),
+            "anon fallback locator missing: {text}");
+
+    // JSON name field also carries the fallback, never the raw ticket.
+    let v = run(&s2db, &["sub", "p.Runnable"]);
+    let hits = v.get("hits").and_then(|x| x.as_array()).expect("hits");
+    let names: Vec<&str> = hits.iter()
+        .filter_map(|h| h.get("name").and_then(|n| n.as_str())).collect();
+    assert!(names.iter().all(|n| !n.starts_with("kythe:")),
+            "raw ticket in --json name: {names:?}");
+    assert!(names.iter().any(|n| n.starts_with("anon@")),
+            "anon fallback missing in --json: {names:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -------- ISSUE 4: names honors --json ---------------------------------
+
+#[test]
+fn names_honors_json_flag() {
+    // #4 regression: `names --json` emitted plain text. It must emit the
+    // structured Names reply that parses as JSON, with the sym rendered as
+    // a 0x-hex string, and keep the plain-text shape unchanged otherwise.
+    let (_dir, s2db) = make_index();
+    // --json: valid JSON with the documented shape.
+    let v = run(&s2db, &["names", "foo", "--json"]);
+    assert_eq!(v.get("cmd").and_then(|c| c.as_str()), Some("names"), "{v}");
+    let hits = v.get("hits").and_then(|x| x.as_array()).expect("hits array");
+    assert!(!hits.is_empty(), "prefix foo matches names: {v}");
+    let first = &hits[0];
+    assert!(first.get("name").and_then(|n| n.as_str()).is_some(), "name field: {v}");
+    let sym = first.get("sym").and_then(|s| s.as_str()).expect("sym hex string");
+    assert!(sym.starts_with("0x"), "sym rendered as 0x-hex: {sym}");
+
+    // Plain text still works (whitespace-separated `0x… name`).
+    let bin = scry2_bin();
+    let out = Command::new(&bin)
+        .arg("--index").arg(&s2db).arg("names").arg("foo")
+        .output().expect("spawn");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("0x") && text.contains("foo."),
+            "plain-text names shape preserved: {text}");
+}
+
+// -------- ISSUE 7: SIGPIPE does not panic ------------------------------
+
+#[test]
+fn pipe_to_head_exits_without_panic() {
+    // #7 regression: the Rust runtime masks SIGPIPE, so streaming long
+    // output into a reader that closes early (`| head`) made println! hit
+    // EPIPE and panic (exit 101). After resetting SIGPIPE to SIG_DFL the
+    // process dies on the signal (exit 141 = 128+SIGPIPE) with NO panic.
+    //
+    // To trigger EPIPE deterministically we need scry2 to still be writing
+    // when the reader closes, so the fixture has many ref rows (well past a
+    // 64 KB pipe buffer). We spawn scry2 with a piped stdout, immediately
+    // drop the read end, and wait: the write then fails mid-stream.
+    use std::process::Stdio;
+    let tid: String = format!("{:?}", std::thread::current().id())
+        .chars().filter(|c| c.is_ascii_digit()).collect();
+    let dir = std::env::temp_dir().join(format!("scry2-cli-pipe-{}-{}", std::process::id(), tid));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s2db = dir.join("pipe.s2db");
+    let mut b = IndexBuilder::new();
+    let s = sym_of("p.HotSym");
+    b.upsert_sym(s, kind::FUNCTION, lang::JAVA, "p.HotSym");
+    b.upsert_file(1, "core/java/p/Hot.java");
+    // ~200k ref rows so the serialized output far exceeds any pipe buffer.
+    for off in 0..200_000u32 { b.add_xref(s, role::REF, 1, off); }
+    b.finish(&s2db).unwrap();
+
+    let bin = scry2_bin();
+    let mut child = Command::new(&bin)
+        .arg("--index").arg(&s2db)
+        .arg("ref").arg("p.HotSym").arg("--max-hits").arg("1000000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn().expect("spawn scry2");
+    // Close the read end of stdout immediately: the next large write from
+    // scry2 hits a broken pipe.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait scry2");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"),
+            "scry2 must not panic on broken pipe (got SIGPIPE? exit {:?}): {err}",
+            out.status);
+    // Not the Rust panic exit code; SIGPIPE death (signal) or clean exit.
+    assert_ne!(out.status.code(), Some(101),
+            "broken-pipe panic regressed (exit 101): {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

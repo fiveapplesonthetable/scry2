@@ -1227,9 +1227,29 @@ fn is_ticket_name(name: &str) -> bool {
     name.starts_with("kythe:")
 }
 
+/// True for a DEGENERATE display-name candidate: one that carries no
+/// human identity and so must never become a sym's display name. A bad
+/// MarkedSource render (e.g. a `tapp` whose head was dropped) yields a
+/// bare `<>`; trimming/whitespace can yield empty; an operator-only render
+/// can yield all-punctuation. None of these identify the element, so a
+/// real alias — or even the raw ticket — is preferable. Guarding here is
+/// the backstop: even if the renderer regresses, a degenerate string can
+/// never win the display name.
+fn is_degenerate_name(name: &str) -> bool {
+    let t = name.trim();
+    if t.is_empty() { return true; }
+    // `<>` and variants like `< >` / `<>[]` carry only generic decoration
+    // with no head — there is no identity in them. More generally, a name
+    // with no alphanumeric character is not a usable identifier name (a
+    // bare `<>`, `()`, `[]`, `::`). A ticket is NOT degenerate (it has the
+    // `kythe`/path text) and is handled by `is_ticket_name`.
+    !t.chars().any(|c| c.is_alphanumeric())
+}
+
 /// Order-independent choice between the current display name `cur` and a
 /// candidate `cand` for the SAME sym. Returns true iff `cand` should
-/// replace `cur`. The total order is: a non-empty name beats empty; a
+/// replace `cur`. The total order is: a usable name beats a degenerate
+/// (`<>`/empty/all-punctuation) one; a non-empty name beats empty; a
 /// human FQN (non-ticket) beats a raw Kythe ticket and a ticket NEVER
 /// overwrites an FQN; within the same class (both FQNs or both tickets)
 /// the shorter string wins, ties broken by lexicographically smaller.
@@ -1241,6 +1261,15 @@ fn is_ticket_name(name: &str) -> bool {
 pub(crate) fn prefers_name(cur: &str, cand: &str) -> bool {
     if cand.is_empty() { return false; }
     if cur.is_empty()  { return true; }
+    // A degenerate candidate (`<>`, all-punctuation) never wins; a usable
+    // candidate always beats a degenerate current — even a ticket beats a
+    // bare `<>`, since the ticket at least locates the element.
+    match (is_degenerate_name(cur), is_degenerate_name(cand)) {
+        (false, true) => return false,
+        (true, false) => return true,
+        (true, true)  => return false,   // both junk: keep cur (stable)
+        (false, false) => {}             // both usable: fall through
+    }
     match (is_ticket_name(cur), is_ticket_name(cand)) {
         (true, false) => true,   // FQN beats ticket
         (false, true) => false,  // ticket never beats FQN
@@ -1654,4 +1683,51 @@ fn build_trigram_index(by_name: &[(u64, u16, u64)], blob: &[u8]) -> (Vec<u8>, Ve
     }));
 
     (dict, postings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_degenerate_name, prefers_name};
+
+    #[test]
+    fn degenerate_name_detection() {
+        assert!(is_degenerate_name("<>"));
+        assert!(is_degenerate_name(""));
+        assert!(is_degenerate_name("   "));
+        assert!(is_degenerate_name("[]"));
+        assert!(is_degenerate_name("?"));
+        assert!(is_degenerate_name("::"));
+        assert!(is_degenerate_name("< >"));
+        assert!(!is_degenerate_name("Comparable<T>"));
+        assert!(!is_degenerate_name("java.util.HashMap"));
+        // A raw ticket is NOT degenerate (it has alphanumerics / locates the
+        // element); the FQN-vs-ticket preference is handled separately.
+        assert!(!is_degenerate_name("kythe:java:c#r#X.java#SIG"));
+    }
+
+    #[test]
+    fn prefers_name_rejects_degenerate_candidate() {
+        // #5: a degenerate `<>` render must never win the display name, even
+        // over a raw ticket — a bad render can't become a sym's name.
+        assert!(!prefers_name("java.util.AbstractMap", "<>"),
+            "<> never beats a real FQN");
+        assert!(!prefers_name("kythe:java:c#r#X.java#SIG", "<>"),
+            "<> never beats even a ticket");
+        // A usable name beats a degenerate current — including a ticket
+        // promoting over a previously-stored `<>`.
+        assert!(prefers_name("<>", "kythe:java:c#r#X.java#SIG"),
+            "ticket promotes over <>");
+        assert!(prefers_name("<>", "java.util.AbstractMap"),
+            "FQN promotes over <>");
+    }
+
+    #[test]
+    fn prefers_name_keeps_fqn_over_ticket_unchanged() {
+        // Regression guard: the degenerate handling must not disturb the
+        // existing FQN-beats-ticket / shortest-lex order for usable names.
+        assert!(prefers_name("kythe:java:c#r#X.java#SIG", "p.Foo.bar"));
+        assert!(!prefers_name("p.Foo.bar", "kythe:java:c#r#X.java#SIG"));
+        assert!(prefers_name("p.Foo.barbaz", "p.Foo.bar")); // shorter wins
+        assert!(!prefers_name("a", "")); // empty never wins
+    }
 }

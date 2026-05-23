@@ -109,12 +109,22 @@ pub struct InhHit {
     pub def: Option<String>,
 }
 
+/// One `names PREFIX` row: a name-index entry and the sym it maps to.
+/// `sym` is rendered as a 16-hex string (`0x…`) to match the text output
+/// and stay JSON-safe (a u64 sym id can exceed JS's safe integer range).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NameHit {
+    pub name: String,
+    pub sym:  String,
+}
+
 /// Top-level reply envelope. Tag = command, payload depends on it.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Reply {
     Stat   { xrefs: u64, syms: u64, files: u64, inhs: u64, calls: u64 },
     Xrefs  { groups: Vec<SymbolGroup>, total: usize, truncated: bool },
+    Names  { hits: Vec<NameHit>, total: usize },
     Inh    { hits: Vec<InhHit>, total: usize },
     Callgraph { nodes: Vec<CallNode>, total: usize, truncated: bool },
     /// `inheritance NAME` — reuses the callgraph BFS-forest node shape
@@ -248,6 +258,12 @@ pub fn emit(reply: &Reply, as_json: bool) {
                     Some(loc) => println!("{}  {}", h.name, loc),
                     None      => println!("{}", h.name),
                 }
+            }
+            eprintln!("hits={total}");
+        }
+        Reply::Names { hits, total } => {
+            for h in hits {
+                println!("{}  {}", h.sym, h.name);
             }
             eprintln!("hits={total}");
         }

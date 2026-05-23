@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use scry2::{Index, IndexBuilder, kythe, kzip, kzip::Progress as _,
-            reply::{Reply, emit}, server::{self, Request}};
+            reply::{self, Reply, emit}, server::{self, Request}};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -57,6 +57,25 @@ fn expand_tilde(s: &str, home: Option<&std::ffi::OsStr>) -> PathBuf {
 /// CLI accepts shell-style home references like `~/scry2-setup/...`.
 fn path_arg(s: &str) -> Result<PathBuf, String> {
     Ok(expand_tilde(s, std::env::var_os("HOME").as_deref()))
+}
+
+/// Restore the default disposition for `SIGPIPE`.
+///
+/// The Rust runtime installs `SIG_IGN` for `SIGPIPE` before `main`, which
+/// turns a broken downstream pipe into an `EPIPE` on every write — and
+/// `println!` panics on that error (exit 101). For a CLI that streams long
+/// output, the canonical `scry2 … | head` is a broken pipe by design: the
+/// reader closes after N lines and we should die quietly, not panic. Reset
+/// the handler to `SIG_DFL` so the kernel terminates us with `SIGPIPE` (the
+/// normal Unix CLI contract) the instant the reader goes away. Must run
+/// before any stdout write. Safe: a bare `signal(2)` call with no shared
+/// state, executed once at startup before threads are spawned.
+fn reset_sigpipe() {
+    // SAFETY: single libc call at process start, before any thread is
+    // spawned and before any I/O; touches no Rust-managed state.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -396,6 +415,7 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    reset_sigpipe();
     let cli = Cli::parse();
     // Build-side verbs don't go through Reply.
     match cli.cmd {
@@ -430,9 +450,17 @@ fn main() -> Result<()> {
         }
         Cmd::Names { prefix, limit } => {
             let ix = Index::open(&cli.index)?;
-            for (name, sym) in ix.names_with_prefix(&prefix, limit) {
-                println!("0x{sym:016x}  {name}");
-            }
+            // Honor --json like every other verb: build a structured reply
+            // and route it through `emit`, which branches on the flag. The
+            // sym id is rendered as `0x…` hex (matching the human output and
+            // keeping the value JSON-safe — a u64 sym can exceed JS's safe
+            // integer range).
+            let hits: Vec<reply::NameHit> = ix.names_with_prefix(&prefix, limit)
+                .into_iter()
+                .map(|(name, sym)| reply::NameHit { name, sym: format!("0x{sym:016x}") })
+                .collect();
+            let total = hits.len();
+            emit(&Reply::Names { hits, total }, cli.json);
             return Ok(());
         }
         _ => {}

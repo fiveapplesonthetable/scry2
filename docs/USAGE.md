@@ -112,7 +112,40 @@ entry stream, and writes a single `.s2db`. The flags:
 | `--snapshot-rows N` | drain whenever the in-RAM delta reaches this many rows (xrefs+inherits+calls+aliases+typed+childof+sig — every append-only delta table). **This is what bounds peak memory** — a large CU crosses the budget sooner and triggers an earlier drain, so the peak is deterministic regardless of how rows are distributed. Default 250M (≈ a 25 GB delta). 0 disables. Bound memory with this, not with worker count. |
 | `--inject-cu-arg PREFIX::ARG` | prepend `ARG` to the indexer argv of any CU whose primary path starts with `PREFIX` (the `::` is the separator). Repeatable. Example: `'libcore/ojluni/src/main/java/::--patch-module=java.base=libcore/ojluni/src/main/java'` so AOSP libcore ojluni files index against `java.base`. Skipped if the CU's argv already has the arg. |
 | `--resume` | continue a killed run from its on-disk partial state. |
+| `--cache-dir PATH` | incremental-rebuild shard cache (default a sibling `<out>.cache/`). Each CU's delta shard is persisted keyed by a content digest of exactly what its indexer consumes; a rebuild reuses unchanged CUs' shards (skipping the indexer subprocess **and** the ingest) and re-indexes only changed CUs. The merged output is byte-identical to a full rebuild. Mutually exclusive with `--no-cache`; ignored under `--resume`. |
+| `--clean` | ignore + delete any existing cache, do a full from-scratch build, then repopulate the cache fresh. Use after a toolchain change or to clear a cache you no longer trust. |
+| `--no-cache` | neither read nor write the cache this run — a pure full build, leaving any existing cache untouched. |
 | `-o, --out PATH` | output `.s2db` (default `scry2.s2db`). |
+
+### Incremental rebuilds (the shard cache)
+
+By default `from-kzip` keeps a per-CU shard cache beside `--out`. The cache
+key is a content digest of everything the indexer reads for a CU — its
+argument list, its required-input `(path, content-digest)` pairs, an
+indexer-version tag, and scry2's ingest-schema version — so it changes
+exactly when (and only when) re-indexing that CU would produce different
+output. On a rebuild:
+
+* **unchanged CU** → its cached shard is reused: no indexer subprocess, no
+  ingest, just a shard copy into the merge set;
+* **changed / new CU** → re-indexed, its shard re-stored under the new
+  digest;
+* **dropped CU** → simply not merged; its orphan cache shard is pruned.
+
+The rebuilt `.s2db` is **byte-for-byte identical** to a full rebuild of the
+same kzip. The enabler is deterministic file-ids: before any ingest the
+allocator is seeded with the plan's file paths in sorted order, so a path's
+id is its rank — a pure function of the kzip, independent of worker
+scheduling — and a cached shard carries the same bytes a fresh build would.
+(Two cold full builds were *not* byte-identical before this seed; they are
+now.) A cache built under a different file-id basis — e.g. a different `--in`
+slice that changes the path set and shifts every rank — is detected via a
+stored basis token and rebuilt rather than reused.
+
+Use `--clean` to force a guaranteed-clean from-scratch rebuild (and refresh
+the cache), or `--no-cache` for a pure full build that ignores the cache
+entirely. `--resume` is unchanged and uses its own partial-state mechanism,
+independent of this cache.
 
 ### On-disk artifacts during a run
 

@@ -1711,6 +1711,13 @@ mod tests {
         b.upsert_sym(foo, kind::FUNCTION, lang::CXX, "foo");
         b.upsert_sym(bar, kind::FUNCTION, lang::CXX, "bar");
         b.upsert_sym(baz, kind::FUNCTION, lang::CXX, "baz");
+        // DECLs so each node also carries a byte-verifiable `def` location.
+        b.upsert_file(1, "/src/foo.cc");
+        b.upsert_file(2, "/src/bar.cc");
+        b.upsert_file(3, "/src/baz.cc");
+        b.add_xref(foo, role::DECL, 1, 10);
+        b.add_xref(bar, role::DECL, 2, 20);
+        b.add_xref(baz, role::DECL, 3, 30);
         b.add_call(foo, bar, role::CALL);
         b.add_call(bar, baz, role::CALL);
         b.finish(&path).unwrap();
@@ -1725,6 +1732,10 @@ mod tests {
             for n in &nodes {
                 assert_eq!(n.kind, "fn",
                     "every node carries its kind=fn; got {:?} for {}", n.kind, n.name);
+                // Parity with def/ref/callers: a node with a DECL carries a
+                // byte-verifiable `path@off` location.
+                assert!(n.def.as_deref().is_some_and(|d| d.contains(".cc@")),
+                    "every node carries its def location; got {:?} for {}", n.def, n.name);
             }
         } else { panic!("expected Reply::Callgraph") }
         let _ = std::fs::remove_file(&path);
@@ -1799,6 +1810,9 @@ mod tests {
             assert!(nodes.iter().all(|n| n.kind == "type"),
                 "every callgraph node carries its kind (all `type` here): {:?}",
                 nodes.iter().map(|n| (&n.name, &n.kind)).collect::<Vec<_>>());
+            assert!(nodes.iter().all(|n| n.def.is_some()),
+                "every callgraph node with a DECL carries its def location: {:?}",
+                nodes.iter().map(|n| (&n.name, &n.def)).collect::<Vec<_>>());
         } else { panic!("expected Reply::Callgraph") }
 
         // callgraph --substr "Child" --def-in tests/ →

@@ -95,9 +95,11 @@ pub struct CallNode {
     /// where a FUNCTION is expected) instead of hiding it behind the name.
     pub kind:   String,
     /// The node's definition site as `path@off`, when the index has a
-    /// DECL/DEF for it. The inheritance forest sets this so each hop
-    /// shows a concrete location next to its (often ticket-shaped) name;
-    /// the callgraph forest leaves it None. Omitted from JSON when absent.
+    /// DECL/DEF for it. Both the callgraph and inheritance forests set
+    /// this so each hop shows a concrete location next to its (often
+    /// ticket-shaped) name — letting a caller byte-verify the node and
+    /// making a mis-rendered name self-evident. None only when the index
+    /// has no DECL/DEF for the sym. Omitted from JSON when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub def: Option<String>,
 }
@@ -279,8 +281,12 @@ pub fn emit(reply: &Reply, as_json: bool) {
             // shape is the source of truth for programmatic use.
             for n in nodes {
                 let p = n.parent.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-                println!("  id={:<3} parent={:<3} hop={} {:<4} {:<9} {}",
-                         n.id, p, n.hop, n.dir, n.kind, n.name);
+                match &n.def {
+                    Some(loc) => println!("  id={:<3} parent={:<3} hop={} {:<4} {:<9} {}  {}",
+                                          n.id, p, n.hop, n.dir, n.kind, n.name, loc),
+                    None      => println!("  id={:<3} parent={:<3} hop={} {:<4} {:<9} {}",
+                                          n.id, p, n.hop, n.dir, n.kind, n.name),
+                }
             }
             if *truncated { eprintln!("(callgraph truncated)"); }
             eprintln!("hits={total}");

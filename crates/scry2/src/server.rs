@@ -617,7 +617,7 @@ fn do_callgraph(
         let id = nodes.len() as u32;
         seen.insert(sym, id);
         rendered.insert(key, id);
-        nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, kind: kind_of(sym), def: None });
+        nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, kind: kind_of(sym), def: def_loc_str(ix, sym) });
         Some(id)
     };
     for &root in &roots {

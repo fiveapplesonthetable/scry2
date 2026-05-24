@@ -382,18 +382,21 @@ Output is a **BFS spanning tree** — every node carries an `id` and a
 `parent` pointing at the node that discovered it. Walk `parent`
 pointers back to the root to reconstruct exact discovery paths. The
 root has `parent: null` (JSON) or `parent=-` (human). Each node also
-reports its `kind` (`fn`, `type`, `var`, …) — the same `kind` every
-other verb reports — so a hop mis-attributed to a non-function (a
-`type` or `var` where you expect `fn`) is visible, not silent.
+reports its `kind` (`fn`, `type`, `var`, …) and its `def` location
+(`path@off`, when the index has a DECL/DEF) — the same fields every
+other verb reports. The `def` lets you byte-verify any node against
+source; together with `kind` it makes a mis-attributed hop (a `type`
+or `var` where you expect `fn`, or a node whose location lands in an
+implausible file) visible instead of silent.
 
 ```bash
 $ scry2 --index aosp.s2db callgraph \
     'kythe:java:android##.../Binder.java#clearCallingIdentity()' \
     --direction up --depth 2
-  id=0   parent=-   hop=0 root  fn        clearCallingIdentity
-  id=1   parent=0   hop=1 up    fn        ActivityManagerService.startActivityAsUser
-  id=2   parent=0   hop=1 up    fn        BroadcastQueueImpl.deliverToReceiverLocked
-  id=3   parent=1   hop=2 up    fn        ActivityStarter.execute
+  id=0   parent=-   hop=0 root  fn        clearCallingIdentity  .../IPCThreadState.cpp@17986
+  id=1   parent=0   hop=1 up    fn        ActivityManagerService.startActivityAsUser  .../AMS.java@1694
+  id=2   parent=0   hop=1 up    fn        BroadcastQueueImpl.deliverToReceiverLocked  .../BroadcastQueueImpl.java@2051
+  id=3   parent=1   hop=2 up    fn        ActivityStarter.execute  .../ActivityStarter.java@2412
 hits=3
 ```
 
@@ -411,10 +414,10 @@ JSON shape (canonical):
 {
   "cmd": "callgraph",
   "nodes": [
-    {"id": 0, "parent": null, "hop": 0, "dir": "root", "kind": "fn", "name": "clearCallingIdentity"},
-    {"id": 1, "parent": 0,    "hop": 1, "dir": "up",   "kind": "fn", "name": "AMS.startActivityAsUser"},
-    {"id": 2, "parent": 0,    "hop": 1, "dir": "up",   "kind": "fn", "name": "BroadcastQueueImpl.deliverToReceiverLocked"},
-    {"id": 3, "parent": 1,    "hop": 2, "dir": "up",   "kind": "fn", "name": "ActivityStarter.execute"}
+    {"id": 0, "parent": null, "hop": 0, "dir": "root", "kind": "fn", "name": "clearCallingIdentity", "def": "frameworks/native/libs/binder/IPCThreadState.cpp@17986"},
+    {"id": 1, "parent": 0,    "hop": 1, "dir": "up",   "kind": "fn", "name": "AMS.startActivityAsUser", "def": ".../AMS.java@1694"},
+    {"id": 2, "parent": 0,    "hop": 1, "dir": "up",   "kind": "fn", "name": "BroadcastQueueImpl.deliverToReceiverLocked", "def": ".../BroadcastQueueImpl.java@2051"},
+    {"id": 3, "parent": 1,    "hop": 2, "dir": "up",   "kind": "fn", "name": "ActivityStarter.execute", "def": ".../ActivityStarter.java@2412"}
   ],
   "total": 3,
   "truncated": false

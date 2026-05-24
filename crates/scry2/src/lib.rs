@@ -1695,6 +1695,42 @@ mod tests {
     }
 
     #[test]
+    fn callgraph_nodes_carry_kind() {
+        // Every callgraph node reports its symbol `kind`, exactly like
+        // def / callers / members. This surfaces call-site mis-attribution
+        // (a hop bound to a TYPE or VARIABLE where a FUNCTION is expected)
+        // instead of hiding it behind a bare name. foo()->bar()->baz() are
+        // all functions, so every node must report kind=fn.
+        use server::{Request, dispatch};
+        use reply::Reply;
+        let path = tmp("cg_kind");
+        let mut b = IndexBuilder::new();
+        let foo = sym_of("kythe:c++:t###foo");
+        let bar = sym_of("kythe:c++:t###bar");
+        let baz = sym_of("kythe:c++:t###baz");
+        b.upsert_sym(foo, kind::FUNCTION, lang::CXX, "foo");
+        b.upsert_sym(bar, kind::FUNCTION, lang::CXX, "bar");
+        b.upsert_sym(baz, kind::FUNCTION, lang::CXX, "baz");
+        b.add_call(foo, bar, role::CALL);
+        b.add_call(bar, baz, role::CALL);
+        b.finish(&path).unwrap();
+        let ix = Index::open(&path).unwrap();
+        let r = dispatch(&ix, &Request::Callgraph {
+            name: "foo".into(), direction: "down".into(),
+            depth: 3, max_syms: 200, substr: false, root_limit: 16,
+            in_: None, not_in: None, def_in: None,
+        });
+        if let Reply::Callgraph { nodes, .. } = r {
+            assert!(!nodes.is_empty(), "expected callgraph nodes");
+            for n in &nodes {
+                assert_eq!(n.kind, "fn",
+                    "every node carries its kind=fn; got {:?} for {}", n.kind, n.name);
+            }
+        } else { panic!("expected Reply::Callgraph") }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn super_sub_callgraph_honor_path_filters() {
         // Two classes in /aosp/.../tests/ and two in /aosp/frameworks/base/.
         // Filter by --in / --not-in / --def-in and confirm the dispatch
@@ -1760,6 +1796,9 @@ mod tests {
             let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
             assert_eq!(names, vec!["Pkg.MainChild", "Pkg.Parent"],
                 "BFS stops at Parent — TestChild filtered out");
+            assert!(nodes.iter().all(|n| n.kind == "type"),
+                "every callgraph node carries its kind (all `type` here): {:?}",
+                nodes.iter().map(|n| (&n.name, &n.kind)).collect::<Vec<_>>());
         } else { panic!("expected Reply::Callgraph") }
 
         // callgraph --substr "Child" --def-in tests/ →

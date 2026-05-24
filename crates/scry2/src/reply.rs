@@ -89,6 +89,11 @@ pub struct CallNode {
     /// by `parent`). For the root, `dir` is "root".
     pub dir:    String,
     pub name:   String,
+    /// The node's symbol kind (function / method / record / variable / …)
+    /// — the same `kind` every other verb reports. Surfaces call-site
+    /// mis-attribution in the forest (a hop bound to a TYPE or VARIABLE
+    /// where a FUNCTION is expected) instead of hiding it behind the name.
+    pub kind:   String,
     /// The node's definition site as `path@off`, when the index has a
     /// DECL/DEF for it. The inheritance forest sets this so each hop
     /// shows a concrete location next to its (often ticket-shaped) name;
@@ -240,10 +245,10 @@ pub fn emit(reply: &Reply, as_json: bool) {
             for n in nodes {
                 let p = n.parent.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
                 match &n.def {
-                    Some(loc) => println!("  id={:<3} parent={:<3} hop={} {:<4} {}  {}",
-                                          n.id, p, n.hop, n.dir, n.name, loc),
-                    None      => println!("  id={:<3} parent={:<3} hop={} {:<4} {}",
-                                          n.id, p, n.hop, n.dir, n.name),
+                    Some(loc) => println!("  id={:<3} parent={:<3} hop={} {:<4} {:<9} {}  {}",
+                                          n.id, p, n.hop, n.dir, n.kind, n.name, loc),
+                    None      => println!("  id={:<3} parent={:<3} hop={} {:<4} {:<9} {}",
+                                          n.id, p, n.hop, n.dir, n.kind, n.name),
                 }
             }
             if *truncated {
@@ -274,8 +279,8 @@ pub fn emit(reply: &Reply, as_json: bool) {
             // shape is the source of truth for programmatic use.
             for n in nodes {
                 let p = n.parent.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-                println!("  id={:<3} parent={:<3} hop={} {:<4} {}",
-                         n.id, p, n.hop, n.dir, n.name);
+                println!("  id={:<3} parent={:<3} hop={} {:<4} {:<9} {}",
+                         n.id, p, n.hop, n.dir, n.kind, n.name);
             }
             if *truncated { eprintln!("(callgraph truncated)"); }
             eprintln!("hits={total}");

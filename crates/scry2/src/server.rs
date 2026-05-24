@@ -557,6 +557,9 @@ fn do_callgraph(
     }
     let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
+    // Same `kind` every other verb reports; reuses sym_meta (already
+    // read for the name), so it's a free render-time add, no reindex.
+    let kind_of = |s: u64| kind_str(ix.sym_meta(s).map(|m| m.1).unwrap_or(0)).to_string();
     // The full set of dup syms that share a representative's logical
     // identity. AOSP compiles one logical function into many build-variant
     // stub copies; each copy is a distinct sym, and the call edges are NOT
@@ -614,7 +617,7 @@ fn do_callgraph(
         let id = nodes.len() as u32;
         seen.insert(sym, id);
         rendered.insert(key, id);
-        nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, def: None });
+        nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, kind: kind_of(sym), def: None });
         Some(id)
     };
     for &root in &roots {
@@ -697,6 +700,7 @@ fn do_inheritance(
     }
     let name_of = |s: u64| ix.sym_meta(s).map(|(n,_,_)| n.to_string())
         .unwrap_or_else(|| format!("<sym {:016x}>", s));
+    let kind_of = |s: u64| kind_str(ix.sym_meta(s).map(|m| m.1).unwrap_or(0)).to_string();
     // The full set of dup syms that share a representative sym's logical
     // identity. AOSP compiles one logical type into many build-variant stub
     // copies; each copy is a distinct sym, and the `inherits`/`inherited_by`
@@ -766,7 +770,7 @@ fn do_inheritance(
         // name renders a readable fallback for anonymous/local types whose
         // stored name is still a bare `kythe:` ticket.
         let name = display_name(ix, sym, &name);
-        nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, def });
+        nodes.push(CallNode { id, parent: parent_id, hop, dir: dir.into(), name, kind: kind_of(sym), def });
         Some(id)
     };
     for &root in &roots {

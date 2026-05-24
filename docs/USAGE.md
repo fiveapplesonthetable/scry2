@@ -381,16 +381,19 @@ Transitive walk over the calls table. Defaults: `--direction up`,
 Output is a **BFS spanning tree** — every node carries an `id` and a
 `parent` pointing at the node that discovered it. Walk `parent`
 pointers back to the root to reconstruct exact discovery paths. The
-root has `parent: null` (JSON) or `parent=-` (human).
+root has `parent: null` (JSON) or `parent=-` (human). Each node also
+reports its `kind` (`fn`, `type`, `var`, …) — the same `kind` every
+other verb reports — so a hop mis-attributed to a non-function (a
+`type` or `var` where you expect `fn`) is visible, not silent.
 
 ```bash
 $ scry2 --index aosp.s2db callgraph \
     'kythe:java:android##.../Binder.java#clearCallingIdentity()' \
     --direction up --depth 2
-  id=0   parent=-   hop=0 root  clearCallingIdentity
-  id=1   parent=0   hop=1 up    ActivityManagerService.startActivityAsUser
-  id=2   parent=0   hop=1 up    BroadcastQueueImpl.deliverToReceiverLocked
-  id=3   parent=1   hop=2 up    ActivityStarter.execute
+  id=0   parent=-   hop=0 root  fn        clearCallingIdentity
+  id=1   parent=0   hop=1 up    fn        ActivityManagerService.startActivityAsUser
+  id=2   parent=0   hop=1 up    fn        BroadcastQueueImpl.deliverToReceiverLocked
+  id=3   parent=1   hop=2 up    fn        ActivityStarter.execute
 hits=3
 ```
 
@@ -408,10 +411,10 @@ JSON shape (canonical):
 {
   "cmd": "callgraph",
   "nodes": [
-    {"id": 0, "parent": null, "hop": 0, "dir": "root", "name": "clearCallingIdentity"},
-    {"id": 1, "parent": 0,    "hop": 1, "dir": "up",   "name": "AMS.startActivityAsUser"},
-    {"id": 2, "parent": 0,    "hop": 1, "dir": "up",   "name": "BroadcastQueueImpl.deliverToReceiverLocked"},
-    {"id": 3, "parent": 1,    "hop": 2, "dir": "up",   "name": "ActivityStarter.execute"}
+    {"id": 0, "parent": null, "hop": 0, "dir": "root", "kind": "fn", "name": "clearCallingIdentity"},
+    {"id": 1, "parent": 0,    "hop": 1, "dir": "up",   "kind": "fn", "name": "AMS.startActivityAsUser"},
+    {"id": 2, "parent": 0,    "hop": 1, "dir": "up",   "kind": "fn", "name": "BroadcastQueueImpl.deliverToReceiverLocked"},
+    {"id": 3, "parent": 1,    "hop": 2, "dir": "up",   "kind": "fn", "name": "ActivityStarter.execute"}
   ],
   "total": 3,
   "truncated": false

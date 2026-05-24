@@ -967,10 +967,177 @@ fn is_named_edge(kind: &str) -> bool {
 /// MarkedSource kind values per kythe/proto/common.proto.
 const MS_BOX:        u32 = 0;
 const MS_TYPE:       u32 = 1;
+const MS_PARAMETER:  u32 = 2;
 const MS_IDENTIFIER: u32 = 3;
 const MS_CONTEXT:    u32 = 4;
+const MS_INITIALIZER: u32 = 5;
+const MS_MODIFIER:   u32 = 12;
+// Substitution kinds (6-11): LOOKUP_BY_PARAM and friends. Their content
+// is resolved from the node's param/typed edges at render time and is
+// absent from the bare MarkedSource proto — never part of the name.
+const MS_LOOKUP_LO:  u32 = 6;
+const MS_LOOKUP_HI:  u32 = 11;
 
+/// Render the qualified NAME of a node from its `/kythe/code` MarkedSource.
+///
+/// Principled and schema-driven (kythe.proto.common.MarkedSource): a node's
+/// qualified name is the concatenation, in document order, of its CONTEXT
+/// (kind=4, the qualifier path) and IDENTIFIER (kind=3, the simple name)
+/// subtrees. The return TYPE (1), PARAMETER (2), INITIALIZER (5), MODIFIER
+/// (12) and the LOOKUP_* substitution kinds (6-11) are NOT part of the name,
+/// so their subtrees are skipped entirely. BOX (0) nodes are transparent
+/// containers: we descend into their children but never emit their own
+/// pre/post text. That last rule is what makes the as-written nested-name-
+/// specifier of an out-of-line C++ definition — a bare `BOX(pre=" Foo::")`
+/// sibling in front of the real CONTEXT-bearing name box — contribute
+/// nothing, so the qualifier never doubles.
+///
+/// Each CONTEXT/IDENTIFIER subtree is rendered faithfully (pre + joined
+/// children [+ trailing joiner when add_final_list_token] + post), so the
+/// `::` separators and any template-argument text the indexer placed
+/// *inside* the context are preserved exactly.
+///
+/// When a node carries no CONTEXT/IDENTIFIER at all it is a pure type
+/// expression (a builtin `int`, `const char *`, a function type). Such a
+/// node has no "name"; its faithful full render is returned instead, which
+/// is what the type renderer for `/kythe/edge/typed` edges needs. Returns
+/// None only when even that render is empty.
 pub fn parse_marked_source_fqn(buf: &[u8]) -> Option<String> {
+    fn node_kind(buf: &[u8]) -> u32 {
+        let mut pos = 0;
+        while pos < buf.len() {
+            match read_proto_field(buf, pos) {
+                Some((1, 0, ve, vs)) => {
+                    return read_varint_at(&buf[vs..ve], 0).map(|(v, _)| v as u32).unwrap_or(MS_BOX);
+                }
+                Some((_, _, ve, _)) => pos = ve,
+                None => break,
+            }
+        }
+        MS_BOX
+    }
+    fn name_excluded(kind: u32) -> bool {
+        matches!(kind, MS_TYPE | MS_PARAMETER | MS_INITIALIZER | MS_MODIFIER)
+            || (MS_LOOKUP_LO..=MS_LOOKUP_HI).contains(&kind)
+    }
+    // Read pre_text, post_child_text (joiner), post_text, add_final_list,
+    // and the raw child slices of a node in one pass. Text is returned as
+    // borrowed Cow (no allocation for the valid-UTF-8 common case).
+    type Strs<'a> = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>, bool, Vec<&'a [u8]>);
+    fn fields(buf: &[u8]) -> Strs<'_> {
+        let e = std::borrow::Cow::Borrowed("");
+        let (mut pre, mut joiner, mut post) = (e.clone(), e.clone(), e);
+        let mut add_final = false;
+        let mut kids: Vec<&[u8]> = Vec::new();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let Some((field, wire, ve, vs)) = read_proto_field(buf, pos) else { break };
+            pos = ve;
+            match (field, wire) {
+                (2, 2) => pre = String::from_utf8_lossy(&buf[vs..ve]),
+                (3, 2) => kids.push(&buf[vs..ve]),
+                (4, 2) => joiner = String::from_utf8_lossy(&buf[vs..ve]),
+                (5, 2) => post = String::from_utf8_lossy(&buf[vs..ve]),
+                (10, 0) => if let Some((v, _)) = read_varint_at(&buf[vs..ve], 0) { add_final = v != 0; },
+                _ => {}
+            }
+        }
+        (pre, joiner, post, add_final, kids)
+    }
+    // Render a subtree as part of a NAME into `out`. Excluded descendant
+    // subtrees (TYPE / PARAMETER / INITIALIZER / MODIFIER / lookup) are
+    // dropped — strips a parameter-list lookup the indexer nests *inside*
+    // an IDENTIFIER (a free function `__acos` whose IDENT child is a `(`/`)`
+    // lookup). An IDENTIFIER contributes only its own identifier text (its
+    // pre_text plus any nested IDENTIFIER children): a malformed libc-math
+    // macro hangs a TYPE child, a stray BOX and an `__attribute__`
+    // post_text off the IDENTIFIER, none of which are part of the
+    // identifier. A CONTEXT/BOX renders faithfully (pre + joined pruned
+    // children [+ trailing joiner] + post) so `::` separators and
+    // template-argument text placed inside the context survive exactly.
+    fn render_name(buf: &[u8], out: &mut String) {
+        let (pre, joiner, post, add_final, kids) = fields(buf);
+        let ident = node_kind(buf) == MS_IDENTIFIER;
+        out.push_str(&pre);
+        let mut wrote = false;
+        for c in kids {
+            let ck = node_kind(c);
+            let keep = if ident { ck == MS_IDENTIFIER } else { !name_excluded(ck) };
+            if !keep { continue; }
+            if wrote { out.push_str(&joiner); }
+            render_name(c, out);
+            wrote = true;
+        }
+        if wrote && add_final { out.push_str(&joiner); }
+        // An IDENTIFIER's post_text is malformed-tail noise; a CONTEXT/BOX
+        // post_text is structural (e.g. a closing `>` of template args).
+        if !ident { out.push_str(&post); }
+    }
+    // Faithful render of a whole subtree (no pruning) into `out` — used only
+    // for a pure type expression (`int`, `const char *`, a function type)
+    // where params and return text are genuinely part of the type name.
+    fn render_faithful(buf: &[u8], out: &mut String) {
+        let (pre, joiner, post, add_final, kids) = fields(buf);
+        out.push_str(&pre);
+        for (i, c) in kids.iter().enumerate() {
+            if i > 0 { out.push_str(&joiner); }
+            render_faithful(c, out);
+        }
+        if !kids.is_empty() && add_final { out.push_str(&joiner); }
+        out.push_str(&post);
+    }
+    // Collect CONTEXT + IDENTIFIER renders, skipping excluded subtrees.
+    // `is_root` lets a top-level type node still be descended (so a pure
+    // type expression can be rendered by the caller below).
+    fn collect(buf: &[u8], is_root: bool, out: &mut String) {
+        let kind = node_kind(buf);
+        if !is_root && name_excluded(kind) { return; }
+        if kind == MS_CONTEXT || kind == MS_IDENTIFIER {
+            render_name(buf, out);
+            return;
+        }
+        let mut pos = 0;
+        while pos < buf.len() {
+            let Some((field, wire, ve, vs)) = read_proto_field(buf, pos) else { break };
+            pos = ve;
+            if field == 3 && wire == 2 { collect(&buf[vs..ve], false, out); }
+        }
+    }
+    // A qualified name is a single line of name characters. It may carry
+    // `::`/`.` separators, `<...>` template args, `()`/operator tokens,
+    // `*`/`&` for operator/pointer types, and bracketed pseudo-names for
+    // anonymous entities (`(anonymous namespace)`, `(lambda at f:line)`).
+    // It can NEVER contain a newline or statement punctuation `{ } ;` —
+    // those mark a rendered body/expression (e.g. the indexer emits an
+    // anonymous lambda's whole source as its IDENTIFIER text), which is
+    // not a name. Reject those rather than poison the name index.
+    fn is_name(s: &str) -> bool {
+        !s.is_empty() && !s.contains(['\n', '\r', '{', '}', ';'])
+    }
+    let mut name = String::new();
+    collect(buf, true, &mut name);
+    let name = name.trim();
+    // A spurious trailing `::` is left when a CONTEXT asserted
+    // add_final_list_token but the following IDENTIFIER was empty (the
+    // class node case). Names never legitimately end in `:`.
+    let name = name.trim_end_matches(':').trim_end();
+    if !name.is_empty() {
+        return is_name(name).then(|| name.to_string());
+    }
+    // No CONTEXT/IDENTIFIER → a pure type expression; its name is the
+    // faithful render of the whole node (params/return are part of the type).
+    let mut full = String::new();
+    render_faithful(buf, &mut full);
+    let full = full.trim();
+    is_name(full).then(|| full.to_string())
+}
+
+/// LEGACY heuristic renderer (CONTEXT-name-box else flatten + last
+/// whitespace token). Retained ONLY so the corpus-audit test can diff it
+/// against the principled [`parse_marked_source_fqn`]; deleted once the
+/// audit confirms the new renderer is a strict improvement.
+#[cfg(test)]
+fn parse_marked_source_fqn_legacy(buf: &[u8]) -> Option<String> {
     // Field numbers per kythe.proto.common.MarkedSource (v0.0.75):
     //   1 kind, 2 pre_text, 3 child, 4 post_child_text, 5 post_text,
     //   10 add_final_list_token (bool — when true, `post_child_text`
@@ -2652,6 +2819,436 @@ mod tests {
     #[test]
     fn parse_marked_source_returns_none_on_empty() {
         assert_eq!(parse_marked_source_fqn(&[]), None);
+    }
+
+    /// Corpus audit (on-demand). Point SCRY2_AUDIT_ENTRIES at a file of
+    /// length-delimited Kythe Entry protos (e.g. `cxx_indexer foo.kzip >
+    /// entries`) and this streams every `/kythe/code` MarkedSource fact
+    /// through `parse_marked_source_fqn`, flagging wrong outputs by an
+    /// oracle that needs no hand-written ground truth: a correct simple
+    /// name MUST be one of the IDENTIFIER node texts in the same proto.
+    /// If the last `::`-component of the rendered FQN is not an actual
+    /// IDENTIFIER (or the FQN leaks whitespace / parens / a `kythe:`
+    /// ticket), it is a rendering bug. Skips silently when the env var
+    /// is unset, so normal `cargo test` is unaffected.
+    #[test]
+    fn audit_marked_source_corpus() {
+        use std::io::Read;
+        let Ok(path) = std::env::var("SCRY2_AUDIT_ENTRIES") else { return; };
+        let f = std::fs::File::open(&path).expect("open SCRY2_AUDIT_ENTRIES");
+        let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+
+        // Recursively collect every IDENTIFIER node's pre_text.
+        fn collect_idents(buf: &[u8], out: &mut std::collections::HashSet<String>) {
+            let mut kind = MS_BOX;
+            let mut pre = String::new();
+            let mut p = 0;
+            while p < buf.len() {
+                let Some((field, wire, ve, vs)) = read_proto_field(buf, p) else { break };
+                p = ve;
+                match (field, wire) {
+                    (1, 0) => if let Some((v, _)) = read_varint_at(&buf[vs..ve], 0) { kind = v as u32; },
+                    (2, 2) => pre = String::from_utf8_lossy(&buf[vs..ve]).into_owned(),
+                    (3, 2) => collect_idents(&buf[vs..ve], out),
+                    _ => {}
+                }
+            }
+            if kind == MS_IDENTIFIER && !pre.is_empty() { out.insert(pre); }
+        }
+
+        // Compact tree dump: kind + pre/joiner/post per node, indented.
+        fn dump(buf: &[u8], depth: usize, out: &mut String) {
+            let (mut kind, mut pre, mut joiner, mut post) =
+                (MS_BOX, String::new(), String::new(), String::new());
+            let mut kids: Vec<&[u8]> = Vec::new();
+            let mut p = 0;
+            while p < buf.len() {
+                let Some((field, wire, ve, vs)) = read_proto_field(buf, p) else { break };
+                p = ve;
+                match (field, wire) {
+                    (1, 0) => if let Some((v, _)) = read_varint_at(&buf[vs..ve], 0) { kind = v as u32; },
+                    (2, 2) => pre = String::from_utf8_lossy(&buf[vs..ve]).into_owned(),
+                    (3, 2) => kids.push(&buf[vs..ve]),
+                    (4, 2) => joiner = String::from_utf8_lossy(&buf[vs..ve]).into_owned(),
+                    (5, 2) => post = String::from_utf8_lossy(&buf[vs..ve]).into_owned(),
+                    _ => {}
+                }
+            }
+            let kname = match kind { 0=>"BOX",1=>"TYPE",2=>"PARAM",3=>"IDENT",4=>"CONTEXT",5=>"INIT",12=>"MOD",6=>"PLBP",7=>"LBP",8=>"PLBPD",9=>"LBT",10=>"PLBTP",11=>"LBTP",_=>"?" };
+            out.push_str(&format!("{:i$}{kname} pre={pre:?} join={joiner:?} post={post:?}\n", "", i=depth*2));
+            for k in kids { dump(k, depth + 1, out); }
+        }
+        // The principled renderer's last `::`-component must be a real
+        // IDENTIFIER node text (templates: strip a trailing `<...>`;
+        // conversion operators keep their space and match a full IDENT).
+        // Empty `idents` ⇒ a pure type expression we can't judge this way.
+        fn last_is_ident(fqn: &str, idents: &std::collections::HashSet<String>) -> bool {
+            if idents.is_empty() { return true; }
+            // Strip balanced <...> template-argument spans first — they can
+            // contain `::` (e.g. `__alloc_func<std::allocator<...>>`), which
+            // would otherwise corrupt the `::`-split.
+            let mut bare = String::new();
+            let mut depth = 0i32;
+            for c in fqn.chars() {
+                match c {
+                    '<' => depth += 1,
+                    '>' if depth > 0 => depth -= 1,
+                    _ if depth == 0 => bare.push(c),
+                    _ => {}
+                }
+            }
+            let last = bare.rsplit("::").next().unwrap_or(&bare);
+            // The original last component (with its template args) may itself
+            // be a recorded identifier; accept either form.
+            let orig_last = fqn.rsplit("::").next().unwrap_or(fqn);
+            idents.contains(last) || idents.contains(orig_last)
+        }
+        let (mut total, mut same) = (0u64, 0u64);
+        let (mut fixed, mut regressed, mut added, mut other) = (0u64, 0u64, 0u64, 0u64);
+        // dropped_bad: old was a valid name, new is None (a real regression).
+        // dropped_ok:  old was garbage, new is None (a correct drop).
+        let (mut dropped_bad, mut dropped_ok) = (0u64, 0u64);
+        // Deduped (old,new) pairs per category so every distinct change is
+        // surfaced exactly once for human review.
+        let mut s_reg: Vec<String> = Vec::new();
+        let mut s_drop: Vec<String> = Vec::new();
+        let mut s_fix: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut s_other: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut s_susp: Vec<String> = Vec::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(8 << 10);
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        loop {
+            let len = match read_varint(&mut r) { Ok(Some(v)) => v as usize, _ => break };
+            buf.resize(len, 0);
+            if r.read_exact(&mut buf).is_err() { break; }
+            let Ok(entry) = parse_entry(&buf) else { continue };
+            if entry.fact_name != "/kythe/code" { continue; }
+            if !seen.insert(entry.fact_value.clone()) { continue; }
+            total += 1;
+            let old = parse_marked_source_fqn_legacy(&entry.fact_value);
+            let new = parse_marked_source_fqn(&entry.fact_value);
+            if old == new { same += 1; continue; }
+            let mut idents = std::collections::HashSet::new();
+            collect_idents(&entry.fact_value, &mut idents);
+            let pair = format!("OLD={old:?}  NEW={new:?}");
+            match (&old, &new) {
+                (None, Some(_)) => { added += 1; s_fix.insert(pair); }
+                (Some(o), None) => {
+                    if last_is_ident(o, &idents) {
+                        dropped_bad += 1;
+                        if s_drop.len() < 25 {
+                            let mut t = String::new(); dump(&entry.fact_value, 0, &mut t);
+                            s_drop.push(format!("{pair}\n{t}"));
+                        }
+                    } else {
+                        dropped_ok += 1;
+                    }
+                }
+                (Some(o), Some(n)) => {
+                    let (ook, nok) = (last_is_ident(o, &idents), last_is_ident(n, &idents));
+                    if !ook && nok { fixed += 1; s_fix.insert(pair); }
+                    else if ook && !nok {
+                        regressed += 1;
+                        if s_reg.len() < 40 {
+                            let mut t = String::new(); dump(&entry.fact_value, 0, &mut t);
+                            s_reg.push(format!("{pair}\n{t}"));
+                        }
+                    } else {
+                        other += 1;
+                        // Flag genuinely-garbage NEW output (leaked decl
+                        // syntax: newlines, attributes, or a bare trailing
+                        // `)` not from a `(anonymous …)`/`(lambda …)` pseudo
+                        // name) and dump its tree.
+                        let suspect = n.contains('\n') || n.contains("__attribute__")
+                            || n.contains(",,") || n.ends_with(')') && !n.contains('(');
+                        if suspect && s_susp.len() < 30 {
+                            let mut t = String::new(); dump(&entry.fact_value, 0, &mut t);
+                            s_susp.push(format!("{pair}\n{t}"));
+                        }
+                        s_other.insert(pair);
+                    }
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        eprintln!("\n==== MarkedSource legacy-vs-principled diff ====");
+        eprintln!("distinct /kythe/code: {total}  unchanged: {same}  changed: {}",
+                  total - same);
+        eprintln!("  fixed (old wrong -> new right): {fixed}");
+        eprintln!("  added (old None  -> new name):  {added}");
+        eprintln!("  REGRESSED (old right -> new wrong): {regressed}");
+        eprintln!("  DROPPED-bad (old name -> new None): {dropped_bad}");
+        eprintln!("  dropped-ok (old junk -> new None):  {dropped_ok}");
+        eprintln!("  other (both changed):          {other}");
+        eprintln!("---- REGRESSED samples (must be empty) ----");
+        for s in &s_reg { eprintln!("  {s}"); }
+        eprintln!("---- DROPPED-bad samples (must be empty) ----");
+        for s in &s_drop { eprintln!("  {s}"); }
+        eprintln!("---- a few FIXED ({}) ----", s_fix.len());
+        for s in s_fix.iter().take(30) { eprintln!("  {s}"); }
+        eprintln!("---- SUSPECT OTHER trees (still-garbage NEW) ----");
+        for s in &s_susp { eprintln!("  {s}"); }
+        eprintln!("---- a few OTHER ({}) ----", s_other.len());
+        for s in s_other.iter().take(40) { eprintln!("  {s}"); }
+        if std::env::var("SCRY2_AUDIT_ENFORCE").is_ok() {
+            assert_eq!(regressed, 0, "principled renderer regressed {regressed} valid names");
+            assert_eq!(dropped_bad, 0, "principled renderer dropped {dropped_bad} valid names");
+        }
+    }
+
+    // ---- MarkedSource proto builder for renderer regression tests ----
+    // Mirrors the cxx_indexer wire encoding (kythe.proto.common.MarkedSource):
+    // field 1 kind (varint), 2 pre_text, 3 child, 4 post_child_text,
+    // 5 post_text, 10 add_final_list_token.
+    struct Ms { kind: u8, pre: String, joiner: String, post: String, fin: bool, kids: Vec<Vec<u8>> }
+    impl Ms {
+        fn k(kind: u8) -> Self { Ms { kind, pre: String::new(), joiner: String::new(), post: String::new(), fin: false, kids: Vec::new() } }
+        fn pre(mut self, s: &str) -> Self { self.pre = s.into(); self }
+        fn join(mut self, s: &str) -> Self { self.joiner = s.into(); self }
+        fn post(mut self, s: &str) -> Self { self.post = s.into(); self }
+        fn fin(mut self) -> Self { self.fin = true; self }
+        fn kid(mut self, k: Ms) -> Self { self.kids.push(k.build()); self }
+        fn build(self) -> Vec<u8> {
+            fn varint(mut v: u64, o: &mut Vec<u8>) { while v >= 0x80 { o.push(((v & 0x7f) | 0x80) as u8); v >>= 7; } o.push(v as u8); }
+            fn lendelim(field: u64, body: &[u8], o: &mut Vec<u8>) { o.push(((field << 3) | 2) as u8); varint(body.len() as u64, o); o.extend_from_slice(body); }
+            let mut o = Vec::new();
+            if self.kind != 0 { o.push(0x08); o.push(self.kind); }
+            if !self.pre.is_empty() { lendelim(2, self.pre.as_bytes(), &mut o); }
+            for kid in &self.kids { lendelim(3, kid, &mut o); }
+            if !self.joiner.is_empty() { lendelim(4, self.joiner.as_bytes(), &mut o); }
+            if !self.post.is_empty() { lendelim(5, self.post.as_bytes(), &mut o); }
+            if self.fin { o.push(0x50); o.push(1); }
+            o
+        }
+    }
+    // Kind tags (kythe.proto.common.MarkedSource.Kind).
+    const K_TYPE: u8 = 1; const K_PARAM: u8 = 2; const K_IDENT: u8 = 3;
+    const K_CTX: u8 = 4; const K_INIT: u8 = 5; const K_PLBP: u8 = 6; const K_MOD: u8 = 12;
+    fn fqn(ms: Ms) -> Option<String> { parse_marked_source_fqn(&ms.build()) }
+
+    /// A free/static function's name is its IDENTIFIER, never its return
+    /// TYPE. Regression for the headline bug: `static jlong nativeInit(...)`
+    /// rendered as `jlong`.
+    #[test]
+    fn ms_free_function_uses_identifier_not_return_type() {
+        let ms = Ms::k(0)
+            .kid(Ms::k(K_TYPE).pre("jlong"))
+            .kid(Ms::k(0).pre(" "))
+            .kid(Ms::k(K_IDENT).pre("nativeInitSensorEventQueue"))
+            .kid(Ms::k(K_PARAM).pre("(").post(")"));
+        assert_eq!(fqn(ms).as_deref(), Some("nativeInitSensorEventQueue"));
+    }
+
+    /// A global/static variable's name is its IDENTIFIER, never its
+    /// INITIALIZER. Regression for `int global_var = 3` rendering as `3`.
+    #[test]
+    fn ms_variable_drops_initializer() {
+        let ms = Ms::k(0).post(" = 3")
+            .kid(Ms::k(K_TYPE).pre("int"))
+            .kid(Ms::k(0).pre(" "))
+            .kid(Ms::k(K_IDENT).pre("global_var"));
+        assert_eq!(fqn(ms).as_deref(), Some("global_var"));
+    }
+
+    /// `operator()` keeps its parentheses — they are part of the IDENTIFIER,
+    /// not a parameter list. Regression for truncation at the first `(`.
+    #[test]
+    fn ms_call_operator_not_truncated() {
+        let ms = Ms::k(0)
+            .kid(Ms::k(K_TYPE).pre("long"))
+            .kid(Ms::k(0)
+                .kid(Ms::k(K_CTX).join("::").fin().kid(Ms::k(K_IDENT).pre("ns")).kid(Ms::k(K_IDENT).pre("C")))
+                .kid(Ms::k(K_IDENT).pre("operator()")))
+            .kid(Ms::k(K_PLBP).pre("(").join(", ").post(")"));
+        assert_eq!(fqn(ms).as_deref(), Some("ns::C::operator()"));
+    }
+
+    /// A parameter-list lookup nested *inside* an IDENTIFIER is pruned.
+    /// Regression for libc `__acos` rendering as `__acos()`.
+    #[test]
+    fn ms_param_lookup_inside_identifier_pruned() {
+        let ms = Ms::k(K_IDENT).pre("__acos").kid(Ms::k(K_PLBP).pre("(").join(", ").post(")"));
+        assert_eq!(fqn(ms).as_deref(), Some("__acos"));
+    }
+
+    /// A multi-word type IDENTIFIER renders whole, not just its last word.
+    /// Regression for `unsigned char` rendering as `char`.
+    #[test]
+    fn ms_multiword_type_identifier_whole() {
+        assert_eq!(fqn(Ms::k(K_IDENT).pre("unsigned char")).as_deref(), Some("unsigned char"));
+    }
+
+    /// A libc-math macro hangs a TYPE child, a stray BOX, a param lookup,
+    /// and an `__attribute__` post_text off the IDENTIFIER. The name is the
+    /// identifier text only. Regression for `__isinff,__isinf,, ) __attribute__…`.
+    #[test]
+    fn ms_malformed_math_macro_identifier_only() {
+        let ms = Ms::k(K_IDENT).pre("__isinff").post(") __attribute__ ((__const__))")
+            .kid(Ms::k(K_TYPE).pre("int"))
+            .kid(Ms::k(0).pre(",__isinf,, "))
+            .kid(Ms::k(K_PLBP).pre("(").join(", ").post(")"));
+        assert_eq!(fqn(ms).as_deref(), Some("__isinff"));
+    }
+
+    /// An anonymous lambda whose IDENTIFIER text is its whole multi-line body
+    /// is not a name → None (must not poison the name index).
+    #[test]
+    fn ms_lambda_body_is_not_a_name() {
+        let ms = Ms::k(0)
+            .kid(Ms::k(K_CTX).kid(Ms::k(K_PLBP).pre("dependent(").join("::").post(")::")))
+            .kid(Ms::k(K_IDENT).pre("[&]() -> int {\n    return 0;\n}"));
+        assert_eq!(fqn(ms), None);
+    }
+
+    /// Anonymous-namespace and other bracketed pseudo-names ARE valid names
+    /// (no newline/braces) and qualify the entity.
+    #[test]
+    fn ms_anonymous_namespace_qualifies() {
+        let ms = Ms::k(0)
+            .kid(Ms::k(K_CTX).join("::").fin()
+                .kid(Ms::k(K_IDENT).pre("android"))
+                .kid(Ms::k(K_IDENT).pre("(anonymous namespace)")))
+            .kid(Ms::k(K_IDENT).pre("fixRecursiveDoubleDerefs"));
+        assert_eq!(fqn(ms).as_deref(),
+            Some("android::(anonymous namespace)::fixRecursiveDoubleDerefs"));
+    }
+
+    /// MODIFIER subtrees (e.g. `static`, `LIBBINDER_EXPORTED`) are excluded.
+    #[test]
+    fn ms_modifier_excluded() {
+        let ms = Ms::k(0)
+            .kid(Ms::k(K_MOD).pre("static "))
+            .kid(Ms::k(K_TYPE).pre("void"))
+            .kid(Ms::k(K_IDENT).pre("helper"));
+        assert_eq!(fqn(ms).as_deref(), Some("helper"));
+    }
+
+    /// Java type rendering goes through the same renderer; CONTEXT carries a
+    /// `.` joiner. `java.lang.String` must round-trip exactly.
+    #[test]
+    fn ms_java_dotted_fqn() {
+        let ms = Ms::k(0)
+            .kid(Ms::k(K_CTX).join(".").fin()
+                .kid(Ms::k(K_IDENT).pre("java"))
+                .kid(Ms::k(K_IDENT).pre("lang")))
+            .kid(Ms::k(K_IDENT).pre("String"));
+        assert_eq!(fqn(ms).as_deref(), Some("java.lang.String"));
+    }
+
+    /// Template arguments held *inside* a CONTEXT (nested BOX `<...>`) are
+    /// preserved verbatim — they are part of the qualified name.
+    #[test]
+    fn ms_template_args_in_context_preserved() {
+        let ms = Ms::k(0)
+            .kid(Ms::k(K_CTX).join("::").fin()
+                .kid(Ms::k(K_IDENT).pre("std"))
+                .kid(Ms::k(0)
+                    .kid(Ms::k(K_IDENT).pre("vector"))
+                    .kid(Ms::k(0).pre("<").post(">").kid(Ms::k(0).pre("int")))))
+            .kid(Ms::k(K_IDENT).pre("push_back"));
+        assert_eq!(fqn(ms).as_deref(), Some("std::vector<int>::push_back"));
+    }
+
+    /// A pure type expression with no IDENTIFIER/CONTEXT (a builtin) renders
+    /// faithfully rather than returning nothing.
+    #[test]
+    fn ms_pure_type_expression_faithful() {
+        assert_eq!(fqn(Ms::k(K_TYPE).pre("int")).as_deref(), Some("int"));
+        // An INITIALIZER-only / empty render is not a name.
+        assert_eq!(fqn(Ms::k(K_INIT).pre("")), None);
+    }
+
+    // Deterministic xorshift64 — no external RNG dependency, reproducible.
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x
+        }
+        fn upto(&mut self, m: u64) -> u64 { self.next() % m }
+    }
+
+    /// Property fuzz: random *well-formed* MarkedSource trees (every Kind,
+    /// random pre/joiner/post drawn from a name-hostile alphabet incl.
+    /// newlines/braces, random nesting) must (1) never panic and (2) only
+    /// ever yield a valid name — never a string with a newline or `{}/;`.
+    #[test]
+    fn ms_fuzz_wellformed_trees() {
+        fn text(r: &mut FuzzRng) -> String {
+            const A: &[char] = &['a', 'Z', '_', ':', '<', '>', '(', ')', ' ',
+                                 '*', '&', '.', ',', '3', '\n', '{', '}', ';'];
+            (0..r.upto(7)).map(|_| A[r.upto(A.len() as u64) as usize]).collect()
+        }
+        fn node(r: &mut FuzzRng, depth: u32) -> Ms {
+            // Kinds 0..=12 (BOX..MODIFIER, including the lookup range).
+            let mut m = Ms::k(r.upto(13) as u8);
+            if r.upto(2) == 0 { m = m.pre(&text(r)); }
+            if r.upto(3) == 0 { m = m.post(&text(r)); }
+            if r.upto(3) == 0 { m = m.join(&text(r)); }
+            if r.upto(2) == 0 { m = m.fin(); }
+            if depth < 5 { for _ in 0..r.upto(4) { m = m.kid(node(r, depth + 1)); } }
+            m
+        }
+        let mut r = FuzzRng(0x9E3779B97F4A7C15);
+        for _ in 0..50_000 {
+            let bytes = node(&mut r, 0).build();
+            if let Some(s) = parse_marked_source_fqn(&bytes) {
+                assert!(!s.contains(['\n', '\r', '{', '}', ';']),
+                    "fuzz produced a non-name: {s:?}");
+                assert!(!s.is_empty(), "fuzz produced an empty Some");
+            }
+        }
+    }
+
+    /// Property fuzz: arbitrary random bytes (malformed protobuf) must never
+    /// panic the hand-rolled decoder — it returns None or a best-effort
+    /// string, never crashes from-kzip ingest on a corrupt fact.
+    #[test]
+    fn ms_fuzz_raw_garbage_bytes() {
+        let mut r = FuzzRng(0xD1CE_F00D_1234_5678);
+        for _ in 0..50_000 {
+            let len = r.upto(96) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (r.next() & 0xff) as u8).collect();
+            let _ = parse_marked_source_fqn(&bytes); // must not panic
+        }
+    }
+
+    /// On-demand perf comparison (SCRY2_AUDIT_ENTRIES): time the principled
+    /// renderer vs the legacy one over every distinct real `/kythe/code`
+    /// blob. The renderer runs once per symbol at ingest, so this is the
+    /// only per-symbol cost that matters for the reindex.
+    #[test]
+    fn ms_perf_compare() {
+        use std::io::Read;
+        let Ok(path) = std::env::var("SCRY2_AUDIT_ENTRIES") else { return; };
+        let f = std::fs::File::open(&path).expect("open entries");
+        let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut buf = Vec::new();
+        loop {
+            let len = match read_varint(&mut r) { Ok(Some(v)) => v as usize, _ => break };
+            buf.resize(len, 0);
+            if r.read_exact(&mut buf).is_err() { break; }
+            let Ok(e) = parse_entry(&buf) else { continue };
+            if e.fact_name == "/kythe/code" && seen.insert(e.fact_value.clone()) {
+                blobs.push(e.fact_value);
+            }
+        }
+        let bench = |f: &dyn Fn(&[u8]) -> Option<String>| -> (u128, usize) {
+            let t = std::time::Instant::now();
+            let mut acc = 0usize;
+            for _ in 0..5 {
+                for b in &blobs { acc += f(b).map(|s| s.len()).unwrap_or(0); }
+            }
+            (t.elapsed().as_millis(), acc)
+        };
+        let (new_ms, a1) = bench(&|b| parse_marked_source_fqn(b));
+        let (old_ms, a2) = bench(&|b| parse_marked_source_fqn_legacy(b));
+        let n = blobs.len() * 5;
+        eprintln!("\n==== renderer perf (×5 over {} distinct blobs) ====", blobs.len());
+        eprintln!("  principled: {new_ms} ms  ({:.0} ns/call)", new_ms as f64 * 1e6 / n as f64);
+        eprintln!("  legacy:     {old_ms} ms  ({:.0} ns/call)", old_ms as f64 * 1e6 / n as f64);
+        eprintln!("  (checksum new={a1} old={a2})");
     }
 
     #[test]

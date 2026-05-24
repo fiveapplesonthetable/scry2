@@ -1025,6 +1025,83 @@ pub fn parse_marked_source_fqn(buf: &[u8]) -> Option<String> {
         out.push_str(&post);
         if out.is_empty() { None } else { Some((out, kind)) }
     }
+    // --- Structural pass (preferred) ------------------------------------
+    // The qualified name lives in the sub-message whose direct children
+    // include a CONTEXT node (kind=4): `<CONTEXT android::Parcel::> <IDENT
+    // writeAligned>`. Rendering *only* that box yields the clean FQN. Crucially
+    // it ignores the as-written nested-name-specifier that cxx_indexer prepends
+    // for an OUT-OF-LINE DEFINITION: `int64_t IPCThreadState::clearCallingIdentity()`
+    // written inside `namespace android` renders as
+    //   TYPE("int64_t")  BOX(" IPCThreadState::")  BOX(CONTEXT("android::IPCThreadState")+IDENT)
+    // and the flatten heuristic below would fold that leading ` IPCThreadState::`
+    // box into the FQN, doubling it to
+    // `IPCThreadState::android::IPCThreadState::clearCallingIdentity`. The
+    // name box (the one carrying the CONTEXT) holds only the correct
+    // `android::IPCThreadState::clearCallingIdentity`.
+    fn ms_kind(buf: &[u8]) -> u32 {
+        let mut pos = 0;
+        while pos < buf.len() {
+            match read_proto_field(buf, pos) {
+                Some((1, 0, val_end, val_start)) => {
+                    return read_varint_at(&buf[val_start..val_end], 0)
+                        .map(|(v, _)| v as u32).unwrap_or(MS_BOX);
+                }
+                Some((_, _, val_end, _)) => pos = val_end,
+                None => break,
+            }
+        }
+        MS_BOX
+    }
+    fn name_box(buf: &[u8]) -> Option<String> {
+        let mut kids: Vec<&[u8]> = Vec::new();
+        let mut ctx_at: Option<usize> = None;
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field, wire, val_end, val_start) = read_proto_field(buf, pos)?;
+            pos = val_end;
+            if field == 3 && wire == 2 {
+                let child = &buf[val_start..val_end];
+                if ctx_at.is_none() && ms_kind(child) == MS_CONTEXT {
+                    ctx_at = Some(kids.len());
+                }
+                kids.push(child);
+            }
+        }
+        if let Some(ci) = ctx_at {
+            // Render ONLY the CONTEXT (the qualifier, which carries its own
+            // trailing separator via post_text / add_final_list_token) plus the
+            // first IDENTIFIER after it (the entity's simple name). Sibling
+            // children — return-type TYPE, the `public final class` /
+            // `LIBBINDER_EXPORTED` modifiers, the as-written nested-name-specifier
+            // box, and the parameter MODIFIER list — are deliberately excluded.
+            // That is what keeps BOTH the C++ out-of-line definition and the
+            // Java `public final class java.lang.String` form clean.
+            let mut out = render(kids[ci]).map(|(s, _)| s).unwrap_or_default();
+            for child in &kids[ci + 1..] {
+                if ms_kind(child) == MS_IDENTIFIER {
+                    if let Some((s, _)) = render(child) { out.push_str(&s); }
+                    break;
+                }
+            }
+            return Some(out);
+        }
+        kids.into_iter().find_map(name_box)
+    }
+    // Cut a name-box render down to the FQN: drop a parameter list (`(`) and
+    // any trailing `::` left by add_final_list_token. No return-type/modifier
+    // prefix can appear here, so the last-whitespace-token step isn't needed.
+    fn clean(s: &str) -> Option<String> {
+        let cut = s.find('(').unwrap_or(s.len());
+        let fqn = s[..cut].trim_end().trim_end_matches(':');
+        (!fqn.is_empty()).then(|| fqn.to_string())
+    }
+    if let Some(fqn) = name_box(buf).and_then(|s| clean(&s)) {
+        return Some(fqn);
+    }
+
+    // --- Fallback: flatten + last-whitespace-token ----------------------
+    // No CONTEXT node present (a free function in the global namespace, or a
+    // bare type name). Render the whole tree and recover the FQN by position.
     let (full, _) = render(buf)?;
     // Truncate at the first `(` — the parameter list lives inside a
     // BOX child whose pre_text starts with `(`.
@@ -2639,6 +2716,51 @@ mod tests {
         let fqn = parse_marked_source_fqn(bytes).expect("renders");
         assert_eq!(fqn, "android::Parcel::writeAligned::val",
             "parameter FQN: <enclosing-function>::<param-name>");
+    }
+
+    #[test]
+    fn parse_marked_source_out_of_line_definition_not_doubled() {
+        // Real /kythe/code bytes captured from cxx_indexer on libbinder's
+        // IPCThreadState.cpp. The OUT-OF-LINE DEFINITION's MarkedSource carries
+        // the as-written nested-name-specifier `IPCThreadState::` as a separate
+        // sibling BOX in front of the fully-qualified CONTEXT; the in-class
+        // DECLARATION does not. Both must yield the SAME clean FQN — the
+        // structural pass renders only the CONTEXT-bearing name box, so the
+        // leading as-written qualifier is ignored. Before the fix the
+        // definition flattened to
+        // `IPCThreadState::android::IPCThreadState::clearCallingIdentity`.
+        const DEF: &[u8] = &[
+            0x1a, 0x0b, 0x08, 0x01, 0x12, 0x07, 0x69, 0x6e, 0x74, 0x36, 0x34, 0x5f,
+            0x74, 0x1a, 0x13, 0x12, 0x11, 0x20, 0x49, 0x50, 0x43, 0x54, 0x68, 0x72,
+            0x65, 0x61, 0x64, 0x53, 0x74, 0x61, 0x74, 0x65, 0x3a, 0x3a, 0x1a, 0x45,
+            0x1a, 0x29, 0x08, 0x04, 0x1a, 0x0b, 0x08, 0x03, 0x12, 0x07, 0x61, 0x6e,
+            0x64, 0x72, 0x6f, 0x69, 0x64, 0x1a, 0x12, 0x08, 0x03, 0x12, 0x0e, 0x49,
+            0x50, 0x43, 0x54, 0x68, 0x72, 0x65, 0x61, 0x64, 0x53, 0x74, 0x61, 0x74,
+            0x65, 0x22, 0x02, 0x3a, 0x3a, 0x50, 0x01, 0x1a, 0x18, 0x08, 0x03, 0x12,
+            0x14, 0x63, 0x6c, 0x65, 0x61, 0x72, 0x43, 0x61, 0x6c, 0x6c, 0x69, 0x6e,
+            0x67, 0x49, 0x64, 0x65, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x1a, 0x0c, 0x08,
+            0x06, 0x12, 0x01, 0x28, 0x22, 0x02, 0x2c, 0x20, 0x2a, 0x01, 0x29, 0x2a,
+            0x01, 0x0a,
+        ];
+        const DECL: &[u8] = &[
+            0x12, 0x13, 0x4c, 0x49, 0x42, 0x42, 0x49, 0x4e, 0x44, 0x45, 0x52, 0x5f,
+            0x45, 0x58, 0x50, 0x4f, 0x52, 0x54, 0x45, 0x44, 0x20, 0x1a, 0x0b, 0x08,
+            0x01, 0x12, 0x07, 0x69, 0x6e, 0x74, 0x36, 0x34, 0x5f, 0x74, 0x1a, 0x03,
+            0x12, 0x01, 0x20, 0x1a, 0x45, 0x1a, 0x29, 0x08, 0x04, 0x1a, 0x0b, 0x08,
+            0x03, 0x12, 0x07, 0x61, 0x6e, 0x64, 0x72, 0x6f, 0x69, 0x64, 0x1a, 0x12,
+            0x08, 0x03, 0x12, 0x0e, 0x49, 0x50, 0x43, 0x54, 0x68, 0x72, 0x65, 0x61,
+            0x64, 0x53, 0x74, 0x61, 0x74, 0x65, 0x22, 0x02, 0x3a, 0x3a, 0x50, 0x01,
+            0x1a, 0x18, 0x08, 0x03, 0x12, 0x14, 0x63, 0x6c, 0x65, 0x61, 0x72, 0x43,
+            0x61, 0x6c, 0x6c, 0x69, 0x6e, 0x67, 0x49, 0x64, 0x65, 0x6e, 0x74, 0x69,
+            0x74, 0x79, 0x1a, 0x0c, 0x08, 0x06, 0x12, 0x01, 0x28, 0x22, 0x02, 0x2c,
+            0x20, 0x2a, 0x01, 0x29,
+        ];
+        assert_eq!(parse_marked_source_fqn(DEF).as_deref(),
+            Some("android::IPCThreadState::clearCallingIdentity"),
+            "out-of-line definition FQN must not double the qualifier");
+        assert_eq!(parse_marked_source_fqn(DECL).as_deref(),
+            Some("android::IPCThreadState::clearCallingIdentity"),
+            "in-class declaration FQN");
     }
 
     #[test]

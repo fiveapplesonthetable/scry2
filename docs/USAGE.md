@@ -24,9 +24,28 @@ It is **not** a text search and **not** live:
   reflect unsaved edits or changes made since the index was built.
 
 Routing rule (especially for automated / LLM callers): **symbol lookup → scry2;
-raw text, log strings, or current-file freshness → `grep`/`ripgrep` or read the
-file.** Misrouting a text query to `--substr` and getting nothing is the most
-common mistake — that is the tool working as designed, not the string missing.
+raw text, log strings, or current-file freshness → `rg` or read the file.**
+Misrouting a text query to `--substr` and getting nothing is the most common
+mistake — that is the tool working as designed, not the string missing.
+
+### Companion: `scry` (live tree) — for a location or a text hit
+
+scry2 is keyed by **name**. When you instead have a **location** (a crash frame,
+a compiler error, an `rg` hit) or a **text string**, resolve it to an FQN first
+with the live `scry` tool (a separate binary that parses the current working
+tree), then bring the FQN back here:
+
+```bash
+scry whereis Foo.java:123 -q | xargs scry2 callers          # crash frame → callers
+scry grep 'log string' --fqn --format lines \
+  | awk -F'\t' '{print $NF}' | sort -u | xargs -n1 scry2 ref # text → symbol → refs
+```
+
+`scry whereis`/`grep --fqn` are syntactic span-containment (robust, no
+resolution), so their FQNs are sound input. scry's own `def`/`ref`/`callers` are
+**lexical** — scry2 is the Kythe-grade authority for those. Use scry to find
+*where you are* and to stay live (`scry watch`); use scry2 for *what a symbol
+does* across the build.
 
 ## Build the index
 

@@ -52,6 +52,18 @@ B+tree by 4× and rocksdb's LSM by 12× on warm point lookups —
 because there's no allocator, no parser, no syscall on the hot
 path. Every read is a memcmp on mmap'd bytes.
 
+## Companion: `scry` (live tree)
+
+scry2 is a build-time **snapshot** keyed by symbol **name**. Its live counterpart,
+`scry` (a separate tree-sitter binary over the current working tree), covers what
+scry2 deliberately doesn't: turning a **location** into a symbol
+(`scry whereis FILE:LINE` — crash frame / error / `rg` hit → enclosing FQN),
+turning a **text hit** into an FQN (`scry grep --fqn`), and staying live as you
+edit (`scry watch`). The FQNs it emits use scry2's separators, so they pipe
+straight in: `scry whereis Foo.java:123 -q | xargs scry2 callers`. Use scry to
+find *where you are*; use scry2 for the Kythe-grade *what a symbol does*. See
+`docs/USAGE.md` → "Companion: scry".
+
 ## Docs
 
 * [`docs/INSTALL.md`](docs/INSTALL.md) — toolchain, Kythe release, smoke test
